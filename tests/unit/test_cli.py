@@ -774,3 +774,55 @@ def test_report_cluster_raters_value_error_exits_1(tmp_path, monkeypatch):
     r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(tmp_path / "reports")])
     assert r.exit_code == 1, r.output
     assert "ERROR: too many candidate pairs" in r.output
+
+
+def test_report_figure_headings_are_human_titles_not_filenames(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+    md = (out_dir / "latest" / "report.md").read_text()
+    assert "### Fig 4. Largest rater clusters" in md
+    assert "### fig4_sybil_clusters.png" not in md
+    assert "fig4_sybil_clusters.png" in md  # still referenced as the image path
+
+
+def test_report_provenance_includes_config_in_markdown_and_json(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+
+    md = (out_dir / "latest" / "report.md").read_text()
+    for phrase in ("bootstrap_n", "bootstrap_seed", "min_clusters", "evidence_weights",
+                  "sybil_jaccard", "sybil_window_s", "sybil_max_group"):
+        assert phrase in md, phrase
+
+    data = json.loads((out_dir / "latest" / "scores.json").read_text())
+    config = data["config"]
+    assert config["bootstrap_n"] == 5
+    for key in ("bootstrap_seed", "min_clusters", "evidence_weights", "sybil_jaccard",
+                "sybil_window_s", "sybil_max_group", "sybil_flag_share"):
+        assert key in config
+
+
+def test_report_latest_is_atomically_replaced_and_stale_files_removed(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db)
+    out_dir = tmp_path / "reports"
+    r1 = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r1.exit_code == 0, r1.output
+
+    stale = out_dir / "latest" / "stale_from_a_previous_run.txt"
+    stale.write_text("old")
+    assert stale.exists()
+
+    r2 = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r2.exit_code == 0, r2.output
+
+    assert not stale.exists()
+    assert (out_dir / "latest" / "report.md").exists()
+    assert (out_dir / "latest" / "scores.json").exists()
+    assert len(list((out_dir / "latest").glob("*.png"))) == 5

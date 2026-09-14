@@ -12,9 +12,8 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
 import pandas as pd  # noqa: E402
-
-_SYBIL_LABEL = "red = largest single cluster >= 50% of records"
 
 
 def _save(fig, out: Path) -> None:
@@ -29,19 +28,38 @@ def _empty_note(ax, text: str) -> None:
     ax.set_yticks([])
 
 
+def _short_label(x) -> str:
+    """Truncate an address/id-like cluster label to `abcdef…wxyz`."""
+    a = str(x)
+    return f"{a[:6]}…{a[-4:]}"
+
+
 def fig_mean_vs_robust(scores: pd.DataFrame, out: Path) -> None:
-    """Fig 1: arithmetic mean vs robust score, one point per scored ratee."""
+    """Fig 1: arithmetic mean vs robust score, one point per scored ratee.
+
+    Color marks whether that ratee's largest single rater-cluster reaches the
+    sybil-flag threshold (>= 50% of its records) -- a legend with proxy handles
+    names the two colors, since a raw color-mapped scatter has no legend of its
+    own. `.fillna("tab:grey")` on the color mapping is defensive: `sybil_flag` is
+    always 0/1 for a scored (non-`insufficient`) ratee, but an unexpected value
+    still renders (grey) instead of raising or vanishing.
+    """
     s = scores.dropna(subset=["robust_score"])
     fig, ax = plt.subplots(figsize=(6, 6))
     if s.empty:
         _empty_note(ax, "no scored ratees (all insufficient)")
     else:
-        ax.scatter(s["naive_mean"], s["robust_score"], s=8, alpha=0.4,
-                   c=s["sybil_flag"].map({0: "tab:blue", 1: "tab:red"}))
+        colors = s["sybil_flag"].map({0: "tab:blue", 1: "tab:red"}).fillna("tab:grey")
+        ax.scatter(s["naive_mean"], s["robust_score"], s=8, alpha=0.4, c=colors)
         ax.plot([0, 1], [0, 1], "k--", lw=1)
         ax.set_xlabel("arithmetic mean")
         ax.set_ylabel("robust score")
-    ax.set_title(f"Fig 1. mean vs robust ({_SYBIL_LABEL})")
+        handles = [
+            Line2D([], [], marker="o", linestyle="", color="tab:blue", label="largest cluster < 50%"),
+            Line2D([], [], marker="o", linestyle="", color="tab:red", label="largest cluster >= 50%"),
+        ]
+        ax.legend(handles=handles, loc="lower right", fontsize="small")
+    ax.set_title("Fig 1. Mean vs robust score")
     _save(fig, out)
 
 
@@ -89,21 +107,34 @@ def fig_evidence(records: pd.DataFrame, out: Path) -> None:
 
 
 def fig_sybil_clusters(records: pd.DataFrame, clusters: dict, out: Path, top: int = 10) -> None:
-    """Fig 4: agent coverage of the largest rater clusters ("largest single cluster"
-    label, matching sybil_flag's definition -- never "sybil clusters" without qualification)."""
+    """Fig 4: the `top` largest rater clusters by member count, each bar
+    annotated with the number of distinct agents that cluster covers.
+
+    Ranked by cluster SIZE (member count), not agent coverage -- a cluster's
+    size is what drives its evidence-mass weight in scoring, while agent
+    coverage (how many different ratees it touched) is the secondary,
+    annotated number. Title never says "sybil cluster": a large cluster here is
+    evidence of coordinated *rater* behavior, not a claim any of it is
+    confirmed sybil activity.
+    """
     fig, ax = plt.subplots(figsize=(8, 4))
     if records.empty:
         _empty_note(ax, "no records")
     else:
-        c = records["rater"].map(lambda r: clusters.get(r, r))
-        cover = records.assign(cluster=c).groupby("cluster")["ratee"].nunique().sort_values(
-            ascending=False).head(top)
-        if cover.empty:
+        cluster_of = records["rater"].map(lambda r: clusters.get(r, r))
+        df = records.assign(cluster=cluster_of)
+        members = df.groupby("cluster")["rater"].nunique().sort_values(ascending=False).head(top)
+        covered = df.groupby("cluster")["ratee"].nunique()
+        if members.empty:
             _empty_note(ax, "no clusters")
         else:
-            ax.bar(range(len(cover)), cover.values)
-            ax.set_xticks(range(len(cover)))
-            ax.set_xticklabels([str(x)[:8] for x in cover.index], rotation=45)
-            ax.set_ylabel("agents covered")
-    ax.set_title(f"Fig 4. largest {top} rater clusters")
+            bars = ax.bar(range(len(members)), members.values)
+            for bar, cluster_id in zip(bars, members.index):
+                ax.annotate(str(int(covered.loc[cluster_id])),
+                           (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                           ha="center", va="bottom", fontsize=8)
+            ax.set_xticks(range(len(members)))
+            ax.set_xticklabels([_short_label(c) for c in members.index], rotation=45)
+            ax.set_ylabel("members (agents covered annotated)")
+    ax.set_title("Fig 4. Largest rater clusters (members; agents covered)")
     _save(fig, out)

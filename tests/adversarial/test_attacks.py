@@ -262,13 +262,16 @@ def test_scenario_i_insufficient_clusters_refuses_to_score():
 
 def test_report_numbers_table():
     """The naive-vs-robust table (robustrep.report.adversarial.scenario_table) the report
-    cites for scenarios A, B, D, E, F, H(k=20)."""
+    cites for scenarios A, B, D, E, F, H(k=20), plus the measured break-even rows."""
     table = scenario_table().set_index("scenario")
     assert list(table.index) == [
         "A_boosting", "B_smearing", "D_evidence_free_flood", "E_fresh_tag",
         "F_split_funders", "H_evasive_k20",
+        "G_smear_breakeven", "G2_boost_breakeven", "H_evasive_breakeven",
     ]
-    assert table["robust_score"].tolist() == [0.8, 0.8, 0.8, 0.9, 0.8, 0.8]
+    assert table.loc[
+        ["A_boosting", "B_smearing", "D_evidence_free_flood", "E_fresh_tag",
+         "F_split_funders", "H_evasive_k20"], "robust_score"].tolist() == [0.8, 0.8, 0.8, 0.9, 0.8, 0.8]
     assert math.isclose(table.loc["A_boosting", "naive_mean"], 54 / 55, rel_tol=1e-3)
     assert math.isclose(table.loc["B_smearing", "naive_mean"], 4 / 55, rel_tol=1e-3)
     assert math.isclose(table.loc["D_evidence_free_flood", "naive_mean"], 0.16, rel_tol=1e-3)
@@ -277,3 +280,11 @@ def test_report_numbers_table():
     assert table.loc["F_split_funders", "sybil_flag"] == 0
     assert table.loc["H_evasive_k20", "sybil_flag"] == 0
     assert table.loc["H_evasive_k20", "zero_evidence_ratio"] >= 0.8
+
+    # Measured attacker break-even points (scanned by k in robustrep.report.adversarial,
+    # never hand-typed): smear succeeds exactly at the mass tie, boost needs one more.
+    assert table.loc["G_smear_breakeven", "break_even_k"] == 30
+    assert table.loc["G2_boost_breakeven", "break_even_k"] == 31
+    assert table.loc["H_evasive_breakeven", "break_even_k"] == 35
+    assert table.loc["H_evasive_breakeven", "break_even_k_boost"] == 36
+    assert table.loc[["G_smear_breakeven", "G2_boost_breakeven", "H_evasive_breakeven"], "sybil_flag"].eq(0).all()

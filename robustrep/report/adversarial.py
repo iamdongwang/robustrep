@@ -99,19 +99,22 @@ def scenario_f_meta(rows):
 # --- scenario H: evasive attacker defeats sybil signals but not the weighted median --
 
 
-def farmless_attackers(n, start_ts, ratee="A"):
+def farmless_attackers(n, start_ts, ratee="A", val=0):
     """k attackers, each on a DISTINCT funder, registered >24h apart (2 days), each
     ALSO rating a decoy ratee from a pool of 6 ("D1".."D6"). A pair sharing the same
-    decoy has an IDENTICAL ratee set ({ratee, decoy}) and so a Jaccard of exactly
-    1.0 -- but that pair is still >24h apart in first_seen_ts (a multiple of 6
-    attackers' worth of 2-day steps) and each attacker has its own distinct funder,
-    so it never reaches the 2-of-3 signal threshold (Jaccard alone is only 1
-    signal). Every attacker therefore evades clustering entirely: `cluster_raters`
-    gives it its own singleton cluster."""
+    decoy DOES reach a Jaccard of exactly 1.0 (an identical ratee set {ratee, decoy})
+    -- but it still evades clustering, because that same pair fails BOTH of the
+    other two signals: they're on distinct funders, and (decoys repeat only every 6
+    attackers, i.e. a >= 12-day gap) that pair is always well outside the sybil time
+    window. Jaccard alone is only 1 of the 3 signals, short of the 2-of-3 threshold,
+    so no pair -- decoy-sharing or not -- ever clusters: `cluster_raters` gives every
+    attacker its own singleton cluster. `val` is the value attackers vote on `ratee`
+    with (0 = smear, a boosting value = boost); the decoy row always votes 0 (its
+    value is irrelevant to `ratee`'s own scoring)."""
     rows = []
     for i in range(n):
         ts = start_ts + i * 2 * DAY
-        rows.append(dict(rater=f"atk{i}", ratee=ratee, value=0, ts=ts, evidence_level=0))
+        rows.append(dict(rater=f"atk{i}", ratee=ratee, value=val, ts=ts, evidence_level=0))
         rows.append(dict(rater=f"atk{i}", ratee=f"D{(i % 6) + 1}", value=0, ts=ts, evidence_level=0))
     return rows
 
@@ -120,13 +123,78 @@ def scenario_h_rows(k, start_ts=1000 * DAY):
     return honest("A", 5) + farmless_attackers(k, start_ts=start_ts)
 
 
+# --- measured attacker break-even points (scenarios G and H's evasive pattern) ----
+#
+# All four break-even points below are found by scanning k (never hand-typed): the
+# smallest number of evidence-free, distinct-funder attackers that first moves the
+# robust_score away from the honest baseline, in each of the two directions (smear
+# = vote 0, boost = vote the maximum). Ties resolve downward (see aggregate.py's
+# `_TIE_EPS`/lower-median convention), so a smear campaign flips the score exactly
+# AT the mass tie while a boost needs to strictly exceed it (one more attacker).
+
+
+def _g_rows(k: int, val: int, ts0: int = 1000 * DAY):
+    """3 level-3 honest votes at 0.9 (mass 3.0) + k evidence-free attackers at `val`,
+    each on a distinct funder, 3 days apart (so attackers never cluster)."""
+    honest_l3 = [dict(rater=f"hl{i}", ratee="A", value=90, ts=i * 7 * DAY, evidence_level=3) for i in range(3)]
+    attackers = [dict(rater=f"atk{i}", ratee="A", value=val, ts=ts0 + i * 3 * DAY, evidence_level=0)
+                 for i in range(k)]
+    return honest_l3 + attackers
+
+
+def _h_rows(k: int, val: int, ts0: int = 1000 * DAY):
+    """5 level-2 honest votes at 0.8 (mass 3.5) + k evasive attackers (see
+    `farmless_attackers`) at `val`."""
+    return honest("A", 5) + farmless_attackers(k, start_ts=ts0, val=val)
+
+
+def _score_distinct_funders(rows):
+    """Score `rows` for ratee "A", with every rater on its own distinct funder
+    (`meta_distinct`) -- the shared baseline for the G/H break-even searches."""
+    df = build(rows)
+    clusters = cluster_raters(profiles_from_records(df, meta_distinct(rows)), CFG)
+    return score(df, CFG, clusters=clusters).set_index("ratee").loc["A"]
+
+
+def _find_break_even(rows_fn, base: float, direction: str, k_range) -> tuple:
+    """Smallest k in `k_range` at which `rows_fn(k)`'s robust_score first moves away
+    from `base` in `direction` ("smear": strictly below `base`; "boost": strictly
+    above `base`). Returns `(k, row)`. Raises ValueError if no k in `k_range` flips
+    it -- the range given must be widened rather than the result hand-typed."""
+    moved = (lambda s: s < base) if direction == "smear" else (lambda s: s > base)
+    for k in k_range:
+        row = _score_distinct_funders(rows_fn(k))
+        if moved(row["robust_score"]):
+            return k, row
+    raise ValueError(f"no {direction} break-even found for k in {k_range}")
+
+
+def g_smear_breakeven():
+    return _find_break_even(lambda k: _g_rows(k, val=0), base=0.9, direction="smear", k_range=range(25, 40))
+
+
+def g_boost_breakeven():
+    return _find_break_even(lambda k: _g_rows(k, val=100), base=0.9, direction="boost", k_range=range(25, 40))
+
+
+def h_smear_breakeven():
+    return _find_break_even(lambda k: _h_rows(k, val=0), base=0.8, direction="smear", k_range=range(30, 45))
+
+
+def h_boost_breakeven():
+    return _find_break_even(lambda k: _h_rows(k, val=100), base=0.8, direction="boost", k_range=range(30, 45))
+
+
 def scenario_table() -> pd.DataFrame:
-    """Naive-vs-robust numbers for scenarios A, B, D, E, F, H(k=20), for the report.
+    """Naive-vs-robust numbers for scenarios A, B, D, E, F, H(k=20), plus three
+    measured attacker break-even rows, for the report.
 
     Side-effect free: computes and returns a DataFrame, never writes a file.
     Columns: scenario, naive_mean, robust_score, n_clusters, sybil_flag,
-    zero_evidence_ratio. All computed with `Config(bootstrap_n=0)` -- point
-    estimates only, no CI claims are made from this table.
+    zero_evidence_ratio, break_even_k (NaN except on the three break-even rows),
+    break_even_k_boost (set only on H_evasive_breakeven: the mirror boost-direction
+    k, alongside that row's own smear-direction break_even_k). All computed with
+    `Config(bootstrap_n=0)` -- point estimates only, no CI claims from this table.
     """
     a = run(honest("A", 5) + sybils("A", 50, val=100, ts=100 * DAY))
     b = run(honest("A", 5) + sybils("A", 50, val=0, ts=100 * DAY))
@@ -157,4 +225,21 @@ def scenario_table() -> pd.DataFrame:
         rows.append(dict(scenario=name, naive_mean=row["naive_mean"], robust_score=row["robust_score"],
                           n_clusters=row["n_clusters"], sybil_flag=row["sybil_flag"],
                           zero_evidence_ratio=row["zero_evidence_ratio"]))
+
+    g_smear_k, g_smear_row = g_smear_breakeven()
+    g_boost_k, g_boost_row = g_boost_breakeven()
+    h_smear_k, h_smear_row = h_smear_breakeven()
+    h_boost_k, _h_boost_row = h_boost_breakeven()
+
+    def _breakeven_row(name, row, k, k_boost=None):
+        d = dict(scenario=name, naive_mean=row["naive_mean"], robust_score=row["robust_score"],
+                  n_clusters=row["n_clusters"], sybil_flag=row["sybil_flag"],
+                  zero_evidence_ratio=row["zero_evidence_ratio"], break_even_k=k)
+        if k_boost is not None:
+            d["break_even_k_boost"] = k_boost
+        return d
+
+    rows.append(_breakeven_row("G_smear_breakeven", g_smear_row, g_smear_k))
+    rows.append(_breakeven_row("G2_boost_breakeven", g_boost_row, g_boost_k))
+    rows.append(_breakeven_row("H_evasive_breakeven", h_smear_row, h_smear_k, k_boost=h_boost_k))
     return pd.DataFrame(rows)

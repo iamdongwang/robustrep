@@ -10,14 +10,15 @@ return a one-line summary string -- this lets tests monkeypatch the
 the whole command end-to-end without any network access.
 
 ``report`` generates figures 1-5, ``report.md`` and ``scores.json`` under
-``out_dir/<block>/`` and ``out_dir/latest/``; it shares ``_load_and_score``
-with ``score`` for the load -> cluster -> score sequence.
+``out_dir/<block>/``, then publishes an atomic copy to ``out_dir/latest/``.
 """
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
@@ -301,36 +302,33 @@ def score(
         f"-> {out} (rater profile mode: {mode})")
 
 
-def _load_and_score(db: Path, cfg: Config):
-    """Load records + rater metadata from the store at ``db``, cluster raters, and
-    score. Returns ``(records, clusters, result)``; ``clusters``/``result`` are
-    both ``None`` when ``records`` is empty -- callers must check
-    ``records.empty`` before using them. A ``ValueError`` from clustering or
-    scoring (malformed data, or too many candidate sybil pairs) is not caught
-    here; callers convert it into a clean CLI failure.
-    """
-    with Store(db) as store:
-        records = store.load_records()
-        if records.empty:
-            return records, None, None
-        clusters = cluster_raters(profiles_from_records(records, store.load_rater_meta()), cfg)
-        result = score_fn(records, cfg, clusters=clusters)
-    return records, clusters, result
-
-
-# Figure file names, in report order -- shared between the "which figures did
-# we draw" bookkeeping and the actual draw calls in `report()` below.
-_FIG_MEAN_VS_ROBUST = "fig1_mean_vs_robust.png"
-_FIG_RANK_SHIFT = "fig2_rank_shift.png"
-_FIG_EVIDENCE = "fig3_evidence.png"
-_FIG_SYBIL_CLUSTERS = "fig4_sybil_clusters.png"
-_FIG_SENSITIVITY = "fig5_sensitivity.png"
+# Figure titles (heading text) -> file names, in report order. Titles are what
+# `render_markdown` uses as the Markdown heading/alt text (never a raw
+# filename); the mapping keeps the two in one place.
+_FIGURES = {
+    "Fig 1. Mean vs robust score": "fig1_mean_vs_robust.png",
+    "Fig 2. Biggest rank drops": "fig2_rank_shift.png",
+    "Fig 3. Evidence levels": "fig3_evidence.png",
+    "Fig 4. Largest rater clusters": "fig4_sybil_clusters.png",
+    "Fig 5. Ranking stability": "fig5_sensitivity.png",
+}
 
 
 def _provenance(mode: str, cfg: Config) -> dict:
+    config = dict(
+        bootstrap_n=cfg.bootstrap_n,
+        bootstrap_seed=cfg.bootstrap_seed,
+        min_clusters=cfg.min_clusters,
+        evidence_weights=list(cfg.evidence_weights),
+        sybil_jaccard=cfg.sybil_jaccard,
+        sybil_window_s=cfg.sybil_window_s,
+        sybil_max_group=cfg.sybil_max_group,
+        sybil_flag_share=cfg.sybil_flag_share,
+    )
     return dict(
         rater_profile_mode=mode,
         confirmations=cfg.confirmations,
+        config=config,
         versions={"robustrep": __version__, "numpy": numpy.__version__, "pandas": pandas.__version__},
     )
 
@@ -339,17 +337,37 @@ def _write_report(target: Path, result, records, clusters, sens, adv, block: int
                   top_n: int) -> None:
     """Draw all 5 figures and write report.md + scores.json into `target`."""
     target.mkdir(parents=True, exist_ok=True)
-    fig_mean_vs_robust(result, out=target / _FIG_MEAN_VS_ROBUST)
-    fig_rank_shift(result, out=target / _FIG_RANK_SHIFT, top_n=top_n)
-    fig_evidence(records, out=target / _FIG_EVIDENCE)
-    fig_sybil_clusters(records, clusters, out=target / _FIG_SYBIL_CLUSTERS)
-    fig_sensitivity(sens, out=target / _FIG_SENSITIVITY)
-    figures = {name: name for name in (
-        _FIG_MEAN_VS_ROBUST, _FIG_RANK_SHIFT, _FIG_EVIDENCE, _FIG_SYBIL_CLUSTERS, _FIG_SENSITIVITY)}
-    md = render_markdown(result, records, block=block, figures=figures, sensitivity=sens,
+    fig_mean_vs_robust(result, out=target / _FIGURES["Fig 1. Mean vs robust score"])
+    fig_rank_shift(result, out=target / _FIGURES["Fig 2. Biggest rank drops"], top_n=top_n)
+    fig_evidence(records, out=target / _FIGURES["Fig 3. Evidence levels"])
+    fig_sybil_clusters(records, clusters, out=target / _FIGURES["Fig 4. Largest rater clusters"])
+    fig_sensitivity(sens, out=target / _FIGURES["Fig 5. Ranking stability"])
+    md = render_markdown(result, records, block=block, figures=_FIGURES, sensitivity=sens,
                          adversarial=adv, provenance=provenance)
     (target / "report.md").write_text(md)
-    export_json(result, block=block, out=target / "scores.json")
+    export_json(result, block=block, out=target / "scores.json", config=provenance.get("config"))
+
+
+def _publish_latest(out_dir: Path, block_dir: Path) -> None:
+    """Atomically publish a copy of `block_dir` as `out_dir/latest/`.
+
+    Builds the new `latest/` contents in a temp directory first, then performs
+    the actual publish as a single `os.replace` -- atomic on POSIX. `os.replace`
+    can only atomically swap onto an EMPTY directory (or none at all), so any
+    previous `latest/` is removed immediately before that final replace: stale
+    files from an earlier run never linger alongside the new ones.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    latest = out_dir / "latest"
+    tmp_parent = Path(tempfile.mkdtemp(dir=out_dir))
+    try:
+        staged = tmp_parent / "latest"
+        shutil.copytree(block_dir, staged)
+        if latest.exists():
+            shutil.rmtree(latest)
+        os.replace(staged, latest)
+    finally:
+        shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
 @app.command()
@@ -362,9 +380,9 @@ def report(
         100, min=1, help="Top-N ratees (by naive mean / robust score) considered for the "
                          "rank-shift and sensitivity figures."),
 ) -> None:
-    """Generate figures 1-5, report.md and scores.json under out_dir/<block>/
-    and out_dir/latest/ (both written, so a fixed link always has the latest
-    report while every past run stays addressable by block number).
+    """Generate figures 1-5, report.md and scores.json under out_dir/<block>/,
+    then atomically publish a copy to out_dir/latest/ (a fixed link always has
+    the latest report while every past run stays addressable by block number).
 
     Exits 1 with "no records" if the store has no feedback rows yet (run
     fetch first), or with an ERROR line if the given options or the data
@@ -378,27 +396,30 @@ def report(
         raise typer.Exit(1)
 
     try:
-        records, clusters, result = _load_and_score(db, cfg)
+        with Store(db) as store:
+            records = store.load_records()
+            if records.empty:
+                typer.echo("no records")
+                raise typer.Exit(1)
+            meta = store.load_rater_meta()
+            clusters = cluster_raters(profiles_from_records(records, meta), cfg)
+            result = score_fn(records, cfg, clusters=clusters)
+            mode = store.get_sync("rater_profile_mode") or "unknown"
+            last_block = store.get_sync("last_block")
     except ValueError as e:
         typer.echo(f"ERROR: {e}")
         raise typer.Exit(1)
-    if records.empty:
-        typer.echo("no records")
-        raise typer.Exit(1)
-
-    with Store(db) as store:
-        mode = store.get_sync("rater_profile_mode") or "unknown"
-        last_block = store.get_sync("last_block")
     block = int(last_block) if last_block is not None else 0
 
-    sens = sensitivity_table(records, cfg, top_n=top_n)
+    sens = sensitivity_table(records, cfg, meta=meta, top_n=top_n)
     adv = scenario_table()
     provenance = _provenance(mode, cfg)
 
-    for target in (out_dir / str(block), out_dir / "latest"):
-        _write_report(target, result, records, clusters, sens, adv, block, provenance, top_n)
+    block_dir = out_dir / str(block)
+    _write_report(block_dir, result, records, clusters, sens, adv, block, provenance, top_n)
+    _publish_latest(out_dir, block_dir)
 
-    typer.echo(f"report written to {out_dir / str(block)} and {out_dir / 'latest'} "
+    typer.echo(f"report written to {block_dir} and {out_dir / 'latest'} "
               f"(rater profile mode: {mode})")
 
 
