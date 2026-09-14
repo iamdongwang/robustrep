@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .aggregate import Aggregator, bootstrap_ci_sorted, weighted_median
+from .aggregate import Aggregator, bootstrap_ci, weighted_median
 from .config import Config
 from .evidence import weights_for
 from .normalize import normalize
@@ -83,21 +83,21 @@ def _ci(scores: np.ndarray, weights: np.ndarray, tag_codes: np.ndarray, cfg: Con
     """Bootstrap CI over the vote array.
 
     A ratee voted on under a single tag (the common case) takes the fully
-    vectorized `bootstrap_ci_sorted` path -- with one tag, `_total` reduces
-    to a plain `weighted_median(scores, weights)`, so a single multinomial
-    draw of shape (bootstrap_n, n_votes) computes the whole bootstrap
-    distribution with no per-resample Python/pandas work. A ratee with
-    votes under more than one tag needs the two-level (per-tag, then
-    across-tag) statistic recomputed on every resample -- a resample can
-    change which tags are even present in it -- so that path loops `_total`
-    once per resample. Both paths take the caller-supplied `rng`.
+    vectorized `bootstrap_ci` path -- with one tag, `_total` reduces to a
+    plain `weighted_median(scores, weights)`, so a single (chunked)
+    multinomial draw computes the whole bootstrap distribution with no
+    per-resample Python/pandas work. A ratee with votes under more than one
+    tag needs the two-level (per-tag, then across-tag) statistic recomputed
+    on every resample -- a resample can change which tags are even present
+    in it -- so that path loops `_total` once per resample. Both paths take
+    the caller-supplied `rng`.
     """
     n = len(scores)
     if n == 1 or cfg.bootstrap_n == 0:
         s = _total(scores, weights, tag_codes)
         return s, s
     if len(np.unique(tag_codes)) == 1:
-        return bootstrap_ci_sorted(scores, weights, cfg.bootstrap_n, rng, cfg.ci_level)
+        return bootstrap_ci(scores, weights, cfg.bootstrap_n, rng, cfg.ci_level)
     idx = rng.integers(0, n, size=(cfg.bootstrap_n, n))
     boots = np.array([_total(scores[i], weights[i], tag_codes[i]) for i in idx])
     a = (1 - cfg.ci_level) / 2
@@ -160,22 +160,25 @@ def score(records: pd.DataFrame, cfg: Config = Config(), clusters: Optional[dict
     # O(n_ratees * n_votes) and too slow at ~28k ratees).
     votes_by_ratee = dict(tuple(votes.groupby("ratee", sort=False)))
 
-    # Per-ratee stats, vectorized once over the whole frame rather than
+    # Per-ratee stats, vectorized once over the whole frame (one groupby
+    # pass covering all three "ratee"-keyed aggregates) rather than
     # recomputed from a raw per-ratee group in a Python loop.
-    n_raw = df.groupby("ratee").size()
-    naive_mean = df.groupby("ratee")["score"].mean()
-    zero_evidence_ratio = (df["evidence_level"] == 0).groupby(df["ratee"]).mean()
+    stats = df.groupby("ratee").agg(
+        n_raw=("score", "size"),
+        naive_mean=("score", "mean"),
+        zero_evidence_ratio=("evidence_level", lambda s: (s == 0).mean()),
+    )
     cluster_counts = df.groupby(["ratee", "cluster"]).size()
-    max_cluster_share = cluster_counts.groupby(level=0).max() / n_raw
+    max_cluster_share = cluster_counts.groupby(level=0).max() / stats["n_raw"]
 
     rows = []
-    for ratee in n_raw.index:
+    for ratee in stats.index:
         v = votes_by_ratee[ratee]
         n_clusters = int(v["cluster"].nunique())
-        row = dict(ratee=ratee, n_clusters=n_clusters, n_raw=int(n_raw.loc[ratee]),
-                   zero_evidence_ratio=float(zero_evidence_ratio.loc[ratee]),
+        row = dict(ratee=ratee, n_clusters=n_clusters, n_raw=int(stats.at[ratee, "n_raw"]),
+                   zero_evidence_ratio=float(stats.at[ratee, "zero_evidence_ratio"]),
                    sybil_flag=int(max_cluster_share.loc[ratee] >= cfg.sybil_flag_share),
-                   naive_mean=float(naive_mean.loc[ratee]))
+                   naive_mean=float(stats.at[ratee, "naive_mean"]))
         if n_clusters < cfg.min_clusters:
             row.update(robust_score=np.nan, ci_low=np.nan, ci_high=np.nan, insufficient=1)
         else:

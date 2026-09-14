@@ -23,6 +23,38 @@ _TIE_EPS = 1e-9
 # weight for the CI to be considered meaningful.
 MIN_VALID_BOOT_FRACTION = 0.1
 
+# Cap on the number of (resample x vote) float64 cells materialized at once
+# by `bootstrap_ci`'s chunked multinomial draw, so peak memory stays bounded
+# even for a ratee with thousands of votes: a chunk holds at most this many
+# cells regardless of how large `n_boot` is.
+_MAX_BOOT_CHUNK_CELLS = 2_000_000
+
+
+def _validate(values: np.ndarray, weights: np.ndarray, name: str) -> tuple[np.ndarray, np.ndarray]:
+    """Shared input validation for `weighted_median` and `bootstrap_ci`.
+
+    Coerces both to 1-D float64 arrays and validates: 1-D, non-empty, equal
+    length, all-finite (no NaN/+/-inf), weights non-negative, and weights
+    summing to > 0. Returns the coerced `(values, weights)`. Raises
+    ValueError (messages prefixed with `name`, the caller's own name) on any
+    violation.
+    """
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if values.ndim != 1 or weights.ndim != 1:
+        raise ValueError(f"{name}: values/weights must be 1-D")
+    if values.shape[0] == 0:
+        raise ValueError(f"{name}: values/weights must not be empty")
+    if values.shape != weights.shape:
+        raise ValueError(f"{name}: values and weights must have the same length")
+    if not np.isfinite(values).all() or not np.isfinite(weights).all():
+        raise ValueError(f"{name}: values/weights must not contain non-finite entries (NaN/inf)")
+    if (weights < 0).any():
+        raise ValueError(f"{name}: weights must be non-negative")
+    if weights.sum() <= 0:
+        raise ValueError(f"{name}: weights must sum to > 0")
+    return values, weights
+
 
 def _weighted_median_sorted(v: np.ndarray, w: np.ndarray) -> float:
     """Weighted median of already-sorted, already-validated inputs.
@@ -50,29 +82,49 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
 
     Raises ValueError if `values`/`weights` are not 1-D, are empty,
     mismatched in length, contain NaN or +/-inf, or if any weight is
-    negative or all weights are zero.
+    negative or all weights are zero (see `_validate`).
     """
-    values = np.asarray(values, dtype=float)
-    weights = np.asarray(weights, dtype=float)
-    if values.ndim != 1 or weights.ndim != 1:
-        raise ValueError("weighted_median: values/weights must be 1-D")
-    if values.shape[0] == 0:
-        raise ValueError("weighted_median: values/weights must not be empty")
-    if values.shape != weights.shape:
-        raise ValueError("weighted_median: values and weights must have the same length")
-    if not np.isfinite(values).all() or not np.isfinite(weights).all():
-        raise ValueError("weighted_median: values/weights must not contain non-finite entries (NaN/inf)")
-    if (weights < 0).any():
-        raise ValueError("weighted_median: weights must be non-negative")
-
+    values, weights = _validate(values, weights, "weighted_median")
     order = np.argsort(values, kind="stable")
-    v, w = values[order], weights[order]
-    if np.cumsum(w)[-1] <= 0:
-        raise ValueError("weighted_median: weights must sum to > 0")
-    return _weighted_median_sorted(v, w)
+    return _weighted_median_sorted(values[order], weights[order])
 
 
-def bootstrap_ci_sorted(
+def _bootstrap_draws(
+    v_sorted: np.ndarray,
+    w_sorted: np.ndarray,
+    n_boot: int,
+    rng: np.random.Generator,
+    chunk_size: int,
+) -> np.ndarray:
+    """The array of valid weighted-median bootstrap draws (length <= n_boot).
+
+    `v_sorted`/`w_sorted` must already be sorted ascending by value. Draws
+    are generated `chunk_size` resamples at a time via
+    `rng.multinomial(n, [1/n]*n, size=chunk_size)` (see `bootstrap_ci` for
+    why a multinomial count draw is equivalent to classic index resampling
+    with replacement) and accumulated, so peak memory is bounded by
+    `chunk_size * n` regardless of `n_boot`. A resample whose weights sum to
+    zero has an undefined weighted median and is dropped from the result
+    rather than counted.
+    """
+    n = len(v_sorted)
+    pvals = np.full(n, 1.0 / n)
+    boots = []
+    remaining = n_boot
+    while remaining > 0:
+        take = min(chunk_size, remaining)
+        remaining -= take
+        counts = rng.multinomial(n, pvals, size=take)
+        cum = np.cumsum(counts * w_sorted, axis=1)
+        valid = cum[:, -1] > 0
+        cum_valid = cum[valid]
+        half = 0.5 * cum_valid[:, -1:]
+        idx = (cum_valid >= half * (1 - _TIE_EPS)).argmax(axis=1)
+        boots.append(v_sorted[idx])
+    return np.concatenate(boots) if boots else np.array([], dtype=float)
+
+
+def bootstrap_ci(
     values: np.ndarray,
     weights: np.ndarray,
     n_boot: int,
@@ -86,40 +138,35 @@ def bootstrap_ci_sorted(
     without a Python-level loop over resamples. A resample's weighted
     median depends only on how many times each *position* was drawn (its
     resample count), not on the order of the draws, so after sorting
-    `values` once (stable), `rng.multinomial(n, [1/n]*n, size=n_boot)`
-    produces every resample's per-position counts in a single call --
-    equivalent to drawing n indices with replacement n_boot times -- and
-    the cumulative sum of `counts * sorted_weights` along each row gives
-    every resample's weighted median in one vectorized pass. This is what
-    keeps the per-ratee bootstrap affordable at ~28k ratees.
+    `values` once (stable), `rng.multinomial(n, [1/n]*n, size=chunk)`
+    produces a batch of resamples' per-position counts in a single call --
+    equivalent to drawing n indices with replacement, once per resample --
+    and the cumulative sum of `counts * sorted_weights` along each row gives
+    every resample's weighted median in one vectorized pass (see
+    `_bootstrap_draws`). Processed in chunks of at most
+    `max(1, 2_000_000 // n)` resamples so peak memory stays bounded even for
+    a ratee with thousands of votes; this is what keeps the per-ratee
+    bootstrap affordable at ~28k ratees.
 
-    Same degenerate-resample handling as before: a resample whose weights
-    sum to zero has an undefined weighted median and is skipped rather than
-    counted. If fewer than `max(2, n_boot // 10)` resamples remain valid,
-    raises ValueError instead of silently reporting a CI built from too few
-    (or zero) samples. Skipping all-zero resamples conditions the CI on
-    non-zero weight; unreachable in-pipeline since Config forbids zero
-    weights.
+    Inputs are validated exactly like `weighted_median` (see `_validate`).
+    A resample whose weights sum to zero has an undefined weighted median
+    and is skipped rather than counted. If fewer than `max(2, n_boot // 10)`
+    resamples remain valid, raises ValueError instead of silently reporting
+    a CI built from too few (or zero) samples. Skipping all-zero resamples
+    conditions the CI on non-zero weight; unreachable in-pipeline since
+    Config forbids zero weights.
     """
-    values = np.asarray(values, dtype=float)
-    weights = np.asarray(weights, dtype=float)
+    values, weights = _validate(values, weights, "bootstrap_ci")
     n = len(values)
     order = np.argsort(values, kind="stable")
     v_sorted, w_sorted = values[order], weights[order]
 
-    counts = rng.multinomial(n, np.full(n, 1.0 / n), size=n_boot)
-    cum = np.cumsum(counts * w_sorted, axis=1)
-    totals = cum[:, -1]
-    valid = totals > 0
+    chunk_size = max(1, _MAX_BOOT_CHUNK_CELLS // n)
+    boots = _bootstrap_draws(v_sorted, w_sorted, n_boot, rng, chunk_size)
 
     min_valid = max(2, int(n_boot * MIN_VALID_BOOT_FRACTION))
-    if int(valid.sum()) < min_valid:
+    if boots.size < min_valid:
         raise ValueError("bootstrap degenerate: too many zero-weight resamples")
-
-    cum_valid = cum[valid]
-    half = 0.5 * cum_valid[:, -1:]
-    idx = (cum_valid >= half * (1 - _TIE_EPS)).argmax(axis=1)
-    boots = v_sorted[idx]
 
     alpha = (1 - ci_level) / 2
     lo, hi = np.quantile(boots, [alpha, 1 - alpha])
@@ -134,11 +181,11 @@ def _bootstrap_ci(
     ci_level: float,
 ) -> tuple[float, float]:
     """Bootstrap (lo, hi) quantiles of the weighted median, seeded by a plain
-    integer `seed`. Thin wrapper around `bootstrap_ci_sorted` (the one
-    bootstrap implementation) for callers that don't manage their own
+    integer `seed`. Thin wrapper around `bootstrap_ci` (the one bootstrap
+    implementation) for callers that don't manage their own
     `numpy.random.Generator`.
     """
-    return bootstrap_ci_sorted(values, weights, n_boot, np.random.default_rng(seed), ci_level)
+    return bootstrap_ci(values, weights, n_boot, np.random.default_rng(seed), ci_level)
 
 
 class Aggregator(ABC):

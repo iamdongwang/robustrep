@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 
 from robustrep.aggregate import (
-    Aggregator, WeightedMedian, _bootstrap_ci, bootstrap_ci_sorted, weighted_median,
+    Aggregator, WeightedMedian, _bootstrap_ci, _bootstrap_draws, _weighted_median_sorted,
+    bootstrap_ci, weighted_median,
 )
 from robustrep.config import Config
 
@@ -183,41 +184,52 @@ def test_from_config():
     assert agg.ci_level == 0.9
 
 
-def test_bootstrap_ci_sorted_matches_loop(rng):
-    # Random 6-vote input. The multinomial-vectorized path and the
-    # per-resample loop draw from different RNG streams so their raw
-    # quantiles need not match exactly, but with n_boot=2000 both should:
-    # (a) bracket the point estimate (widened the same way the pipeline
-    # widens its CIs, since neither raw bootstrap function guarantees
-    # containment on its own), (b) stay within the observed [min, max] of
-    # values, and (c) land close to each other.
-    vals = rng.uniform(0, 1, size=6)
-    weights = rng.uniform(0.1, 1.0, size=6)
-    point = weighted_median(vals, weights)
+def test_bootstrap_ci_matches_index_resampling():
+    # Fixed 6-vote input. Compare the library's vectorized (multinomial)
+    # bootstrap against an independent, directly-coded classic index
+    # resampling loop (draw n indices with replacement per resample,
+    # compute the weighted median of each draw) -- not via any library
+    # internals beyond the already-tested `_weighted_median_sorted`. Both
+    # draw 20,000 boots from rngs spun off the same SeedSequence family.
+    # Since a weighted median always lands on one of the original values,
+    # bucket each method's boots by those support points and compare the
+    # resulting frequency distributions.
+    vals = np.array([0.12, 0.53, 0.77, 0.31, 0.66, 0.90])
+    weights = np.array([0.4, 0.9, 0.2, 0.7, 1.0, 0.3])
+    n = len(vals)
+    n_boot = 20_000
 
-    lo_loop, hi_loop = _bootstrap_ci(vals, weights, 2000, seed=1, ci_level=0.95)
-    lo_loop, hi_loop = min(lo_loop, point), max(hi_loop, point)
+    vec_rng, idx_rng = (np.random.default_rng(s) for s in np.random.SeedSequence(0).spawn(2))
 
-    lo_vec, hi_vec = bootstrap_ci_sorted(vals, weights, 2000, np.random.default_rng(2), 0.95)
-    lo_vec, hi_vec = min(lo_vec, point), max(hi_vec, point)
+    order = np.argsort(vals, kind="stable")
+    v_sorted, w_sorted = vals[order], weights[order]
+    vec_boots = _bootstrap_draws(v_sorted, w_sorted, n_boot, vec_rng, chunk_size=n_boot)
 
-    assert lo_loop <= point <= hi_loop
-    assert lo_vec <= point <= hi_vec
-    assert vals.min() <= lo_loop <= hi_loop <= vals.max()
-    assert vals.min() <= lo_vec <= hi_vec <= vals.max()
-    assert abs(lo_loop - lo_vec) < 0.15
-    assert abs(hi_loop - hi_vec) < 0.15
+    idx = idx_rng.integers(0, n, size=(n_boot, n))
+    idx_boots = []
+    for row in idx:
+        vi, wi = vals[row], weights[row]
+        if wi.sum() <= 0:
+            continue
+        o = np.argsort(vi, kind="stable")
+        idx_boots.append(_weighted_median_sorted(vi[o], wi[o]))
+    idx_boots = np.array(idx_boots)
+
+    support = np.unique(vals)
+    vec_freq = np.array([(vec_boots == s).mean() for s in support])
+    idx_freq = np.array([(idx_boots == s).mean() for s in support])
+    assert np.max(np.abs(vec_freq - idx_freq)) < 0.01
 
 
-def test_bootstrap_ci_sorted_is_deterministic_given_same_rng_state():
+def test_bootstrap_ci_is_deterministic_given_same_rng_state():
     vals = np.array([0.1, 0.4, 0.6, 0.9])
     weights = np.ones(4)
-    r1 = bootstrap_ci_sorted(vals, weights, 500, np.random.default_rng(7), 0.95)
-    r2 = bootstrap_ci_sorted(vals, weights, 500, np.random.default_rng(7), 0.95)
+    r1 = bootstrap_ci(vals, weights, 500, np.random.default_rng(7), 0.95)
+    r2 = bootstrap_ci(vals, weights, 500, np.random.default_rng(7), 0.95)
     assert r1 == r2
 
 
-def test_bootstrap_ci_sorted_degenerate_raises():
+def test_bootstrap_ci_degenerate_raises():
     # Same reasoning as test_bootstrap_degenerate_raises: n=2, one weight is
     # zero, n_boot=2 needs >= 2 valid resamples so a single all-zero
     # resample already triggers the guard.
@@ -226,8 +238,30 @@ def test_bootstrap_ci_sorted_degenerate_raises():
     raised = False
     for seed in range(200):
         try:
-            bootstrap_ci_sorted(vals, weights, 2, np.random.default_rng(seed), 0.95)
+            bootstrap_ci(vals, weights, 2, np.random.default_rng(seed), 0.95)
         except ValueError:
             raised = True
             break
     assert raised is True
+
+
+def test_bootstrap_ci_rejects_non_finite_input():
+    with pytest.raises(ValueError, match="non-finite"):
+        bootstrap_ci(np.array([0.1, np.inf]), np.ones(2), 10, np.random.default_rng(0), 0.95)
+    with pytest.raises(ValueError, match="non-finite"):
+        bootstrap_ci(np.array([0.1, 0.2]), np.array([1.0, np.nan]), 10, np.random.default_rng(0), 0.95)
+
+
+def test_bootstrap_ci_chunked_completes_for_many_votes():
+    # 1 ratee x 20,000 votes: exercises the chunked multinomial draw path
+    # (chunk_size = max(1, 2_000_000 // 20_000) = 100 << n_boot). No memory
+    # assertion -- just confirm it completes and returns a CI bracketing a
+    # sane range.
+    rng = np.random.default_rng(3)
+    vals = rng.uniform(0, 1, size=20_000)
+    weights = rng.uniform(0.1, 1.0, size=20_000)
+    point = weighted_median(vals, weights)
+    lo, hi = bootstrap_ci(vals, weights, 1000, np.random.default_rng(4), 0.95)
+    lo, hi = min(lo, point), max(hi, point)
+    assert lo <= point <= hi
+    assert 0.0 <= lo <= hi <= 1.0
