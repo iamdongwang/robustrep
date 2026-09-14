@@ -10,6 +10,7 @@ endpoint does not stall the whole sync.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Callable, Optional
 from urllib.parse import urlsplit
@@ -22,6 +23,41 @@ logger = logging.getLogger(__name__)
 class RpcError(RuntimeError):
     """Raised when a JSON-RPC call/batch fails on every configured retry, or
     immediately for a non-retryable error (see ``NON_RETRYABLE``)."""
+
+
+class RpcBatchUnsupportedError(RpcError):
+    """Base class for a batch-level failure that means *batching itself* is
+    unusable against this endpoint -- as opposed to an ordinary transient
+    failure or a single call's own error. Raised immediately (no retry, no
+    URL rotation, no backoff): identically re-attempting the same batch
+    cannot succeed, so retrying would only burn the full backoff schedule
+    for a guaranteed repeat failure. Callers that batch across many chunks
+    (see ``base_erc8004.fill_block_timestamps``/``owners_of``) catch this
+    base class specifically to permanently stop attempting ``batch()`` for
+    the rest of the run and fall back to per-item calls (each of which keeps
+    retrying normally -- only *batching* is abandoned, not the RPC calls
+    themselves)."""
+
+
+class RpcBatchStructureError(RpcBatchUnsupportedError):
+    """A batch response that is structurally wrong: not a list, the wrong
+    number of entries, mismatched ids, or an entry with a missing/null
+    ``result``. Unlike a JSON-RPC error body (a legitimate per-call failure,
+    e.g. a revert) or a transport error (plausibly transient), this means the
+    endpoint does not support -- or mishandles -- JSON-RPC batching at all
+    (observed in the wild: a public node returning a single error *object*
+    instead of a *list* for a 100-call batch)."""
+
+
+class RpcBatchRateLimitError(RpcBatchUnsupportedError):
+    """A batch request whose response reports an "over rate limit" JSON-RPC
+    error (see ``BATCH_RATE_LIMIT``) on any entry. Observed in the wild:
+    ``mainnet.base.org`` throttles *batched* requests far more aggressively
+    than the equivalent single calls, returning ``[-32016] over rate limit``
+    reliably on every 100-call batch while individual calls succeed fine --
+    so, unlike an ordinary rate-limited single call (which should keep
+    retrying/rotating as normal), a batch hitting this is a signal to stop
+    batching entirely, not to keep re-attempting the same doomed batch."""
 
 
 def _endpoint(url: str) -> str:
@@ -62,10 +98,23 @@ def _redact(last: Optional[BaseException], url: str) -> str:
 # the retry budget.
 NON_RETRYABLE = ("limited to a", "invalid params", "-32602", "-32600")
 
+# Substrings (case-insensitive) of a JSON-RPC error message/code that mean "you
+# are being rate-limited" -- checked only against a *batch* entry's error (see
+# ``_check_batch``). A single call hitting one of these should still retry/rotate
+# normally (rate limits are transient); a *batch* hitting one is instead treated
+# as evidence the endpoint throttles batching specifically, see
+# ``RpcBatchRateLimitError``.
+BATCH_RATE_LIMIT = ("over rate limit", "-32016", "-32005")
+
 
 def _is_non_retryable(message: str) -> bool:
     low = message.lower()
     return any(s.lower() in low for s in NON_RETRYABLE)
+
+
+def _is_batch_rate_limited(message: str) -> bool:
+    low = message.lower()
+    return any(s.lower() in low for s in BATCH_RATE_LIMIT)
 
 
 class RpcClient:
@@ -76,14 +125,40 @@ class RpcClient:
     public endpoints 403 the default ``python-requests`` UA), an injectable
     ``session`` (for tests) and ``sleep`` function (so backoff is instant in
     tests), and ``retries``/``timeout`` knobs.
+
+    ``session`` is thread-local when not injected: each calling thread gets
+    its own lazily-created ``requests.Session`` (via the ``session`` property
+    below), since a single ``requests.Session`` is not guaranteed safe to
+    share across threads and ``classify_all`` may drive one ``RpcClient``
+    from a thread pool. An explicitly injected ``session`` (the test-only
+    path) is used as-is, shared by every thread -- tests rely on this to
+    observe every call through one fake session.
     """
 
     def __init__(self, urls, user_agent: str, session=None, retries: int = 5, timeout: int = 30,
                  sleep: Callable[[float], None] = time.sleep):
         self.urls, self.i = list(urls), 0
         self.headers = {"content-type": "application/json", "user-agent": user_agent}
-        self.session = session or requests.Session()
+        self._injected_session = session
+        self._local = threading.local()
         self.retries, self.timeout, self.sleep = retries, timeout, sleep
+
+    @property
+    def session(self):
+        """The ``requests.Session`` to use on the calling thread.
+
+        Returns the injected session as-is when one was given to ``__init__``
+        (shared across every thread -- this is what tests inject and assert
+        against). Otherwise returns this thread's own lazily-created session,
+        creating one on first access from a given thread.
+        """
+        if self._injected_session is not None:
+            return self._injected_session
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            self._local.session = sess
+        return sess
 
     def _post(self, payload):
         url = self.urls[self.i % len(self.urls)]
@@ -96,8 +171,11 @@ class RpcClient:
         ``check(body)`` returns a non-``None`` error message. Raises ``RpcError``
         naming the last failure once ``retries`` attempts are exhausted, or
         immediately (no rotation, no sleep, no further attempts) if ``check``
-        reports a ``NON_RETRYABLE`` error. The final failed attempt is never
-        followed by a sleep, since nothing more will be tried afterwards.
+        reports a ``NON_RETRYABLE`` error, or if ``check`` itself raises (as
+        ``_check_batch`` does for ``RpcBatchStructureError``/``RpcBatchRateLimitError``
+        -- neither of these is caught here, so they propagate straight through
+        on the very first attempt). The final failed attempt is never followed
+        by a sleep, since nothing more will be tried afterwards.
 
         The final ``RpcError``'s message is redacted (see ``_redact``): it
         never contains the raw exception text or full request URL, only the
@@ -149,18 +227,29 @@ class RpcClient:
 
     @classmethod
     def _check_batch(cls, n: int, body) -> Optional[str]:
+        """Validate a batch response body, either returning a retryable error
+        message (an ordinary per-entry JSON-RPC error) or raising directly
+        for a failure that retrying cannot fix -- see ``RpcBatchStructureError``
+        (malformed shape: not a list, wrong count, id mismatch, missing/null
+        result) and ``RpcBatchRateLimitError`` (an entry's error reports the
+        endpoint is rate-limiting this batch specifically). Raising instead
+        of returning skips ``_with_retry``'s retry/backoff/rotation entirely,
+        the same way a ``NON_RETRYABLE`` single-call error does."""
         if not isinstance(body, list) or len(body) != n:
             got = len(body) if isinstance(body, list) else type(body).__name__
-            return f"malformed batch response: expected {n} entries, got {got}"
+            raise RpcBatchStructureError(f"malformed batch response: expected {n} entries, got {got}")
         ids = sorted(x.get("id") for x in body if isinstance(x, dict))
         if ids != list(range(1, n + 1)):
-            return f"malformed batch response: ids {ids} != 1..{n}"
+            raise RpcBatchStructureError(f"malformed batch response: ids {ids} != 1..{n}")
         for item in body:
             err = item.get("error")
             if err is not None:
-                return f"batch entry id={item.get('id')}: {cls._error_message(err)}"
+                msg = cls._error_message(err)
+                if _is_batch_rate_limited(msg):
+                    raise RpcBatchRateLimitError(f"batch entry id={item.get('id')}: {msg}")
+                return f"batch entry id={item.get('id')}: {msg}"
             if item.get("result") is None:
-                return f"batch entry id={item.get('id')}: missing result"
+                raise RpcBatchStructureError(f"batch entry id={item.get('id')}: missing result")
         return None
 
     def call(self, method: str, params: list):
@@ -180,11 +269,15 @@ class RpcClient:
         ``calls``, matched by response ``id`` (not response position -- servers
         are free to return batch entries in any order).
 
-        Raises ``RpcError`` if every retry either transport-fails, returns a
-        response that isn't a list of exactly ``len(calls)`` entries, returns
-        entries whose ids aren't exactly ``{1..len(calls)}``, or contains an
-        entry with a non-null ``error`` or a missing/null ``result``. A
-        non-retryable error (see ``NON_RETRYABLE``) raises immediately.
+        Raises ``RpcError`` if every retry transport-fails or an entry has a
+        non-null JSON-RPC ``error`` (retried like a single-call error, subject
+        to the same ``NON_RETRYABLE`` immediate-raise). Raises immediately --
+        no retry, no rotation, no backoff -- via a more specific subclass when
+        the failure means retrying the batch itself is pointless:
+        ``RpcBatchStructureError`` (the response isn't a list of exactly
+        ``len(calls)`` entries, entry ids aren't exactly ``{1..len(calls)}``,
+        or an entry has a missing/null ``result``) or ``RpcBatchRateLimitError``
+        (an entry's error reports the batch itself is rate-limited).
         """
         n = len(calls)
         payload = [{"jsonrpc": "2.0", "id": i + 1, "method": m, "params": p} for i, (m, p) in enumerate(calls)]
