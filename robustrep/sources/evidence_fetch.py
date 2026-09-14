@@ -58,6 +58,8 @@ import base64
 import ipaddress
 import logging
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Sequence
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -310,20 +312,35 @@ def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Call
 
 def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
                   tx_parties: Callable[[str], Optional[set]] = lambda h: None,
-                  log_every: int = 500) -> int:
+                  log_every: int = 500, workers: int = 8) -> int:
     """Classify every distinct URI referenced by ``feedback`` that is not yet in
     the evidence cache, and persist each result via ``store.upsert_evidence``.
 
     ``parties`` passed to ``classify`` for each URI is the union of every
     rater address (``feedback.client``) and agent-owner address that used it.
 
-    Opens one ``requests.Session`` for the whole call (connection-pool reuse
-    across every URI) and passes it to ``fetch_text`` as the ``session``
-    keyword. Iterates the query's cursor directly (no ``fetchall()``) so a
-    100k-row batch never holds the whole result set in memory at once. Logs
-    progress at INFO every ``log_every`` URIs; ``log_every <= 0`` disables
-    progress logging entirely (also guards against a ``ZeroDivisionError``
-    from ``% log_every``). Returns the number of URIs processed.
+    The pending ``(uri, parties)`` rows are read into a list up front (a
+    ~34k-row batch is fine in memory), then classified concurrently across
+    ``workers`` threads (``concurrent.futures.ThreadPoolExecutor``) -- each
+    URI's fetch+classify (``_classify_uri``, including its own per-URI
+    exception guard) runs in a worker thread. ``store.upsert_evidence`` is
+    called ONLY from this (the main) thread, as each future completes via
+    ``as_completed``: ``Store`` wraps a single ``sqlite3`` connection opened
+    with the default ``check_same_thread=True`` and is not safe to write from
+    multiple threads. ``workers=1`` behaves like the previous sequential
+    implementation (results identical; the order of store writes is not
+    guaranteed either way).
+
+    Each worker thread lazily creates and reuses its own ``requests.Session``
+    (via thread-local storage) for every ``fetch_text`` call it makes --
+    sessions are never shared across threads, since a single
+    ``requests.Session`` is not guaranteed safe for concurrent use. Every
+    created session is closed once all URIs have been processed.
+
+    Logs progress at INFO every ``log_every`` URIs *completed* (regardless of
+    completion order); ``log_every <= 0`` disables progress logging entirely
+    (also guards against a ``ZeroDivisionError`` from ``% log_every``).
+    Returns the number of URIs processed.
     """
     # feedback.client and agents.owner are 0x-hex addresses, which never
     # contain a comma, so GROUP_CONCAT's default "," separator can't collide
@@ -332,21 +349,47 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
            FROM feedback f LEFT JOIN agents a ON a.agent_id=f.agent_id
            WHERE f.feedback_uri<>'' AND NOT EXISTS (SELECT 1 FROM evidence_cache e WHERE e.uri=f.feedback_uri)
            GROUP BY f.feedback_uri"""
-    cursor = store.conn.execute(q)
-    session = requests.Session()
+    # Read every pending row up front (rather than streaming the cursor): the
+    # correlated NOT EXISTS sub-select re-reads evidence_cache on every row,
+    # which is only safe to interleave with writes when nothing is written
+    # back until the whole pending set has been captured -- concurrent
+    # workers writing mid-scan (as they complete, out of order) could
+    # otherwise race the cursor's own re-evaluation of NOT EXISTS.
+    rows = store.conn.execute(q).fetchall()
+
+    thread_local = threading.local()
+    sessions: list = []
+    sessions_lock = threading.Lock()
+
+    def _thread_session():
+        sess = getattr(thread_local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            thread_local.session = sess
+            with sessions_lock:
+                sessions.append(sess)
+        return sess
+
+    def _classify_one(uri: str, parties: set):
+        session = _thread_session()
+        return _classify_uri(uri, parties, fetch_text, tx_parties, session)
+
     processed = 0
     try:
-        # The query's correlated NOT EXISTS re-reads evidence_cache on every row as
-        # the cursor is scanned; safe here only because each upsert_evidence() below
-        # inserts a row for the URI the scan just visited (never one still ahead of
-        # it) -- do not reorder this loop to insert speculatively or out of order.
-        for uri, clients, owners in cursor:
-            processed += 1
-            parties = {p for p in (clients or "").split(",") + (owners or "").split(",") if p}
-            level, note = _classify_uri(uri, parties, fetch_text, tx_parties, session)
-            store.upsert_evidence(uri, level, note)
-            if log_every > 0 and processed % log_every == 0:
-                _log.info("classify_all: processed %d URIs", processed)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_uri = {}
+            for uri, clients, owners in rows:
+                parties = {p for p in (clients or "").split(",") + (owners or "").split(",") if p}
+                future = executor.submit(_classify_one, uri, parties)
+                future_to_uri[future] = uri
+            for future in as_completed(future_to_uri):
+                uri = future_to_uri[future]
+                level, note = future.result()
+                store.upsert_evidence(uri, level, note)
+                processed += 1
+                if log_every > 0 and processed % log_every == 0:
+                    _log.info("classify_all: processed %d URIs", processed)
     finally:
-        session.close()
+        for sess in sessions:
+            sess.close()
     return processed

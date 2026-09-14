@@ -118,9 +118,9 @@ def _step_sync(store: Store, rpc: RpcClient, cfg: Config, to_block: Optional[int
     return f"feedback rows added: {n}"
 
 
-def _step_timestamps(store: Store, rpc: RpcClient) -> str:
+def _step_timestamps(store: Store, rpc: RpcClient, batch_state: Optional[base.BatchState] = None) -> str:
     """Resolve block timestamps for every block referenced by feedback rows."""
-    n = base.fill_block_timestamps(store, rpc)
+    n = base.fill_block_timestamps(store, rpc, state=batch_state)
     still_missing = store.n_missing_block_ts()
     if still_missing > 0:
         typer.echo(f"WARNING: {still_missing} block(s) still missing a cached timestamp")
@@ -128,23 +128,29 @@ def _step_timestamps(store: Store, rpc: RpcClient) -> str:
 
 
 def _step_owners(store: Store, rpc: RpcClient, log_every: int = OWNER_LOG_EVERY,
-                  batch_size: int = OWNER_BATCH_DEFAULT) -> str:
+                  batch_size: int = OWNER_BATCH_DEFAULT, batch_state: Optional[base.BatchState] = None) -> str:
     """Resolve the IdentityRegistry owner for every not-yet-resolved agent id.
 
     Owners are resolved ``batch_size`` at a time via ``base.owners_of`` (one
     JSON-RPC batch call per chunk instead of one ``eth_call`` per agent --
     ``owners_of`` itself falls back to per-agent calls if a chunk's batch
-    fails). Every agent id is recorded, even when no owner resolves -- as an
-    empty string (``Store.upsert_agent_owner`` accepts one; the evidence
-    classification join already filters falsy owners out of its parties set)
-    -- so an unresolved agent is never re-queried on a later run. Logs
-    progress at INFO every ``log_every`` agents (not every chunk).
+    fails). Every chunk shares one ``base.BatchState`` (``batch_state``, or a
+    fresh one if not given) so that once any chunk's batch fails with an
+    ``RpcBatchUnsupportedError`` (batching itself doesn't work against this
+    endpoint), every later chunk skips straight to per-agent calls instead of
+    re-attempting an identical, doomed batch call. Every agent id is
+    recorded, even when no owner resolves -- as an empty string
+    (``Store.upsert_agent_owner`` accepts one; the evidence classification
+    join already filters falsy owners out of its parties set) -- so an
+    unresolved agent is never re-queried on a later run. Logs progress at
+    INFO every ``log_every`` agents (not every chunk).
     """
     agents = store.distinct_agents()
     resolved = 0
+    batch_state = batch_state or base.BatchState()
     for i in range(0, len(agents), batch_size):
         chunk = agents[i:i + batch_size]
-        owners = base.owners_of(rpc, chunk, batch_size=batch_size)
+        owners = base.owners_of(rpc, chunk, batch_size=batch_size, state=batch_state)
         for j, agent_id in enumerate(chunk):
             owner = owners.get(agent_id)
             store.upsert_agent_owner(agent_id, owner or "")
@@ -179,9 +185,10 @@ def _step_raters(store: Store, etherscan_key: Optional[str]) -> str:
     return f"raters profiled: {n}{fallback_note}; rater profile mode: {mode}"
 
 
-def _step_evidence(store: Store, rpc: RpcClient) -> str:
-    """Classify every not-yet-cached evidence URI referenced by feedback rows."""
-    n = classify_all(store, tx_parties=lambda h: base.tx_parties(rpc, h))
+def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
+    """Classify every not-yet-cached evidence URI referenced by feedback rows,
+    fetching+classifying up to ``workers`` URIs concurrently."""
+    n = classify_all(store, tx_parties=lambda h: base.tx_parties(rpc, h), workers=workers)
     return f"evidence URIs classified: {n}"
 
 
@@ -205,6 +212,9 @@ def fetch(
         help="Agents resolved per JSON-RPC batch call for owner resolution (1 = one call per agent)."),
     skip_raters: bool = typer.Option(False, "--skip-raters", help="Skip rater profile enrichment."),
     skip_evidence: bool = typer.Option(False, "--skip-evidence", help="Skip evidence URI classification."),
+    evidence_workers: int = typer.Option(
+        8, "--evidence-workers", min=1,
+        help="Concurrent worker threads used to fetch+classify evidence URIs."),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print what would be synced and exit, without any network calls."),
 ) -> None:
@@ -238,15 +248,20 @@ def fetch(
 
     rpc = RpcClient(cfg.rpc_urls, user_agent=cfg.user_agent)
     partial_failure = False
+    # Shared across every batch-capable step of this run: once one step's
+    # batch calls are found to fail structurally (or get batch-rate-limited),
+    # every later step also skips straight to per-item calls instead of
+    # re-discovering the same doomed batch failure from scratch.
+    batch_state = base.BatchState()
 
     with Store(db) as store:
         with _rpc_guard():
             typer.echo(_step_sync(store, rpc, cfg, to_block))
-            typer.echo(_step_timestamps(store, rpc))
+            typer.echo(_step_timestamps(store, rpc, batch_state=batch_state))
             if skip_owners:
                 typer.echo("agent owner resolution skipped")
             else:
-                typer.echo(_step_owners(store, rpc, batch_size=owner_batch))
+                typer.echo(_step_owners(store, rpc, batch_size=owner_batch, batch_state=batch_state))
 
         if skip_raters:
             mode = store.get_sync("rater_profile_mode") or "unknown"
@@ -262,7 +277,7 @@ def fetch(
             if skip_evidence:
                 typer.echo("evidence classification skipped")
             else:
-                typer.echo(_step_evidence(store, rpc))
+                typer.echo(_step_evidence(store, rpc, workers=evidence_workers))
 
     if partial_failure:
         raise typer.Exit(2)

@@ -533,6 +533,56 @@ def test_fetch_rejects_non_positive_owner_batch(tmp_path):
     assert r.exit_code == 2
 
 
+# --- fetch: --evidence-workers ------------------------------------------------
+
+
+def test_fetch_evidence_workers_reaches_classify_all(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db)
+    seen = {}
+
+    def _capture(store, tx_parties=None, workers=8, **kwargs):
+        seen["workers"] = workers
+        return 0
+
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", _capture)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--evidence-workers", "3"])
+    assert r.exit_code == 0, r.output
+    assert seen["workers"] == 3
+
+
+def test_fetch_evidence_workers_defaults_to_eight(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db)
+    seen = {}
+
+    def _capture(store, tx_parties=None, workers=8, **kwargs):
+        seen["workers"] = workers
+        return 0
+
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", _capture)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert seen["workers"] == 8
+
+
+def test_fetch_rejects_non_positive_evidence_workers(tmp_path):
+    r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--evidence-workers", "0", "--dry-run"])
+    assert r.exit_code == 2
+
+
 # --- ValueError handling (Config / cluster_raters / validate_records) ---------
 
 
