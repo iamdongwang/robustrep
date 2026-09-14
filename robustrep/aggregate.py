@@ -25,7 +25,8 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     order-independent convention rather than numpy's mean-of-two-middles.
 
     Raises ValueError if `values`/`weights` are empty, mismatched in length,
-    contain NaN, or if any weight is negative or all weights are zero.
+    contain NaN or +/-inf, or if any weight is negative or all weights are
+    zero.
     """
     values = np.asarray(values, dtype=float)
     weights = np.asarray(weights, dtype=float)
@@ -33,8 +34,8 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
         raise ValueError("weighted_median: values/weights must not be empty")
     if values.shape != weights.shape:
         raise ValueError("weighted_median: values and weights must have the same length")
-    if np.isnan(values).any() or np.isnan(weights).any():
-        raise ValueError("weighted_median: values/weights must not contain NaN")
+    if not np.isfinite(values).all() or not np.isfinite(weights).all():
+        raise ValueError("weighted_median: values/weights must not contain non-finite entries (NaN/inf)")
     if (weights < 0).any():
         raise ValueError("weighted_median: weights must be non-negative")
     if weights.sum() <= 0:

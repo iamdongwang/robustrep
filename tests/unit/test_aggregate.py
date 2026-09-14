@@ -52,6 +52,16 @@ def test_weighted_median_rejects_bad_weights():
         weighted_median(np.array([0.1, 0.2, 0.3]), np.array([1.0, 1.0]))
 
 
+def test_weighted_median_rejects_inf_value():
+    with pytest.raises(ValueError, match="non-finite"):
+        weighted_median(np.array([0.1, np.inf]), np.ones(2))
+
+
+def test_weighted_median_rejects_inf_weight():
+    with pytest.raises(ValueError, match="non-finite"):
+        weighted_median(np.array([0.1, 0.2]), np.array([1.0, np.inf]))
+
+
 def test_weighted_median_ties_and_even_counts():
     # lower-median convention: side="left"
     assert weighted_median(np.array([0.2, 0.8]), np.ones(2)) == 0.2
