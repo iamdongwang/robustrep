@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 ETHERSCAN_V2 = "https://api.etherscan.io/v2/api"
 BASE_CHAIN_ID = 8453
+# Default Etherscan V2 request rate (free-tier limit); shared by EtherscanClient's
+# throttle and by callers (e.g. the CLI) that need to estimate wall-clock time for
+# a run via `estimate_seconds` before it starts.
+DEFAULT_RPS = 4.0
 
 # Substrings (case-insensitive) of an Etherscan V2 error ``result``/``message``
 # that indicate the request itself is permanently rejected (bad key) -- retrying
@@ -69,7 +73,7 @@ class EtherscanClient:
     100,000 addresses at the default 4 requests/sec (see ``estimate_seconds``).
     """
 
-    def __init__(self, api_key: str, chain_id: int = BASE_CHAIN_ID, session=None, rps: float = 4.0,
+    def __init__(self, api_key: str, chain_id: int = BASE_CHAIN_ID, session=None, rps: float = DEFAULT_RPS,
                  retries: int = 3, sleep: Callable[[float], None] = time.sleep):
         self.key, self.chain_id = api_key, chain_id
         self.session = session or requests.Session()

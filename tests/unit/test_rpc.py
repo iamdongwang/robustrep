@@ -159,3 +159,38 @@ def test_non_retryable_error_matches_via_code():
         c.call("m", [])
     assert len(s.calls) == 1
     assert sleeps == []
+
+
+def test_gives_up_message_never_includes_raw_exception_text_or_url():
+    # Many paid RPC providers embed an API key right in the URL path (e.g.
+    # ".../v2/<key>"); requests/urllib3 exceptions stringify the *whole*
+    # request URL, so surfacing str(exc) verbatim would leak it into logs,
+    # CLI output, or a bug report. The RpcError message must carry only the
+    # exception type and the endpoint's scheme+host -- never the raw text.
+    secret_url = "https://rpc.example.com/v2/SUPER_SECRET"
+    s = FakeSession([requests.ConnectionError(f"Failed to establish a connection to {secret_url}")] * 2)
+    c = RpcClient([secret_url], user_agent="ua", session=s, sleep=lambda _: None, retries=2)
+    with pytest.raises(RpcError) as exc_info:
+        c.call("m", [])
+    msg = str(exc_info.value)
+    assert "SUPER_SECRET" not in msg
+    assert secret_url not in msg
+    assert "ConnectionError" in msg
+    assert "rpc.example.com" in msg  # bare scheme+host is fine, not a secret
+
+
+def test_gives_up_message_includes_http_status_code():
+    class FakeResponse:
+        status_code = 503
+
+    err = requests.exceptions.HTTPError("503 Server Error: url: https://rpc.example.com/v2/SUPER_SECRET")
+    err.response = FakeResponse()
+    s = FakeSession([err] * 2)
+    c = RpcClient(["https://rpc.example.com/v2/SUPER_SECRET"], user_agent="ua", session=s,
+                   sleep=lambda _: None, retries=2)
+    with pytest.raises(RpcError) as exc_info:
+        c.call("m", [])
+    msg = str(exc_info.value)
+    assert "SUPER_SECRET" not in msg
+    assert "503" in msg
+    assert "rpc.example.com" in msg
