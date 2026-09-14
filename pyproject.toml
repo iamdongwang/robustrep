@@ -16,6 +16,7 @@ dependencies = [
   "eth-abi>=5.0",
   "eth-hash[pycryptodome]>=0.5",
   "requests>=2.31",
+  "urllib3>=2",
   "tabulate>=0.9",
   "matplotlib>=3.7",
   "typer>=0.12",

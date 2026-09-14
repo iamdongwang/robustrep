@@ -31,32 +31,54 @@ class FakeResp:
         self.status_code = status_code
         self.headers = headers or {}
         self.raw = FakeRaw(body)
+        self.closed = False
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"http {self.status_code}")
 
+    def close(self):
+        self.closed = True
+
 
 class FakeSession:
-    """Serves canned responses per URL; records every .get() call."""
+    """Serves canned responses per URL; records every .get() call. Raises
+    loudly (not silently) on a URL it wasn't told to expect, so a guard that
+    fails open is caught by the assertion failure, not masked as "no call"."""
 
     def __init__(self, by_url):
         self.by_url = dict(by_url)
         self.calls = []
 
     def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
+        self.calls.append(url)
         resp = self.by_url.get(url)
         if resp is None:
-            raise AssertionError(f"unexpected fetch of {url}")
+            raise RuntimeError(f"unexpected fetch of {url}")
         if isinstance(resp, Exception):
             raise resp
         return resp
 
 
 class NeverCalledSession:
-    def get(self, *a, **k):
-        raise AssertionError("session.get must not be called")
+    """A session that must never be used. Records the call (so a refusal test
+    can assert the exact -- here, empty -- set of URLs that were fetched) and
+    then raises, so a guard that fails open surfaces as a loud RuntimeError
+    rather than silently returning None from a session that quietly no-ops.
+
+    Regression check for this fixture itself: temporarily making
+    `_is_safe_url` always return True turns every refusal test in this file
+    red (either on the RuntimeError propagating, or on the `sess.calls == []`
+    assertion), confirming these tests actually detect a fail-open guard
+    rather than passing vacuously.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        raise RuntimeError("session.get must not be called for a refused URL")
 
 
 # --- resolve_uri / basic http_fetch_text (task's own contract tests) ------------
@@ -75,6 +97,12 @@ def test_http_fetch_text_handles_data_uri_and_failure():
             raise RuntimeError("x")
 
     assert http_fetch_text("https://a", session=Boom()) is None
+
+
+def test_http_fetch_text_rejects_non_str_and_empty_uri():
+    assert http_fetch_text(None) is None
+    assert http_fetch_text("") is None
+    assert http_fetch_text(123) is None
 
 
 # --- classify_all (task's own contract test) -------------------------------------
@@ -107,7 +135,38 @@ def test_classify_all_uses_cache_and_parties(tmp_path):
     n = classify_all(s, fetch_text=fetch, tx_parties=parties)
     assert n == 2 and sorted(fetched) == ["https://bad", "https://good"]
     assert s.evidence_level("https://good") == 3 and s.evidence_level("https://bad") == 1
+    # "good" was fetched successfully -> note ""; "bad"'s fetch returned None
+    # (per `fetch` above) -> note "unfetchable" (see the dedicated test below
+    # for the level-1-but-fetched-successfully case, which also gets note "").
+    good_note = s.conn.execute("SELECT note FROM evidence_cache WHERE uri='https://good'").fetchone()[0]
+    bad_note = s.conn.execute("SELECT note FROM evidence_cache WHERE uri='https://bad'").fetchone()[0]
+    assert good_note == "" and bad_note == "unfetchable"
     assert classify_all(s, fetch_text=fetch, tx_parties=parties) == 0  # cached
+
+
+def test_classify_all_notes_unfetchable_vs_empty_vs_fetch_error(tmp_path):
+    s = Store(tmp_path / "tnotes.db")
+    s.upsert_feedback([
+        _fb("https://never-fetched"),
+        {**_fb("https://boom"), "feedback_index": 1},
+        {**_fb("https://no-evidence"), "feedback_index": 2},
+    ])
+
+    def fetch(uri, session=None):
+        if uri == "https://never-fetched":
+            return None  # genuinely unfetchable
+        if uri == "https://boom":
+            raise RuntimeError("boom")  # fetch_text violating its no-raise contract
+        return "just some prose, no tx hash or taskId here"  # fetched fine, level 1
+
+    n = classify_all(s, fetch_text=fetch)
+    assert n == 3
+    note = s.conn.execute("SELECT note FROM evidence_cache WHERE uri='https://never-fetched'").fetchone()[0]
+    assert note == "unfetchable"
+    note2 = s.conn.execute("SELECT note FROM evidence_cache WHERE uri='https://boom'").fetchone()[0]
+    assert note2 == "fetch-error"
+    note3 = s.conn.execute("SELECT note FROM evidence_cache WHERE uri='https://no-evidence'").fetchone()[0]
+    assert s.evidence_level("https://no-evidence") == 1 and note3 == ""
 
 
 # --- SSRF guard -------------------------------------------------------------------
@@ -118,27 +177,46 @@ def test_classify_all_uses_cache_and_parties(tmp_path):
     "http://10.0.0.1/x",
     "http://169.254.169.254/latest/meta-data",
     "http://[::1]/",
+    "http://localhost./x",  # trailing FQDN dot must not bypass the localhost check
 ])
 def test_ssrf_guard_refuses_local_and_link_local_hosts(uri):
-    assert http_fetch_text(uri, session=NeverCalledSession()) is None
+    sess = NeverCalledSession()
+    assert http_fetch_text(uri, session=sess) is None
+    assert sess.calls == []
 
 
 def test_ssrf_guard_refuses_non_standard_port():
-    assert http_fetch_text("https://evil.example:8443/", session=NeverCalledSession()) is None
+    sess = NeverCalledSession()
+    assert http_fetch_text("https://evil.example:8443/", session=sess) is None
+    assert sess.calls == []
 
 
 def test_ssrf_guard_refuses_malformed_port():
-    assert http_fetch_text("http://evil.example:abc/", session=NeverCalledSession()) is None
-    assert http_fetch_text("http://evil.example:99999/", session=NeverCalledSession()) is None
+    sess = NeverCalledSession()
+    assert http_fetch_text("http://evil.example:abc/", session=sess) is None
+    assert http_fetch_text("http://evil.example:99999/", session=sess) is None
+    assert sess.calls == []
 
 
 def test_ssrf_guard_refuses_unparseable_ipv6_url():
-    assert http_fetch_text("http://[::1", session=NeverCalledSession()) is None
+    sess = NeverCalledSession()
+    assert http_fetch_text("http://[::1", session=sess) is None
+    assert sess.calls == []
 
 
-def test_ssrf_guard_allows_public_ip_literal():
-    sess = FakeSession({"http://8.8.8.8/x": FakeResp(200, body=b"ok")})
-    assert http_fetch_text("http://8.8.8.8/x", session=sess) == "ok"
+def test_ssrf_guard_refuses_ip_literal_outright_even_when_public():
+    # A bare IP literal is refused regardless of whether it's public --
+    # evidence URIs must name a resolvable host so every fetch goes through
+    # the resolver-based check, with no "it's just an IP" bypass.
+    sess = NeverCalledSession()
+    assert http_fetch_text("http://8.8.8.8/x", session=sess) is None
+    assert sess.calls == []
+
+
+def test_ssrf_guard_refuses_non_ascii_host():
+    sess = NeverCalledSession()
+    assert http_fetch_text("http://faß.example/x", session=sess) is None  # "faß.example"
+    assert sess.calls == []
 
 
 # _is_safe_url / _is_disallowed_ip: internal units, covering branches
@@ -157,18 +235,42 @@ def test_is_disallowed_ip_true_for_non_ip_string():
     assert _is_disallowed_ip("not-an-ip") is True
 
 
+def test_is_disallowed_ip_refuses_cgnat_and_6to4_loopback():
+    assert _is_disallowed_ip("100.64.0.1") is True  # CGNAT shared address space
+    assert _is_disallowed_ip("2002:7f00:1::") is True  # 6to4 embedding 127.0.0.1
+    assert _is_disallowed_ip("93.184.216.34") is False  # sanity: a real public IP is allowed
+
+
 def test_ssrf_guard_refuses_when_resolver_returns_garbage():
+    sess = NeverCalledSession()
+
     def resolver(host):
         return ["not-an-ip"]
 
-    assert http_fetch_text("http://public.example/x", session=NeverCalledSession(), resolver=resolver) is None
+    assert http_fetch_text("http://public.example/x", session=sess, resolver=resolver) is None
+    assert sess.calls == []
 
 
 def test_ssrf_guard_refuses_when_resolver_returns_private_ip():
+    sess = NeverCalledSession()
+
     def resolver(host):
         return ["10.1.2.3"]
 
-    assert http_fetch_text("http://internal.example/x", session=NeverCalledSession(), resolver=resolver) is None
+    assert http_fetch_text("http://internal.example/x", session=sess, resolver=resolver) is None
+    assert sess.calls == []
+
+
+def test_ssrf_guard_refuses_mixed_public_and_private_resolved_addresses():
+    # Any disallowed address in the resolver's answer refuses the whole host,
+    # even if a public address is also present.
+    sess = NeverCalledSession()
+
+    def resolver(host):
+        return ["93.184.216.34", "10.0.0.5"]
+
+    assert http_fetch_text("http://multi.example/x", session=sess, resolver=resolver) is None
+    assert sess.calls == []
 
 
 def test_ssrf_guard_allows_public_resolved_host():
@@ -177,8 +279,7 @@ def test_ssrf_guard_allows_public_resolved_host():
 
     sess = FakeSession({"http://public.example/x": FakeResp(200, body=b"hello")})
     assert http_fetch_text("http://public.example/x", session=sess, resolver=resolver) == "hello"
-    assert sess.calls[0][1]["allow_redirects"] is False
-    assert sess.calls[0][1]["timeout"] == (5, 10)
+    assert sess.calls == ["http://public.example/x"]
 
 
 # --- redirects ----------------------------------------------------------------------
@@ -191,6 +292,9 @@ def test_redirect_to_private_host_refused():
         "https://public.example/a": FakeResp(302, headers={"location": "https://internal.example/b"}),
     })
     assert http_fetch_text("https://public.example/a", session=sess, resolver=resolver) is None
+    # Only the first (public) hop is ever fetched -- the internal redirect
+    # target must never reach session.get.
+    assert sess.calls == ["https://public.example/a"]
 
 
 def test_redirect_to_public_host_followed():
@@ -202,6 +306,7 @@ def test_redirect_to_public_host_followed():
         "https://public.example/b": FakeResp(200, body=b"final body"),
     })
     assert http_fetch_text("https://public.example/a", session=sess, resolver=resolver) == "final body"
+    assert sess.calls == ["https://public.example/a", "https://public.example/b"]
 
 
 def test_transport_error_returns_none():
@@ -216,7 +321,9 @@ def test_transport_error_returns_none():
 
 
 def test_unrecognized_scheme_returns_none():
-    assert http_fetch_text("ftp://public.example/x") is None
+    sess = NeverCalledSession()
+    assert http_fetch_text("ftp://public.example/x", session=sess) is None
+    assert sess.calls == []
 
 
 def test_redirect_chain_longer_than_max_is_refused():
@@ -229,6 +336,56 @@ def test_redirect_chain_longer_than_max_is_refused():
             302, headers={"location": f"https://public.example/{i + 1}"})
     sess = FakeSession(by_url)
     assert http_fetch_text("https://public.example/0", session=sess, resolver=resolver) is None
+    # MAX_REDIRECTS=3: the initial fetch plus 3 hops = 4 calls, then refused.
+    assert sess.calls == [f"https://public.example/{i}" for i in range(4)]
+
+
+# --- response lifecycle: closed on every path ----------------------------------------
+
+def test_response_closed_on_success_redirect_and_error_paths():
+    def resolver(host):
+        return ["93.184.216.34"]
+
+    ok = FakeResp(200, body=b"hi")
+    redirect = FakeResp(302, headers={"location": "https://public.example/final"})
+    final = FakeResp(200, body=b"done")
+    err = FakeResp(500)
+
+    sess = FakeSession({
+        "https://public.example/ok": ok,
+        "https://public.example/redirect": redirect,
+        "https://public.example/final": final,
+        "https://public.example/err": err,
+    })
+
+    assert http_fetch_text("https://public.example/ok", session=sess, resolver=resolver) == "hi"
+    assert ok.closed is True
+
+    assert http_fetch_text("https://public.example/redirect", session=sess, resolver=resolver) == "done"
+    assert redirect.closed is True
+    assert final.closed is True
+
+    assert http_fetch_text("https://public.example/err", session=sess, resolver=resolver) is None
+    assert err.closed is True
+
+
+def test_response_closed_when_body_read_raises():
+    def resolver(host):
+        return ["93.184.216.34"]
+
+    class ExplodingRaw:
+        def read(self, n, decode_content=True):
+            raise RuntimeError("stream error")
+
+    class ExplodingResp(FakeResp):
+        def __init__(self):
+            super().__init__(200)
+            self.raw = ExplodingRaw()
+
+    resp = ExplodingResp()
+    sess = FakeSession({"https://public.example/explode": resp})
+    assert http_fetch_text("https://public.example/explode", session=sess, resolver=resolver) is None
+    assert resp.closed is True
 
 
 # --- size / content -------------------------------------------------------------------
@@ -270,6 +427,13 @@ def test_data_uri_base64_decodes():
     import base64
     payload = base64.b64encode(b'{"taskId":"1"}').decode()
     assert http_fetch_text(f"data:application/json;base64,{payload}") == '{"taskId":"1"}'
+
+
+def test_data_uri_base64_marker_case_insensitive():
+    import base64
+    payload = base64.b64encode(b'{"taskId":"1"}').decode()
+    assert http_fetch_text(f"data:application/json;BASE64,{payload}") == '{"taskId":"1"}'
+    assert http_fetch_text(f"data:application/json;Base64,{payload}") == '{"taskId":"1"}'
 
 
 def test_data_uri_invalid_base64_returns_none():
@@ -342,6 +506,20 @@ def test_classify_all_logs_progress(tmp_path, caplog):
     assert len(progress_msgs) == 2  # at i=2 and i=4
 
 
+def test_classify_all_log_every_zero_disables_progress_logging(tmp_path, caplog):
+    s = Store(tmp_path / "t3b.db")
+    rows = [{**_fb(f"https://v{i}"), "feedback_index": i} for i in range(3)]
+    s.upsert_feedback(rows)
+
+    def fetch(uri, session=None):
+        return None
+
+    with caplog.at_level(logging.INFO):
+        n = classify_all(s, fetch_text=fetch, log_every=0)  # must not raise ZeroDivisionError
+    assert n == 3
+    assert not [rec for rec in caplog.records if "processed" in rec.message]
+
+
 def test_classify_all_reuses_one_session_across_uris(tmp_path):
     s = Store(tmp_path / "t4.db")
     rows = [{**_fb(f"https://s{i}"), "feedback_index": i} for i in range(3)]
@@ -356,3 +534,25 @@ def test_classify_all_reuses_one_session_across_uris(tmp_path):
     assert len(seen_sessions) == 3
     assert len({id(x) for x in seen_sessions}) == 1
     assert all(x is not None for x in seen_sessions)
+
+
+# --- known limitation: DNS rebinding (documented, not mitigated in v0.1) -------------
+
+@pytest.mark.xfail(strict=True, reason="DNS rebinding not mitigated in v0.1 (see module docstring)")
+def test_dns_rebinding_not_mitigated_in_v0_1():
+    # The guard's resolver answers a public address (so the check passes), but
+    # a real rebinding attacker would have the *actual* connection -- made
+    # independently by requests/urllib3 -- land on a private address instead.
+    # We can't simulate the second, different resolution here (no real
+    # network), but we CAN show the guard has no way to stop the session from
+    # being used once it has passed on the first (attacker-controlled)
+    # answer -- i.e. the session is *not* protected end-to-end. This asserts
+    # the (currently false) safety property so it fails now and will start
+    # passing -- turning this xfail into a hard failure that flags the
+    # docstring/test for an update -- once pinned-IP fetching lands in v0.2.
+    def resolver(host):
+        return ["93.184.216.34"]  # public, on the guard's lookup
+
+    sess = NeverCalledSession()
+    http_fetch_text("http://rebind.example/x", session=sess, resolver=resolver)
+    assert sess.calls == []
