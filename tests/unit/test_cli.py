@@ -1,9 +1,12 @@
+import logging
+
 import pandas as pd
 from typer.testing import CliRunner
 
 from robustrep import cli
 from robustrep.cli import app
 from robustrep.schema import RESULT_COLUMNS
+from robustrep.sources.rpc import RpcError
 from robustrep.store import Store
 
 runner = CliRunner()
@@ -22,6 +25,38 @@ def _seed(db, n=4):
     s.upsert_block_ts([(1, 10)])
     for i in range(n):
         s.upsert_rater(f"0x{i:040x}", 10 + i * 100000, None)
+    s.close()
+
+
+def _seed_agents(db, agent_ids):
+    """Seed a store with one feedback row per agent id in ``agent_ids``
+    (distinct raters, all rater-profiled), for exercising ``_step_owners``
+    with more than one agent."""
+    s = Store(db)
+    rows = []
+    for i, agent_id in enumerate(agent_ids):
+        rows.append(dict(chain="base", block=1, tx_hash="0x", log_index=i, agent_id=agent_id,
+                          client=f"0x{i:040x}", feedback_index=0, value="80", value_decimals=0, tag1="q",
+                          tag2="", endpoint="", feedback_uri="", feedback_hash=""))
+    s.upsert_feedback(rows)
+    s.upsert_block_ts([(1, 10)])
+    for i in range(len(agent_ids)):
+        s.upsert_rater(f"0x{i:040x}", 10 + i * 100000, None)
+    s.close()
+
+
+def _seed_unprofiled(db, n=1):
+    """Seed a store with ``n`` feedback rows whose raters are NOT yet
+    profiled (``distinct_clients()`` returns them) -- for exercising the
+    Etherscan ETA branch of ``_step_raters``."""
+    s = Store(db)
+    rows = []
+    for i in range(n):
+        rows.append(dict(chain="base", block=1, tx_hash="0x", log_index=i, agent_id="1", client=f"0x{i:040x}",
+                          feedback_index=0, value="80", value_decimals=0, tag1="q", tag2="", endpoint="",
+                          feedback_uri="", feedback_hash=""))
+    s.upsert_feedback(rows)
+    s.upsert_block_ts([(1, 10)])
     s.close()
 
 
@@ -100,7 +135,7 @@ def test_fetch_command_requires_network_flag_free_dry_run(tmp_path):
 
 def test_fetch_end_to_end_with_stubs(tmp_path, monkeypatch):
     db = tmp_path / "t.db"
-    _seed(db, n=2)
+    _seed_agents(db, ["1", "2"])
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 3)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 2)
@@ -110,10 +145,11 @@ def test_fetch_end_to_end_with_stubs(tmp_path, monkeypatch):
 
     r = runner.invoke(app, ["fetch", "--db", str(db)])
     assert r.exit_code == 0, r.output
-    assert "3" in r.output  # feedback rows added
-    assert "2" in r.output  # block timestamps filled
-    assert "1" in r.output  # raters profiled
-    assert "5" in r.output  # evidence URIs classified
+    assert "feedback rows added: 3" in r.output
+    assert "block timestamps filled: 2" in r.output
+    assert "agent owners resolved: 2/2" in r.output
+    assert "raters profiled: 1" in r.output
+    assert "evidence URIs classified: 5" in r.output
     assert "rater profile mode" in r.output
 
 
@@ -267,8 +303,6 @@ def test_fetch_keyboard_interrupt_propagates(tmp_path, monkeypatch):
 
 
 def test_verbose_flag_sets_info_logging(tmp_path, monkeypatch):
-    import logging
-
     db = tmp_path / "t.db"
     _seed(db, n=1)
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
@@ -287,3 +321,332 @@ def test_help_lists_fetch_and_score():
     r = runner.invoke(app, ["--help"])
     assert r.exit_code == 0
     assert "fetch" in r.output and "score" in r.output
+
+
+# --- RPC error handling (redacted, exit 3) -------------------------------------
+
+
+def test_fetch_rpc_error_from_sync_step_exits_3_with_clean_message(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+
+    def _raise(*a, **k):
+        # Already-redacted, as rpc.py itself guarantees (see test_rpc.py) --
+        # this test only proves the CLI's own plumbing, not rpc.py's redaction.
+        raise RpcError("gave up after 5 attempts: ConnectionError contacting https://rpc.example.com")
+
+    monkeypatch.setattr(cli.base, "sync_feedback", _raise)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 3, r.output
+    assert "ERROR: RPC failed" in r.output
+    assert "re-run with --verbose" in r.output
+    assert "SUPER_SECRET" not in r.output
+    assert "Traceback" not in r.output
+
+
+def test_fetch_rpc_error_from_evidence_step_exits_3(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+
+    def _raise(*a, **k):
+        raise RpcError("gave up after 5 attempts: ConnectionError contacting https://rpc.example.com")
+
+    monkeypatch.setattr(cli, "classify_all", _raise)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 3, r.output
+    assert "ERROR: RPC failed" in r.output
+
+
+def test_fetch_closes_store_on_rpc_error(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+
+    def _raise(*a, **k):
+        raise RpcError("gave up: ConnectionError contacting https://rpc.example.com")
+
+    monkeypatch.setattr(cli.base, "sync_feedback", _raise)
+
+    closed = []
+    real_store_cls = cli.Store
+
+    class _TrackingStore(real_store_cls):
+        def close(self):
+            closed.append(1)
+            super().close()
+
+    monkeypatch.setattr(cli, "Store", _TrackingStore)
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 3, r.output
+    assert closed == [1]
+
+
+# --- _step_owners: always records, progress log, --skip-owners ----------------
+
+
+def test_step_owners_records_unresolved_and_skips_on_rerun(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed_agents(db, ["1"])
+    calls = []
+    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: calls.append(1) or None)
+
+    with Store(db) as store:
+        summary = cli._step_owners(store, _FakeRpc())
+        assert summary == "agent owners resolved: 0/1"
+        assert store.agent_owner("1") == ""  # recorded, even though unresolved
+
+        # a second run must not re-query an agent already recorded (with or
+        # without an owner) -- distinct_agents() excludes it now.
+        summary2 = cli._step_owners(store, _FakeRpc())
+        assert summary2 == "agent owners resolved: 0/0"
+    assert len(calls) == 1
+
+
+def test_step_owners_progress_logged_every_n(tmp_path, monkeypatch, caplog):
+    db = tmp_path / "t.db"
+    _seed_agents(db, ["1", "2", "3", "4"])
+    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+
+    with Store(db) as store:
+        with caplog.at_level(logging.INFO, logger=cli.__name__):
+            summary = cli._step_owners(store, _FakeRpc(), log_every=2)
+    assert summary == "agent owners resolved: 0/4"
+    # caplog's records already have `.message` fully formatted (its handler
+    # calls record.getMessage() as it captures each record).
+    progress = [r.message for r in caplog.records if "agent owners resolved" in r.message]
+    assert progress == ["fetch: agent owners resolved 2/4", "fetch: agent owners resolved 4/4"]
+
+
+def test_fetch_skip_owners_skips_owner_of(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    calls = []
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--skip-owners"])
+    assert r.exit_code == 0, r.output
+    assert calls == []
+    assert "agent owner resolution skipped" in r.output
+
+
+# --- ValueError handling (Config / cluster_raters / validate_records) ---------
+
+
+def test_fetch_config_value_error_exits_1(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+
+    def _raise_cfg(*a, **k):
+        raise ValueError("bad config")
+
+    monkeypatch.setattr(cli, "Config", _raise_cfg)
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 1, r.output
+    assert "ERROR: bad config" in r.output
+
+
+def test_score_config_value_error_exits_1(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db)
+
+    def _raise_cfg(*a, **k):
+        raise ValueError("bad cfg")
+
+    monkeypatch.setattr(cli, "Config", _raise_cfg)
+    r = runner.invoke(app, ["score", "--db", str(db)])
+    assert r.exit_code == 1, r.output
+    assert "ERROR: bad cfg" in r.output
+
+
+def test_score_cluster_raters_value_error_exits_1(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db)
+
+    def _raise(*a, **k):
+        raise ValueError("too many candidate pairs")
+
+    monkeypatch.setattr(cli, "cluster_raters", _raise)
+    r = runner.invoke(app, ["score", "--db", str(db)])
+    assert r.exit_code == 1, r.output
+    assert "ERROR: too many candidate pairs" in r.output
+
+
+# --- click-level option validation (exit 2) ------------------------------------
+
+
+def test_fetch_rejects_non_positive_chunk(tmp_path):
+    r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--chunk", "0", "--dry-run"])
+    assert r.exit_code == 2
+
+
+def test_fetch_rejects_negative_confirmations(tmp_path):
+    r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--confirmations", "-1", "--dry-run"])
+    assert r.exit_code == 2
+
+
+def test_score_rejects_negative_bootstrap_n(tmp_path):
+    r = runner.invoke(app, ["score", "--db", str(tmp_path / "t.db"), "--bootstrap-n", "-1"])
+    assert r.exit_code == 2
+
+
+def test_score_rejects_non_positive_min_clusters(tmp_path):
+    r = runner.invoke(app, ["score", "--db", str(tmp_path / "t.db"), "--min-clusters", "0"])
+    assert r.exit_code == 2
+
+
+def test_fetch_rejects_blank_etherscan_key(tmp_path):
+    r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--etherscan-key", "", "--dry-run"])
+    assert r.exit_code == 2
+
+
+# --- dry-run must not create the DB file ---------------------------------------
+
+
+def test_fetch_dry_run_does_not_create_db_file(tmp_path):
+    db = tmp_path / "new.db"
+    assert not db.exists()
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert not db.exists()
+
+
+def test_fetch_dry_run_uses_existing_checkpoint(tmp_path):
+    db = tmp_path / "t.db"
+    with Store(db) as store:
+        store.set_sync("last_block", "1000")
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert "would sync from block 1001" in r.output
+
+
+# --- score: mkdir parent for --out ----------------------------------------------
+
+
+def test_score_creates_out_parent_dir(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db)
+    out = tmp_path / "nested" / "dir" / "scores.csv"
+    r = runner.invoke(app, ["score", "--db", str(db), "--out", str(out), "--bootstrap-n", "10"])
+    assert r.exit_code == 0, r.output
+    assert out.exists()
+
+
+# --- Store used as a context manager (closed even on early exit) --------------
+
+
+def test_fetch_closes_store_on_success(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    closed = []
+    real_store_cls = cli.Store
+
+    class _TrackingStore(real_store_cls):
+        def close(self):
+            closed.append(1)
+            super().close()
+
+    monkeypatch.setattr(cli, "Store", _TrackingStore)
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert closed == [1]
+
+
+def test_score_closes_store_on_success(tmp_path):
+    db, out = tmp_path / "t.db", tmp_path / "scores.csv"
+    _seed(db)
+
+    closed = []
+    real_store_cls = cli.Store
+
+    class _TrackingStore(real_store_cls):
+        def close(self):
+            closed.append(1)
+            super().close()
+
+    orig = cli.Store
+    cli.Store = _TrackingStore
+    try:
+        r = runner.invoke(app, ["score", "--db", str(db), "--out", str(out), "--bootstrap-n", "10"])
+    finally:
+        cli.Store = orig
+    assert r.exit_code == 0, r.output
+    assert closed == [1]
+
+
+# --- _step_raters: ETA branch, single distinct_clients() call, DEFAULT_RPS ----
+
+
+def test_fetch_eta_branch_prints_estimate(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    class _FakeEtherscanClient:
+        def __init__(self, api_key):
+            pass
+
+    monkeypatch.setattr(cli, "EtherscanClient", _FakeEtherscanClient)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--etherscan-key", "k"])
+    assert r.exit_code == 0, r.output
+    assert "profiling 1 rater(s) via Etherscan" in r.output
+    assert "ETA" in r.output
+
+
+def test_step_raters_calls_distinct_clients_once(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+
+    with Store(db) as store:
+        calls = []
+        orig = store.distinct_clients
+
+        def _counting():
+            calls.append(1)
+            return orig()
+
+        store.distinct_clients = _counting
+        cli._step_raters(store, None)
+    assert len(calls) == 1
+
+
+def test_default_rps_exported_and_used_by_cli():
+    from robustrep.sources.rater_profile import DEFAULT_RPS
+
+    assert DEFAULT_RPS == 4.0
+    assert cli.DEFAULT_RPS == 4.0
+
+
+# --- help text: etherscan key recommends the env var ---------------------------
+
+
+def test_fetch_help_recommends_env_var_for_etherscan_key():
+    r = runner.invoke(app, ["fetch", "--help"])
+    assert r.exit_code == 0
+    assert "ETHERSCAN_API_KEY" in r.output

@@ -39,7 +39,7 @@ filterwarnings = ["error"]
 
 [tool.coverage.run]
 source = ["robustrep"]
-omit = ["robustrep/cli.py", "robustrep/report/*"]
+omit = ["robustrep/report/*"]
 
 [tool.coverage.report]
 fail_under = 80

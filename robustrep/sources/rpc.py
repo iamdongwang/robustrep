@@ -9,15 +9,51 @@ endpoint does not stall the whole sync.
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Callable, Optional
+from urllib.parse import urlsplit
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class RpcError(RuntimeError):
     """Raised when a JSON-RPC call/batch fails on every configured retry, or
     immediately for a non-retryable error (see ``NON_RETRYABLE``)."""
+
+
+def _endpoint(url: str) -> str:
+    """``url`` reduced to ``scheme://host`` -- strips path, query string,
+    port and userinfo, any of which may embed a provider API key (many paid
+    RPC providers put it right in the URL path, e.g. ``.../v2/<key>``)."""
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.hostname}"
+
+
+def _redact(last: Optional[BaseException], url: str) -> str:
+    """Render the last retry failure for an ``RpcError`` message without ever
+    including the raw ``requests``/``urllib3`` exception text or the full
+    request URL -- both routinely echo the whole URL (query string and all)
+    in their ``str()``, which would leak an API key embedded in it straight
+    into logs, CLI output or a bug report. Only the exception type, an HTTP
+    status code when available, and the endpoint's bare ``scheme://host``
+    survive into the message; full detail still reaches DEBUG-level logs.
+
+    ``last`` being our own ``RpcError`` (raised from ``check()`` on a
+    malformed/JSON-RPC-level error) is not a raw transport exception -- its
+    message is text we constructed ourselves -- so it is passed through
+    unredacted.
+    """
+    endpoint = _endpoint(url)
+    if isinstance(last, requests.exceptions.HTTPError):
+        status = getattr(getattr(last, "response", None), "status_code", None)
+        status_part = f" (HTTP {status})" if status is not None else ""
+        return f"HTTPError{status_part} from {endpoint}"
+    if isinstance(last, requests.RequestException):
+        return f"{type(last).__name__} contacting {endpoint}"
+    return str(last)
 
 
 # Substrings (case-insensitive) of a JSON-RPC error message/code that indicate the
@@ -61,9 +97,17 @@ class RpcClient:
         naming the last failure once ``retries`` attempts are exhausted, or
         immediately (no rotation, no sleep, no further attempts) if ``check``
         reports a ``NON_RETRYABLE`` error. The final failed attempt is never
-        followed by a sleep, since nothing more will be tried afterwards."""
+        followed by a sleep, since nothing more will be tried afterwards.
+
+        The final ``RpcError``'s message is redacted (see ``_redact``): it
+        never contains the raw exception text or full request URL, only the
+        exception type/status code and the endpoint's scheme+host. Full,
+        unredacted detail (exception + traceback, against the actual URL
+        attempted) is logged at DEBUG on every failed attempt instead."""
         last: Optional[Exception] = None
+        last_url = self.urls[self.i % len(self.urls)]
         for attempt in range(self.retries):
+            last_url = self.urls[self.i % len(self.urls)]
             try:
                 body = self._post(payload)
                 err = check(body)
@@ -74,10 +118,11 @@ class RpcClient:
                 last = RpcError(err)
             except (requests.RequestException, ValueError) as e:
                 last = e
+                logger.debug("rpc: attempt %d against %s failed", attempt + 1, _endpoint(last_url), exc_info=True)
             self.i += 1
             if attempt < self.retries - 1:
                 self.sleep(min(2 ** attempt, 30))
-        raise RpcError(f"gave up after {self.retries} attempts: {last}")
+        raise RpcError(f"gave up after {self.retries} attempts: {_redact(last, last_url)}")
 
     @staticmethod
     def _error_message(err) -> str:
