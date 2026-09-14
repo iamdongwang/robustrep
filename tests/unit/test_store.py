@@ -224,7 +224,7 @@ def test_upsert_block_ts_rejects_none_number(tmp_path):
         s.upsert_block_ts([(None, 1)])
 
 
-def test_pop_failed_ranges_atomic(tmp_path):
+def test_pop_failed_ranges_clears_and_repeats(tmp_path):
     s = Store(tmp_path / "t.db")
     s.add_failed_range(1, 100, "boom")
     assert s.pop_failed_ranges() == [(1, 100)]
@@ -284,3 +284,19 @@ def test_store_in_memory_still_works():
     s = Store(":memory:")
     s.upsert_feedback([FB])
     assert len(s.load_records()) == 1
+
+
+def test_stale_schema_guard(tmp_path):
+    """A pre-revocations database with a legacy feedback.revoked column must fail
+    loudly rather than silently losing revocations (see fix in the previous commit)."""
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(str(path))
+    legacy.execute("""CREATE TABLE feedback(
+        chain TEXT, block INTEGER, tx_hash TEXT, log_index INTEGER, agent_id TEXT, client TEXT,
+        feedback_index INTEGER, value TEXT, value_decimals INTEGER, tag1 TEXT, tag2 TEXT, endpoint TEXT,
+        feedback_uri TEXT, feedback_hash TEXT, revoked INTEGER DEFAULT 0,
+        PRIMARY KEY(agent_id, client, feedback_index))""")
+    legacy.commit()
+    legacy.close()
+    with pytest.raises(ValueError, match="stale"):
+        Store(path)

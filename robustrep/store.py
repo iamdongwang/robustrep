@@ -104,6 +104,12 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(feedback)").fetchall()}
+        if "revoked" in cols:
+            self.conn.close()
+            raise ValueError(
+                "stale robustrep schema (feedback.revoked column present): "
+                "delete the database file and re-run fetch")
 
     def __enter__(self) -> "Store":
         return self
