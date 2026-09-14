@@ -40,7 +40,7 @@ OWNER_LOG_EVERY = 500
 
 
 @app.callback()
-def main(verbose: bool = typer.Option(False, "--verbose", help="Enable INFO-level logging.")) -> None:
+def main(verbose: bool = typer.Option(False, "--verbose", help="Enable DEBUG-level logging.")) -> None:
     """Robust, transport-agnostic reputation scoring for AI agents."""
     # Only ever *adjust the level* of our own package logger -- never call
     # logging.basicConfig(..., force=True), which tears down and replaces every
@@ -52,6 +52,11 @@ def main(verbose: bool = typer.Option(False, "--verbose", help="Enable INFO-leve
     # later log call reusing that handler raises "I/O operation on closed
     # file." Adding a handler only when the root logger has none yet avoids
     # ever rebinding a handler to a stream that may later be closed.
+    #
+    # --verbose sets DEBUG (not INFO): _rpc_guard's "re-run with --verbose for
+    # detail" message promises that --verbose actually surfaces the
+    # DEBUG-level detail rpc.py and _rpc_guard log on failure; INFO wouldn't.
+    #
     # Non-verbose resets to NOTSET (defer to the root logger's own level,
     # WARNING by default) rather than pinning WARNING explicitly on this
     # named logger: an explicit level here would otherwise outlive this call
@@ -60,7 +65,7 @@ def main(verbose: bool = typer.Option(False, "--verbose", help="Enable INFO-leve
     # logger's level) from ever reaching child loggers under "robustrep" --
     # Python's level lookup stops at the first ancestor with an explicit
     # level, so an explicit WARNING here would shadow root's override.
-    logging.getLogger("robustrep").setLevel(logging.INFO if verbose else logging.NOTSET)
+    logging.getLogger("robustrep").setLevel(logging.DEBUG if verbose else logging.NOTSET)
     root = logging.getLogger()
     if not root.handlers:
         root.addHandler(logging.StreamHandler(sys.stderr))
@@ -138,11 +143,14 @@ def _step_raters(store: Store, etherscan_key: Optional[str]) -> str:
     """
     key = etherscan_key if etherscan_key is not None else os.environ.get("ETHERSCAN_API_KEY")
     client = EtherscanClient(key) if key else None
-    n_targets = len(store.distinct_clients())  # computed once, reused below
-    if client is not None and n_targets:
-        eta_h = estimate_seconds(n_targets, DEFAULT_RPS) / 3600
-        typer.echo(f"profiling {n_targets} rater(s) via Etherscan, ETA ~{eta_h:.1f}h")
-    n = enrich_raters(store, client)
+    # store.distinct_clients() computed exactly once here and handed to
+    # enrich_raters(addresses=...) below, instead of letting it re-query the
+    # store itself.
+    targets = store.distinct_clients()
+    if client is not None and targets:
+        eta_h = estimate_seconds(len(targets), DEFAULT_RPS) / 3600
+        typer.echo(f"profiling {len(targets)} rater(s) via Etherscan, ETA ~{eta_h:.1f}h")
+    n = enrich_raters(store, client, addresses=targets)
     mode = store.get_sync("rater_profile_mode") or "unknown"
     fallback_note = "" if client is not None else " (fallback: no ETHERSCAN_API_KEY; rows not written)"
     return f"raters profiled: {n}{fallback_note}; rater profile mode: {mode}"

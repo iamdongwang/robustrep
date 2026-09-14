@@ -463,6 +463,25 @@ def test_enrich_nothing_to_do_fallback(tmp_path):
     assert s.get_sync("rater_profile_mode") is None
 
 
+# --- enrich_raters: explicit `addresses` bypasses distinct_clients() ----------------
+
+
+def test_enrich_uses_given_addresses_instead_of_distinct_clients(tmp_path, monkeypatch):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa"), fb("0xb")])
+    calls = []
+    monkeypatch.setattr(Store, "distinct_clients", lambda self: calls.append(1) or ["should-not-be-used"])
+    assert enrich_raters(s, None, addresses=["0xa"]) == 1
+    assert calls == []  # distinct_clients() never called when addresses is given
+
+
+def test_enrich_addresses_none_falls_back_to_distinct_clients(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa")])
+    s.upsert_block_ts([(1, 555)])
+    assert enrich_raters(s, None) == 1  # default addresses=None -> store.distinct_clients()
+
+
 # --- client_from_env -----------------------------------------------------------------
 
 

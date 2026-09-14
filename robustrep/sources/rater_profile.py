@@ -204,7 +204,8 @@ def estimate_seconds(n_addresses: int, rps: float) -> float:
     return n_addresses / rps
 
 
-def enrich_raters(store: Store, client: Optional[EtherscanClient]) -> int:
+def enrich_raters(store: Store, client: Optional[EtherscanClient],
+                   addresses: Optional[list[str]] = None) -> int:
     """Fill the raters table for every client address not yet profiled.
 
     With ``client``, looks up each address's first transaction via Etherscan
@@ -223,12 +224,16 @@ def enrich_raters(store: Store, client: Optional[EtherscanClient]) -> int:
     should be run first), and returns the number of still-unprofiled
     addresses as an informational count (nothing was written).
 
+    ``addresses``, when given, is used verbatim instead of calling
+    ``store.distinct_clients()`` -- for a caller (e.g. the CLI) that already
+    computed the target list, so it isn't queried from the store twice.
+
     Returns the number of addresses successfully processed with a client, or
     the number of still-unprofiled addresses in fallback mode; 0 (no HTTP
     calls, no store writes, no mode change) when every client address is
     already profiled.
     """
-    addrs = store.distinct_clients()
+    addrs = store.distinct_clients() if addresses is None else addresses
     if not addrs:
         return 0
 
