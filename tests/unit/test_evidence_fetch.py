@@ -1,4 +1,5 @@
 import logging
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -241,6 +242,17 @@ def test_is_disallowed_ip_refuses_cgnat_and_6to4_loopback():
     assert _is_disallowed_ip("93.184.216.34") is False  # sanity: a real public IP is allowed
 
 
+def test_is_disallowed_ip_refuses_nat64_reserved_ranges():
+    # 64:ff9b::/96 (well-known NAT64) and 64:ff9b:1::/48 (RFC 8215 local-use
+    # NAT64) both embed an IPv4 address -- and are marked `is_reserved` by
+    # Python's ipaddress module (verified: is_global is True for these, so it
+    # takes `is_reserved` specifically to catch them).
+    assert _is_disallowed_ip("64:ff9b::7f00:1") is True  # embeds 127.0.0.1
+    assert _is_disallowed_ip("64:ff9b::a00:1") is True  # embeds 10.0.0.1
+    assert _is_disallowed_ip("64:ff9b:1::7f00:1") is True  # RFC 8215 local-use variant
+    assert _is_disallowed_ip("8.8.8.8") is False  # sanity: a real public IP is allowed
+
+
 def test_ssrf_guard_refuses_when_resolver_returns_garbage():
     sess = NeverCalledSession()
 
@@ -280,6 +292,15 @@ def test_ssrf_guard_allows_public_resolved_host():
     sess = FakeSession({"http://public.example/x": FakeResp(200, body=b"hello")})
     assert http_fetch_text("http://public.example/x", session=sess, resolver=resolver) == "hello"
     assert sess.calls == ["http://public.example/x"]
+
+
+def test_ssrf_guard_allows_host_resolving_to_8_8_8_8():
+    def resolver(host):
+        return ["8.8.8.8"]
+
+    sess = FakeSession({"http://dns.example/x": FakeResp(200, body=b"hello")})
+    assert http_fetch_text("http://dns.example/x", session=sess, resolver=resolver) == "hello"
+    assert sess.calls == ["http://dns.example/x"]
 
 
 # --- redirects ----------------------------------------------------------------------
@@ -540,19 +561,43 @@ def test_classify_all_reuses_one_session_across_uris(tmp_path):
 
 @pytest.mark.xfail(strict=True, reason="DNS rebinding not mitigated in v0.1 (see module docstring)")
 def test_dns_rebinding_not_mitigated_in_v0_1():
-    # The guard's resolver answers a public address (so the check passes), but
-    # a real rebinding attacker would have the *actual* connection -- made
-    # independently by requests/urllib3 -- land on a private address instead.
-    # We can't simulate the second, different resolution here (no real
-    # network), but we CAN show the guard has no way to stop the session from
-    # being used once it has passed on the first (attacker-controlled)
-    # answer -- i.e. the session is *not* protected end-to-end. This asserts
-    # the (currently false) safety property so it fails now and will start
-    # passing -- turning this xfail into a hard failure that flags the
-    # docstring/test for an update -- once pinned-IP fetching lands in v0.2.
-    def resolver(host):
-        return ["93.184.216.34"]  # public, on the guard's lookup
+    """Documents the vetted-address invariant a real fix must satisfy: the
+    address actually connected to must be the *first* (guard-vetted) answer,
+    never a later, independent re-resolution of the same host.
 
-    sess = NeverCalledSession()
+    ``_is_safe_url`` calls ``resolver(host)`` once to vet the host. A real
+    HTTP client (requests/urllib3) resolves the host *again*, independently,
+    when it actually opens the connection. ``RebindingSession`` stands in for
+    that second resolution by calling the same stateful ``resolver`` a second
+    time from ``.get()`` -- mimicking a DNS server that answers differently on
+    consecutive queries (a rebinding attack): public on the first (the
+    guard's) lookup, then the link-local metadata address afterwards.
+
+    Nothing today pins the connection to the address the guard vetted, so
+    ``connected_to`` ends up holding the *second* (rebound, private) answer
+    instead of the first (public, vetted) one, and this assertion fails --
+    hence the strict xfail. Once v0.2 adds a pinned-IP transport adapter
+    (resolve once, connect to that literal address, keep the original
+    hostname only for TLS SNI/Host), the connection will be pinned to the
+    first answer, ``connected_to`` will equal ``["93.184.216.34"]``, and this
+    test will XPASS -- turning the strict xfail into a hard failure that
+    forces the module docstring and this test's xfail marker to be
+    updated/removed.
+    """
+    answers = iter(["93.184.216.34", "169.254.169.254"])
+
+    def resolver(host):
+        return [next(answers)]
+
+    class RebindingSession:
+        def __init__(self):
+            self.connected_to = []
+
+        def get(self, url, **kwargs):
+            host = urlsplit(url).hostname
+            self.connected_to.append(resolver(host)[0])
+            return FakeResp(200, body=b"ok")
+
+    sess = RebindingSession()
     http_fetch_text("http://rebind.example/x", session=sess, resolver=resolver)
-    assert sess.calls == []
+    assert sess.connected_to == ["93.184.216.34"]
