@@ -33,7 +33,7 @@ from .pipeline import score as score_fn
 from .report.adversarial import scenario_table
 from .report.export import export_json
 from .report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
-from .report.render import render_markdown
+from .report.render import evidence_level_shares, render_markdown
 from .report.sensitivity import fig_sensitivity, sensitivity_table
 from .sources import base_erc8004 as base
 from .sources.evidence_fetch import classify_all
@@ -344,7 +344,16 @@ _FIGURES = {
 }
 
 
-def _provenance(mode: str, cfg: Config) -> dict:
+def _evidence_shares_for_provenance(records: pandas.DataFrame) -> dict:
+    """Per-record evidence-level shares (0..3) among non-revoked records, as a
+    JSON-friendly ``{level: share}`` dict -- the same figure the report's
+    headline numbers are built from (see ``robustrep.report.render``)."""
+    non_revoked = records[records["revoked"] == 0] if "revoked" in records.columns else records
+    shares = evidence_level_shares(non_revoked)
+    return {int(level): float(share) for level, share in shares.items()}
+
+
+def _provenance(mode: str, cfg: Config, records: pandas.DataFrame) -> dict:
     config = dict(
         bootstrap_n=cfg.bootstrap_n,
         bootstrap_seed=cfg.bootstrap_seed,
@@ -354,6 +363,7 @@ def _provenance(mode: str, cfg: Config) -> dict:
         sybil_window_s=cfg.sybil_window_s,
         sybil_max_group=cfg.sybil_max_group,
         sybil_flag_share=cfg.sybil_flag_share,
+        evidence_level_shares=_evidence_shares_for_provenance(records),
     )
     return dict(
         rater_profile_mode=mode,
@@ -445,7 +455,7 @@ def report(
 
     sens = sensitivity_table(records, cfg, meta=meta, top_n=top_n)
     adv = scenario_table()
-    provenance = _provenance(mode, cfg)
+    provenance = _provenance(mode, cfg, records)
 
     block_dir = out_dir / str(block)
     _write_report(block_dir, result, records, clusters, sens, adv, block, provenance, top_n)
