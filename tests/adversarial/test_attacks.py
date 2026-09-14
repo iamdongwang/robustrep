@@ -6,7 +6,12 @@ Every scenario here is evidence for the report: an attack that visibly moves
 value. None of these tests may require changing library code to pass -- a
 failure here means the pipeline's guarantees don't hold and must be reported
 as BLOCKED, not patched around.
+
+All scenarios use `Config(bootstrap_n=0)`: they check point estimates only,
+never `ci_low`/`ci_high`, so no confidence-interval claims are made here.
 """
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -19,12 +24,13 @@ DAY = 86400
 
 
 def honest(ratee, n, val=80, start_ts=0):
-    # n independent raters, spread over months, each with its own funder
+    # n independent raters, each with its own funder, spread weekly (28 days total for n=5)
     return [dict(rater=f"h{i}", ratee=ratee, value=val, ts=start_ts + i * 7 * DAY, evidence_level=2)
             for i in range(n)]
 
 
-def sybils(ratee, n, val, ts, funder="F"):
+def sybils(ratee, n, val, ts):
+    # all n raters share funder "F" (wired via meta_for's sybil_funder, not stored on the row itself)
     return [dict(rater=f"s{i}", ratee=ratee, value=val, ts=ts + i * 60, evidence_level=0) for i in range(n)]
 
 
@@ -32,6 +38,14 @@ def meta_for(rows, sybil_funder="F"):
     raters = sorted({r["rater"] for r in rows})
     return pd.DataFrame([dict(rater=r, first_seen_ts=min(x["ts"] for x in rows if x["rater"] == r),
                               funder=(sybil_funder if r.startswith("s") else f"own-{r}")) for r in raters])
+
+
+def meta_distinct(rows):
+    """Every rater gets its own distinct funder ('own-<rater>') -- used where the scenario
+    must guarantee no funder-signal clustering regardless of timing/Jaccard."""
+    raters = sorted({r["rater"] for r in rows})
+    return pd.DataFrame([dict(rater=r, first_seen_ts=min(x["ts"] for x in rows if x["rater"] == r),
+                              funder=f"own-{r}") for r in raters])
 
 
 def build(rows):
@@ -60,14 +74,34 @@ def test_scenario_b_smearing_sybils_do_not_sink_robust():
     assert row["robust_score"] == 0.8
 
 
-def test_scenario_c_equal_evidence_weights_reduce_to_median():
-    rows = honest("A", 5, val=80) + honest("A", 2, val=20, start_ts=400 * DAY)
-    for r in rows[5:]:
-        r["rater"] = r["rater"].replace("h", "g")
+def test_scenario_c_flat_weights_reduce_to_lower_median():
+    # 2 raters at 0.8 with evidence_level 3, 3 raters at 0.2 with evidence_level 0; distinct
+    # funders/wide-apart timestamps (no clusters are computed for this test anyway -- no
+    # `clusters` is passed to `score`, so every rater is trivially its own cluster).
+    # Default weights (0.1,0.3,0.7,1.0): mass(0.8)=2*1.0=2.0 vs mass(0.2)=3*0.1=0.3 -> 0.8 wins.
+    # Flat weights (1,1,1,1): mass(0.8)=2.0 vs mass(0.2)=3.0 -> 0.2 wins (lower weighted median).
+    rows = ([dict(rater=f"c_hi{i}", ratee="A", value=80, ts=i * 30 * DAY, evidence_level=3) for i in range(2)]
+            + [dict(rater=f"c_lo{i}", ratee="A", value=20, ts=1000 * DAY + i * 30 * DAY, evidence_level=0)
+               for i in range(3)])
+    df = build(rows)
+    assert score(df, CFG).set_index("ratee").loc["A", "robust_score"] == 0.8
+    flat = Config(bootstrap_n=0, evidence_weights=(1, 1, 1, 1))
+    assert score(df, flat).set_index("ratee").loc["A", "robust_score"] == 0.2
+
+
+def test_scenario_c2_even_count_lower_median_convention():
+    # 4 votes at 0.8 + 4 votes at 0.2, flat weights (equal mass either side: 4.0 vs 4.0).
+    # `robustrep.aggregate.weighted_median` is documented as the LOWER weighted median: for
+    # an even count/tied mass it picks the smaller of the two middle values, NOT their
+    # average. np.median (mean-of-two-middles) would give 0.5; the pipeline gives 0.2.
+    rows = ([dict(rater=f"e_hi{i}", ratee="A", value=80, ts=i * 30 * DAY, evidence_level=0) for i in range(4)]
+            + [dict(rater=f"e_lo{i}", ratee="A", value=20, ts=1000 * DAY + i * 30 * DAY, evidence_level=0)
+               for i in range(4)])
     flat = Config(bootstrap_n=0, evidence_weights=(1, 1, 1, 1))
     df = build(rows)
     out = score(df, flat).set_index("ratee").loc["A"]
-    assert out["robust_score"] == np.median([0.8] * 5 + [0.2] * 2)
+    assert np.median([0.8] * 4 + [0.2] * 4) == 0.5
+    assert out["robust_score"] == 0.2
 
 
 def test_scenario_d_evidence_free_flood_is_downweighted_even_without_clusters():
@@ -140,23 +174,16 @@ def test_scenario_g_attack_breakeven_point():
     # never cluster with each other or the honest raters -- see the n_clusters == 3 + k check
     # below). Find the smallest k that flips robust_score below 0.9.
     #
-    # By weight: honest mass = 3.0, attacker mass = 0.1k. The weighted median (lower-median
-    # convention) flips to 0.0 once the attacker mass reaches half the total weight, i.e.
-    # 0.1k >= (3.0 + 0.1k) / 2, i.e. k >= 30. At k = 30 the two sides are EXACTLY tied
-    # (0.1*30 == 3.0 == half), and the lower-weighted-median convention (the tie-breaking
-    # epsilon in `_weighted_median_pos` nudges the half-weight threshold down) resolves the
-    # tie to the lower value -- so the flip happens exactly at k = 30, not k = 31.
+    # By weight: honest mass = 3.0, attacker mass = 0.1k. The weighted median flips to 0.0
+    # once attacker mass reaches half the total weight: 0.1k >= (3.0 + 0.1k) / 2 -> k >= 30.
+    # 30 is the exact tie (3.0 vs 3.0); pins the lower-median convention and `_TIE_EPS`
+    # scale-invariance -- without the epsilon a rescaled weight vector gives 31.
     def honest_l3(n):
         return [dict(rater=f"hl{i}", ratee="A", value=90, ts=i * 7 * DAY, evidence_level=3) for i in range(n)]
 
     def attackers(n, ts0):
         return [dict(rater=f"atk{i}", ratee="A", value=0, ts=ts0 + i * 3 * DAY, evidence_level=0)
                 for i in range(n)]
-
-    def meta_distinct(rows):
-        raters = sorted({r["rater"] for r in rows})
-        return pd.DataFrame([dict(rater=r, first_seen_ts=min(x["ts"] for x in rows if x["rater"] == r),
-                                  funder=f"own-{r}") for r in raters])
 
     scores = {}
     for k in range(25, 36):
@@ -167,14 +194,122 @@ def test_scenario_g_attack_breakeven_point():
         row = score(df, CFG, clusters=clusters).set_index("ratee").loc["A"]
         scores[k] = row["robust_score"]
 
+    assert scores[25] == 0.9
+    assert scores[35] < 0.9
     flips = [k for k, s in scores.items() if s < 0.9]
-    first_flip = min(flips)
-    assert first_flip >= 30
-    assert first_flip == 30
+    assert min(flips) == 30
 
 
-def test_report_numbers_table():
-    """The naive-vs-robust table the report cites for scenarios A, B, D, E."""
+def test_scenario_g2_boost_direction():
+    # Mirror of scenario G with attackers boosting (value 1.0, the higher side) instead of
+    # smearing. At the same exact tie (k=30: honest mass 3.0 vs attacker mass 3.0), the lower
+    # weighted-median convention picks the LOWER of the two tied values -- here that's the
+    # honest 0.9, not the attacker's 1.0 -- so the tie favors the defender: robust_score stays
+    # 0.9 at k=30 and only flips to 1.0 once the attacker mass strictly exceeds half, at k=31.
+    def honest_l3(n):
+        return [dict(rater=f"hl{i}", ratee="A", value=90, ts=i * 7 * DAY, evidence_level=3) for i in range(n)]
+
+    def attackers_boost(n, ts0):
+        return [dict(rater=f"atk{i}", ratee="A", value=100, ts=ts0 + i * 3 * DAY, evidence_level=0)
+                for i in range(n)]
+
+    def score_at(k):
+        rows = honest_l3(3) + attackers_boost(k, ts0=1000 * DAY)
+        df = build(rows)
+        clusters = cluster_raters(profiles_from_records(df, meta_distinct(rows)), CFG)
+        return score(df, CFG, clusters=clusters).set_index("ratee").loc["A", "robust_score"]
+
+    assert score_at(30) == 0.9
+    assert score_at(31) == 1.0
+
+
+def test_scenario_h_evasive_attacker_defeats_sybil_signals_but_not_the_weighted_median():
+    # The key limitation attack: k attackers, each on a DISTINCT funder, registered > 24h
+    # apart (2 days), each ALSO rating a decoy ratee from a pool of 6 ("D1".."D6") so that no
+    # two attackers -- and no attacker and any honest rater -- share an identical ratee set,
+    # keeping the Jaccard signal below 0.8 for the overwhelming majority of pairs (the rare
+    # same-decoy pair still fails on funder+window, so nothing ever reaches 2 of 3 signals).
+    # Every attacker evades sybil clustering entirely: cluster_raters gives it its own cluster.
+    def farmless_attackers(n, start_ts):
+        rows = []
+        for i in range(n):
+            ts = start_ts + i * 2 * DAY
+            rows.append(dict(rater=f"atk{i}", ratee="A", value=0, ts=ts, evidence_level=0))
+            rows.append(dict(rater=f"atk{i}", ratee=f"D{(i % 6) + 1}", value=0, ts=ts, evidence_level=0))
+        return rows
+
+    def clusters_and_row(k):
+        rows = honest("A", 5) + farmless_attackers(k, start_ts=1000 * DAY)
+        df = build(rows)
+        clusters = cluster_raters(profiles_from_records(df, meta_distinct(rows)), CFG)
+        row = score(df, CFG, clusters=clusters).set_index("ratee").loc["A"]
+        return clusters, row
+
+    # (a) no merging among attackers (each its own singleton cluster) at a representative k.
+    clusters, _ = clusters_and_row(30)
+    atk_clusters = {r for r, c in clusters.items() if r.startswith("atk")}
+    assert len({clusters[r] for r in atk_clusters}) == len(atk_clusters) == 30
+
+    # (b) honest mass 5*0.7=3.5 comfortably beats k*0.1 attacker mass at k=20 and k=30.
+    for k in (20, 30):
+        _, row = clusters_and_row(k)
+        assert row["robust_score"] == 0.8
+        assert row["sybil_flag"] == 0   # every attacker is its own cluster: no single cluster dominates
+
+    # (c) break-even: honest mass 3.5 vs k*0.1 attacker mass flips once k*0.1 >= (3.5+k*0.1)/2,
+    # i.e. k >= 35. 35 is again an exact tie (3.5 vs 3.5), and the lower-median convention
+    # resolves exact ties to the lower (here: attacker) value -- so, as with scenario G, the
+    # flip happens exactly AT the tie, at k=35, not k=36.
+    robust_by_k = {}
+    for k in range(30, 45):
+        _, row = clusters_and_row(k)
+        robust_by_k[k] = row["robust_score"]
+        assert row["zero_evidence_ratio"] >= 0.8  # (d) see comment below
+    flips = [k for k, s in robust_by_k.items() if s < 0.8]
+    assert min(flips) == 35
+
+    # (d) zero_evidence_ratio (fraction of raw A-votes at evidence_level 0) stays >= 0.8 at
+    # every k tested above (k/(5+k) >= 0.8 once k >= 20) even while sybil_flag sits at 0 and
+    # robust_score still reads the honest value. This is the signal that survives evasion --
+    # sybil_flag is blind to a farm that never clusters, but the evidence-mass ratio is not.
+
+
+def test_scenario_i_insufficient_clusters_refuses_to_score():
+    # 1 honest rater + one 50-rater same-funder/same-hour farm: 2 clusters total, below
+    # min_clusters=3 -> the pipeline refuses to produce a robust_score (NaN) rather than
+    # publish an unreliable number. Refusing to score is the outcome an attacker most wants
+    # to avoid -- it denies the very manipulation they were trying to buy.
+    def farm50(ts0):
+        return [dict(rater=f"far{i}", ratee="A", value=100, ts=ts0 + i * 30, evidence_level=0) for i in range(50)]
+
+    def meta_farm(rows):
+        raters = sorted({r["rater"] for r in rows})
+        return pd.DataFrame([dict(rater=r, first_seen_ts=min(x["ts"] for x in rows if x["rater"] == r),
+                                  funder=("FARM" if r.startswith("far") else f"own-{r}")) for r in raters])
+
+    rows_2h = honest("A", 2) + farm50(500 * DAY)
+    df = build(rows_2h)
+    clusters = cluster_raters(profiles_from_records(df, meta_farm(rows_2h)), CFG)
+    row = score(df, CFG, clusters=clusters).set_index("ratee").loc["A"]
+    assert row["n_clusters"] == 3
+    assert row["insufficient"] == 0
+    assert row["robust_score"] == 0.8
+
+    rows_1h = honest("A", 1) + farm50(500 * DAY)
+    df = build(rows_1h)
+    clusters = cluster_raters(profiles_from_records(df, meta_farm(rows_1h)), CFG)
+    row = score(df, CFG, clusters=clusters).set_index("ratee").loc["A"]
+    assert row["n_clusters"] == 2
+    assert row["insufficient"] == 1
+    assert math.isnan(row["robust_score"])
+
+
+def scenario_table() -> pd.DataFrame:
+    """Naive-vs-robust numbers for scenarios A, B, D, E, for the report (Task 14) to import.
+
+    Side-effect free: computes and returns a DataFrame, never writes a file. Tests below call
+    it to assert on the same numbers cited in the report.
+    """
     a = run(honest("A", 5) + sybils("A", 50, val=100, ts=100 * DAY))
     b = run(honest("A", 5) + sybils("A", 50, val=0, ts=100 * DAY))
     d_rows = honest("A", 5, val=80) + [dict(rater=f"z{i}", ratee="A", value=0, ts=i * 3 * DAY, evidence_level=0)
@@ -186,9 +321,19 @@ def test_report_numbers_table():
                  for i in range(4)])
     e = score(build(e_rows), CFG).set_index("ratee").loc["A"]
 
-    table = pd.DataFrame(
-        {"naive_mean": [a["naive_mean"], b["naive_mean"], d["naive_mean"], e["naive_mean"]],
-         "robust_score": [a["robust_score"], b["robust_score"], d["robust_score"], e["robust_score"]]},
-        index=["A_boosting", "B_smearing", "D_evidence_free_flood", "E_fresh_tag"],
-    )
+    rows = []
+    for name, row in (("A_boosting", a), ("B_smearing", b), ("D_evidence_free_flood", d), ("E_fresh_tag", e)):
+        rows.append(dict(scenario=name, naive_mean=row["naive_mean"], robust_score=row["robust_score"],
+                          n_clusters=row["n_clusters"], sybil_flag=row["sybil_flag"],
+                          zero_evidence_ratio=row["zero_evidence_ratio"]))
+    return pd.DataFrame(rows)
+
+
+def test_report_numbers_table():
+    """The naive-vs-robust table the report cites for scenarios A, B, D, E."""
+    table = scenario_table().set_index("scenario")
     assert table["robust_score"].tolist() == [0.8, 0.8, 0.8, 0.9]
+    assert math.isclose(table.loc["A_boosting", "naive_mean"], 54 / 55, rel_tol=1e-3)
+    assert math.isclose(table.loc["B_smearing", "naive_mean"], 4 / 55, rel_tol=1e-3)
+    assert math.isclose(table.loc["D_evidence_free_flood", "naive_mean"], 0.16, rel_tol=1e-3)
+    assert math.isclose(table.loc["E_fresh_tag", "naive_mean"], 2.7 / 7, rel_tol=1e-3)
