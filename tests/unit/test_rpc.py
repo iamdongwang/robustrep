@@ -147,3 +147,15 @@ def test_non_retryable_error_by_message_substring():
     with pytest.raises(RpcError):
         c.call("m", [])
     assert len(s.calls) == 1
+
+
+def test_non_retryable_error_matches_via_code():
+    # message alone ("bad") doesn't match NON_RETRYABLE; the numeric code must
+    # be folded into the checked message so "-32602"/"-32600" entries work.
+    s = FakeSession([{"error": {"code": -32602, "message": "bad"}}])
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=5)
+    with pytest.raises(RpcError):
+        c.call("m", [])
+    assert len(s.calls) == 1
+    assert sleeps == []

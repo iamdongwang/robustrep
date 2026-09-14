@@ -81,7 +81,15 @@ class RpcClient:
 
     @staticmethod
     def _error_message(err) -> str:
-        return err.get("message", "error") if isinstance(err, dict) else str(err)
+        """Render a JSON-RPC ``error`` object as a single string that folds in
+        its numeric ``code`` (as ``"[code] message"``) so ``NON_RETRYABLE``
+        entries that match on a code (e.g. ``"-32602"``) can match regardless
+        of whether the server's ``message`` text happens to repeat it."""
+        if not isinstance(err, dict):
+            return str(err)
+        msg = err.get("message", "error")
+        code = err.get("code")
+        return f"[{code}] {msg}" if code is not None else msg
 
     @classmethod
     def _check_single(cls, body) -> Optional[str]:

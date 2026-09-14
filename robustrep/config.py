@@ -3,6 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Blocks to lag behind the chain head before ingesting: guards against a re-org
+# near the tip leaving phantom feedback rows behind. Single source of truth for
+# both Config.confirmations' default and robustrep.sources.base_erc8004.sync_feedback's
+# default, so the two can never silently drift apart.
+DEFAULT_CONFIRMATIONS = 20
+
 
 @dataclass(frozen=True)
 class Config:
@@ -23,9 +29,7 @@ class Config:
     rpc_urls: tuple[str, ...] = ("https://mainnet.base.org",)
     chunk_blocks: int = 2000
     user_agent: str = "robustrep/0.1 (+https://github.com/iamdongwang/robustrep)"
-    # blocks to lag behind the chain head before ingesting: guards against a re-org
-    # near the tip leaving phantom feedback rows behind.
-    confirmations: int = 20
+    confirmations: int = DEFAULT_CONFIRMATIONS
 
     def __post_init__(self) -> None:
         if len(self.evidence_weights) != 4:

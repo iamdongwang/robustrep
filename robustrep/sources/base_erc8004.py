@@ -34,6 +34,7 @@ from typing import Optional
 from eth_abi import decode
 from eth_hash.auto import keccak
 
+from ..config import DEFAULT_CONFIRMATIONS
 from ..store import Store
 from .rpc import RpcError
 
@@ -44,7 +45,6 @@ REPUTATION_REGISTRY = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"
 IDENTITY_REGISTRY = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
 DEPLOY_BLOCK = 41663784
 ZERO_ADDRESS = "0x" + "00" * 20
-DEFAULT_CONFIRMATIONS = 20
 
 _OWNER_OF_SELECTOR = "0x6352211e"
 
@@ -238,7 +238,7 @@ def fill_block_timestamps(store: Store, rpc, batch_size: int = 100) -> int:
         for block_num, blk in zip(block_nums, blocks):
             if blk is None:
                 raise RpcError(f"fill_block_timestamps: block {block_num} not found (null result)")
-            pairs.append((block_num, int(blk["timestamp"], 16)))
+            pairs.append((block_num, _hexint(blk["timestamp"])))
         store.upsert_block_ts(pairs)
     return len(missing)
 
