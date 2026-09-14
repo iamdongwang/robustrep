@@ -134,11 +134,15 @@ def test_bad_scale_rejected_at_boundary(records_factory):
         validate_records(df)
 
 
-def test_scale_decimals_over_18_rejected():
+def test_scale_decimals_over_255_rejected():
     with pytest.raises(ValueError):
-        scale_decimals("d19")
+        scale_decimals("d256")
     with pytest.raises(ValueError):
-        make_scale(19)
+        make_scale(256)
+    assert scale_decimals("d255") == 255
+    assert make_scale(255) == "d255"
+    assert scale_decimals("d19") == 19
+    assert make_scale(19) == "d19"
 
 
 def test_config_more_checks():

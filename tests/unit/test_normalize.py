@@ -90,6 +90,11 @@ def test_duplicate_index_groups_do_not_mix(records_factory):
     assert list(df["norm_rule"]) == ["binary", "binary", "percent", "percent"]
 
 
+def test_large_decimals_no_overflow(records_factory):
+    df = _n(records_factory, [dict(rater="a", ratee="1", value=5, scale="d255", tag="x")])
+    assert df["norm_rule"].iloc[0] == "unit" and np.isfinite(df["score"].iloc[0])
+
+
 def test_empty_frame_returns_score_column(records_factory):
     validated = validate_records(records_factory([dict(rater="a", ratee="1", value=87)]))
     empty = validated.iloc[0:0]

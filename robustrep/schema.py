@@ -16,7 +16,9 @@ VALID_LEVELS = {0, 1, 2, 3}
 VALID_REVOKED = {0, 1}
 
 
-MAX_SCALE_DECIMALS = 18  # ERC-8004 valueDecimals is 0-18
+# ERC-8004 valueDecimals is uint8 (0-255); the EIP text recommends 0-18. Values up to 255 are
+# chain-valid and must not be dropped.
+MAX_SCALE_DECIMALS = 255
 
 
 def make_scale(decimals: int) -> str:
@@ -24,7 +26,7 @@ def make_scale(decimals: int) -> str:
         raise ValueError(f"decimals must be a non-negative integer, got {decimals!r}")
     if decimals > MAX_SCALE_DECIMALS:
         raise ValueError(
-            f"decimals must be 0-{MAX_SCALE_DECIMALS} (ERC-8004 valueDecimals range), got {decimals!r}")
+            f"decimals must be 0-{MAX_SCALE_DECIMALS} (ERC-8004 valueDecimals is uint8), got {decimals!r}")
     return f"d{int(decimals)}"
 
 
@@ -34,7 +36,7 @@ def scale_decimals(scale: str) -> int:
     decimals = int(scale[1:])
     if decimals > MAX_SCALE_DECIMALS:
         raise ValueError(
-            f"bad scale {scale!r}; decimals must be 0-{MAX_SCALE_DECIMALS} (ERC-8004 valueDecimals range)")
+            f"bad scale {scale!r}; decimals must be 0-{MAX_SCALE_DECIMALS} (ERC-8004 valueDecimals is uint8)")
     return decimals
 
 
