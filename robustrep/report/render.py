@@ -10,7 +10,7 @@ import pandas as pd
 # introduced this feedback scheme found the overwhelming majority of ratings
 # carried no interaction evidence at all.
 _PAPER_CITATION = (
-    "For reference, the ERC-8004 study (arXiv 2606.26028) reported 98.7-100% of "
+    "This is comparable to the study's (arXiv 2606.26028) reported 98.7-100% of "
     "ratings with no interaction evidence."
 )
 
@@ -40,6 +40,37 @@ def _non_revoked(records: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     if "revoked" not in records.columns:
         return records, 0
     return records[records["revoked"] == 0], int((records["revoked"] == 1).sum())
+
+
+def evidence_level_shares(non_revoked: pd.DataFrame) -> pd.Series:
+    """Share of non-revoked records at each evidence level 0..3, reindexed so
+    every level is present (0.0) even when absent from the data."""
+    if len(non_revoked) == 0:
+        return pd.Series(0.0, index=[0, 1, 2, 3])
+    return non_revoked["evidence_level"].value_counts(normalize=True).reindex([0, 1, 2, 3], fill_value=0.0)
+
+
+def _rater_concentration(records: pd.DataFrame) -> tuple[int, float, int]:
+    """(distinct raters, median ratings-per-rater, max ratings-per-rater) over
+    ALL records (revoked included -- a revoked rating still came from a real
+    rater address)."""
+    if len(records) == 0 or "rater" not in records.columns:
+        return 0, 0.0, 0
+    counts = records.groupby("rater").size()
+    return int(counts.shape[0]), float(counts.median()), int(counts.max())
+
+
+def _tag_hygiene(records: pd.DataFrame, min_count: int = 10) -> tuple[int, float]:
+    """(distinct tag count, share of records whose tag has fewer than
+    `min_count` records overall) over ALL records. `tag1` is free-text on
+    ERC-8004, so a handful of records is a common outcome for a tag, not an
+    error."""
+    if len(records) == 0 or "tag" not in records.columns:
+        return 0, 0.0
+    counts = records["tag"].value_counts()
+    rare_tags = counts[counts < min_count].index
+    rare_share = records["tag"].isin(rare_tags).mean()
+    return int(counts.shape[0]), float(rare_share)
 
 
 def _measured_boundaries_paragraph(adversarial: pd.DataFrame) -> Optional[str]:
@@ -91,7 +122,12 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     scored = scores[scores["insufficient"] == 0]
     insufficient = scores[scores["insufficient"] == 1]
     n_flagged, flag_rate = _flag_rate(scored)
-    zero_ev = (non_revoked["evidence_level"] == 0).mean() if len(non_revoked) else 0.0
+    ev_shares = evidence_level_shares(non_revoked)
+    zero_ev = float(ev_shares.loc[0])
+    zero_one_ev = float(ev_shares.loc[0] + ev_shares.loc[1])
+    level3_ev = float(ev_shares.loc[3])
+    n_raters, rating_median, rating_max = _rater_concentration(records)
+    n_tags, rare_tag_share = _tag_hygiene(records)
 
     lines = [
         "# Robust reputation on ERC-8004 (Base)",
@@ -101,12 +137,22 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
         f"{len(scored)}; insufficient (too few clusters): {len(insufficient)}.",
         "",
         "## Headline numbers",
-        f"- Zero-evidence ratings (non-revoked only): {zero_ev:.1%}. {_PAPER_CITATION}",
+        f"- No evidence URI (level 0): {zero_ev:.1%}",
+        f"- No verifiable interaction evidence (levels 0-1): {zero_one_ev:.1%}. {_PAPER_CITATION}",
+        f"- Verified on chain (level 3): {level3_ev:.1%}",
         "- Agents flagged (largest single cluster >= 50% of that agent's records, "
         f"among scored agents only): {n_flagged} ({flag_rate:.1%})",
         "- Read `sybil_flag` together with `n_clusters` and `zero_evidence_ratio`: in "
         "scenario F an attack split across two funders held 91% of the records while "
         "the largest single cluster was 45%, leaving the flag at 0.",
+        f"- Rater concentration: {n_raters} distinct raters, {len(records)} ratings "
+        f"({rating_median:.1f} median, {rating_max} max ratings per rater). With repeat raters "
+        "this dense, the largest-single-cluster flag is mostly single-rater dominance (one "
+        "address rating the same agent many times); read it with `n_raw` and `n_clusters`.",
+        f"- Tag hygiene: {n_tags} distinct tags; {rare_tag_share:.1%} of records carry a tag "
+        "with fewer than 10 records overall. tag1 is free text on ERC-8004; many values are "
+        "sentences rather than categories. v0.1 keeps every tag as its own group; a rare-tag "
+        "merge is a v0.2 item.",
     ]
     if len(scored):
         med_gap = (scored["naive_mean"] - scored["robust_score"]).abs().median()
@@ -179,6 +225,9 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
         "1e-9 relative tolerance) the lower-scored tag wins by the same lower-median "
         "convention. The deviation from a blended estimate is bounded by the gap between the "
         "two tag medians and is downward only at the tie.",
+        "- **Tag hygiene.** tag1 is free text on ERC-8004; many values are sentences rather "
+        "than categories. v0.1 keeps every tag as its own group; a rare-tag merge is a v0.2 "
+        "item.",
         "",
         "## Provenance",
     ]

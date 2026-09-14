@@ -10,7 +10,7 @@ from robustrep.report.adversarial import scenario_table
 from robustrep.report.export import export_json
 from robustrep.report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
 from robustrep.report.render import render_markdown
-from robustrep.report.sensitivity import fig_sensitivity, sensitivity_table
+from robustrep.report.sensitivity import fig_sensitivity, sensitivity_table, tie_aware_sensitivity
 
 HOUR = 3600
 WEEK = 7 * 24 * HOUR
@@ -72,8 +72,12 @@ def test_figures_save_png(tmp_path, records_factory):
 def test_sensitivity_table_has_spearman(records_factory):
     records, meta = _sensitivity_data(records_factory)
     t = sensitivity_table(records, Config(bootstrap_n=0), meta=meta, top_n=5)
-    assert {"variant", "spearman_top"} <= set(t.columns) and len(t) >= 4
+    assert {"variant", "spearman_top", "spearman_union", "top_set_jaccard", "top_set_size"} <= set(t.columns)
+    assert len(t) >= 4
     assert t["spearman_top"].dropna().between(-1, 1).all()
+    assert (t["spearman_top"] == t["spearman_union"]).all()
+    assert t["top_set_jaccard"].dropna().between(0, 1).all()
+    assert (t["top_set_size"] >= 0).all()
 
 
 def test_sensitivity_table_reflects_real_perturbations(records_factory):
@@ -90,16 +94,17 @@ def test_sensitivity_table_reflects_real_perturbations(records_factory):
     assert by_variant["window_72h"] < 1.0
 
 
-def test_sensitivity_table_nan_when_overlap_too_small(records_factory):
-    """Item 1: fewer than 2 overlapping ratees between the base top-N and a
-    variant's scored set must report NaN, never a fabricated 1.0. Two raters on
-    ratee "only" (distinct funders, both rating only that ratee so their Jaccard
-    is trivially 1.0) sit 50h apart: outside the default/6h window (no merge,
-    "only" scores fine with 3 singleton clusters) but inside the 72h window
-    (merge -> 2 clusters, below min_clusters=3 -> "only" alone drops out under
-    window_72h). A second, always-stable "control" ratee keeps the base-vs-base
-    overlap at 2 points (a real, defined correlation) so this isolates the
-    window_72h-specific drop to exactly 1 overlapping point -- NaN, not 1.0."""
+def test_sensitivity_table_defined_correlation_when_one_ratee_drops_out(records_factory):
+    """A ratee that becomes `insufficient` under a variant no longer vanishes
+    from the comparison (the old intersect-and-dropna behaviour, which read a
+    fabricated-feeling NaN off a single overlapping point) -- it stays in the
+    UNION of the two tie-inclusive top sets and gets that run's lowest rank
+    (see `tie_aware_sensitivity`), so the correlation is still defined and
+    reflects a real, measured ranking change. Two raters on ratee "only"
+    (distinct funders, both rating only that ratee) sit 50h apart: outside the
+    default/6h window (no merge, "only" scores fine with 3 singleton clusters)
+    but inside the 72h window (merge -> 2 clusters, below min_clusters=3 ->
+    "only" alone drops out under window_72h)."""
     rows = [
         dict(rater="p0", ratee="only", value=50, ts=0, evidence_level=2),
         dict(rater="p1", ratee="only", value=60, ts=50 * HOUR, evidence_level=2),
@@ -120,7 +125,81 @@ def test_sensitivity_table_nan_when_overlap_too_small(records_factory):
     t = sensitivity_table(records, Config(bootstrap_n=0), meta=meta, top_n=5)
     by_variant = t.set_index("variant")["spearman_top"]
     assert by_variant["base"] == pytest.approx(1.0)
+    assert pd.notna(by_variant["window_72h"])
+    assert by_variant["window_72h"] < 1.0
+    jaccard = t.set_index("variant")["top_set_jaccard"]
+    assert jaccard["window_72h"] == pytest.approx(0.5)  # "only" dropped, "control" kept: 1/2
+
+
+def test_sensitivity_table_nan_when_union_has_fewer_than_two_ratees(records_factory):
+    """The true degenerate case for NaN under the new tie-aware method: the
+    union of the two tie-inclusive top sets itself has fewer than 2 members
+    (here: a single ratee total, which then drops out entirely under
+    window_72h, leaving the union at exactly that one ratee) -- there just
+    isn't enough data to define a correlation, so NaN, never a fabricated
+    value."""
+    rows = [
+        dict(rater="p0", ratee="only", value=50, ts=0, evidence_level=2),
+        dict(rater="p1", ratee="only", value=60, ts=50 * HOUR, evidence_level=2),
+        dict(rater="p2", ratee="only", value=70, ts=2000 * HOUR, evidence_level=2),
+    ]
+    meta = pd.DataFrame([
+        dict(rater="p0", first_seen_ts=0, funder="fA"),
+        dict(rater="p1", first_seen_ts=50 * HOUR, funder="fB"),
+        dict(rater="p2", first_seen_ts=2000 * HOUR, funder="fC"),
+    ])
+    records = records_factory(rows)
+    t = sensitivity_table(records, Config(bootstrap_n=0), meta=meta, top_n=5)
+    by_variant = t.set_index("variant")["spearman_top"]
+    # A single-ratee universe can never define a correlation (zero variance,
+    # only one point) -- NaN even for the identical-config "base" row itself.
+    assert pd.isna(by_variant["base"])
     assert pd.isna(by_variant["window_72h"])
+    jaccard = t.set_index("variant")["top_set_jaccard"]
+    assert jaccard["base"] == pytest.approx(1.0)  # base vs itself: same singleton top set
+    assert jaccard["window_72h"] == pytest.approx(0.0)  # union non-empty ({"only"}), intersection empty
+
+
+def test_tie_aware_sensitivity_handles_large_tie_group():
+    """40 agents, 30 of which tie at 1.0 -- mirroring the real cut, where 1,067
+    of 5,170 scored agents tie at exactly robust_score==1.0. With
+    `rank(method="first")` on an arbitrary top-N cut through that tie group,
+    any row-order difference between two otherwise-identical runs churns
+    which N-of-30 get picked as "the" top set, reading a near-zero Spearman
+    purely from tie order -- never from any real ranking change. The
+    tie-aware top set (every score >= the N-th highest, ties included) fixes
+    this: a no-op variant is perfectly stable, reordering within the tie
+    changes nothing, and only an actual change in *which* agents are on top
+    moves the numbers."""
+    base = pd.Series({f"a{i}": 1.0 for i in range(30)} | {f"b{i}": 0.9 - i * 0.09 for i in range(10)})
+
+    # No-op: identical scores -> perfect agreement.
+    r = tie_aware_sensitivity(base, base.copy(), top_n=10)
+    assert r["spearman_union"] == pytest.approx(1.0)
+    assert r["top_set_jaccard"] == pytest.approx(1.0)
+    assert r["top_set_size"] == 30  # the whole 30-way tie, not an arbitrary 10
+
+    # Reordering the SAME values (only the Series' row order changes, no score
+    # changes) must not move the tie-inclusive top set or its correlation at
+    # all -- unlike rank(method="first"), which is order-sensitive.
+    reordered = base.iloc[::-1]
+    r_reordered = tie_aware_sensitivity(base, reordered, top_n=10)
+    assert r_reordered["top_set_jaccard"] == pytest.approx(1.0)
+    assert r_reordered["spearman_union"] == pytest.approx(1.0)
+
+    # Swap 5 of the 30 tied agents out (drop a25-a29) for 5 that were outside
+    # the tie group (raise b0-b4 to 1.0): the tie-inclusive top set changes by
+    # exactly 5 members each way -- jaccard drops accordingly (25 kept / 35
+    # union = 5/7), unlike the untouched no-op and reorder-only cases above.
+    variant = base.copy()
+    for i in range(25, 30):
+        variant[f"a{i}"] = 0.05
+    for i in range(5):
+        variant[f"b{i}"] = 1.0
+    r_swap = tie_aware_sensitivity(base, variant, top_n=10)
+    assert r_swap["top_set_size"] == 30
+    assert r_swap["top_set_jaccard"] == pytest.approx(25 / 35)
+    assert r_swap["spearman_union"] < 1.0
 
 
 def test_fig_sensitivity_annotates_nan_bars(tmp_path):
@@ -269,6 +348,47 @@ def test_render_markdown_never_claims_sybil_detection_and_states_measured_bounda
         assert banned not in lowered, banned
     assert "flips the score at k=30" in md
     assert "smear flips at 35" in md
+
+
+def test_render_markdown_headline_evidence_and_rater_concentration_lines(records_factory):
+    """`_data()` gives 24 records over 6 ratees, 4 per ratee at evidence levels
+    0/1/2/3 (6 records at each level), each from its own distinct rater (24
+    raters, 1 rating each) -- clean round numbers for the new headline lines."""
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=pd.DataFrame(
+        [dict(variant="base", spearman_top=1.0)]))
+    assert "- No evidence URI (level 0): 25.0%" in md
+    assert "- No verifiable interaction evidence (levels 0-1): 50.0%. " in md
+    assert "comparable to the study's" in md and "98.7-100%" in md
+    # the paper-contrast sentence is attached to the levels-0-1 line, not the level-0 line.
+    level01_line = next(line for line in md.splitlines() if "levels 0-1" in line)
+    assert "comparable to the study's" in level01_line and "98.7-100%" in level01_line
+    assert "- Verified on chain (level 3): 25.0%" in md
+    assert "- Rater concentration: 24 distinct raters, 24 ratings (1.0 median, 1 max ratings per rater)." in md
+    assert ("With repeat raters this dense, the largest-single-cluster flag is mostly "
+           "single-rater dominance (one address rating the same agent many times); read it "
+           "with `n_raw` and `n_clusters`.") in md
+
+
+def test_render_markdown_tag_hygiene_headline_and_limitations(records_factory):
+    """15 records: 3 tagged with a rare, free-text tag (< 10 records overall) and
+    12 tagged "quality" -- 2 distinct tags, 20% of records on a rare tag."""
+    rows = []
+    for a in range(3):
+        for i in range(5):
+            tag = "please_fix_the_thing_it_broke_again" if (a == 0 and i < 3) else "quality"
+            rows.append(dict(rater=f"r{a}{i}", ratee=str(a), value=50, evidence_level=2, tag=tag))
+    rec = records_factory(rows)
+    sc = score(rec, Config(bootstrap_n=0))
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=pd.DataFrame(
+        [dict(variant="base", spearman_top=1.0)]))
+    assert ("- Tag hygiene: 2 distinct tags; 20.0% of records carry a tag with fewer than 10 "
+           "records overall.") in md
+    sentence = ("tag1 is free text on ERC-8004; many values are sentences rather than "
+               "categories. v0.1 keeps every tag as its own group; a rare-tag merge is a "
+               "v0.2 item.")
+    assert md.count(sentence) == 2  # once in Headline numbers, once in Limitations
+    assert "- **Tag hygiene.** " + sentence in md
 
 
 def test_export_json_nan_to_null_and_sorted(tmp_path, records_factory):

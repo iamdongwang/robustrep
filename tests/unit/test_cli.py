@@ -2,6 +2,7 @@ import json
 import logging
 
 import pandas as pd
+import pytest
 from typer.testing import CliRunner
 
 from robustrep import cli
@@ -894,6 +895,43 @@ def test_report_provenance_includes_config_in_markdown_and_json(tmp_path):
     for key in ("bootstrap_seed", "min_clusters", "evidence_weights", "sybil_jaccard",
                 "sybil_window_s", "sybil_max_group", "sybil_flag_share"):
         assert key in config
+
+
+def test_report_provenance_includes_evidence_level_shares(tmp_path):
+    """`_seed` writes feedback rows with no evidence_uri -- every row classifies
+    to evidence level 0 -- so the shares should read 100% level 0, and land in
+    both the CLI provenance dict's `config` and the same-named key of
+    scores.json's `config` block (they're the same dict)."""
+    db = tmp_path / "t.db"
+    _seed(db, n=4)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+
+    data = json.loads((out_dir / "latest" / "scores.json").read_text())
+    shares = data["config"]["evidence_level_shares"]
+    assert shares == {"0": 1.0, "1": 0.0, "2": 0.0, "3": 0.0}
+
+
+def test_provenance_evidence_level_shares_from_records(tmp_path):
+    """`cli._provenance` computes `evidence_level_shares` directly from the
+    `records` frame it's given (non-revoked rows only), independent of the
+    `report` command's wiring."""
+    from robustrep import Config
+    from robustrep.schema import validate_records
+
+    rows = []
+    for lvl, n in ((0, 2), (1, 6), (2, 1), (3, 1)):
+        for i in range(n):
+            rows.append(dict(rater=f"r{lvl}_{i}", ratee="A", value=50, scale="d0", tag="q", ts=0,
+                             evidence_uri=None, source="test", evidence_level=lvl))
+    records = validate_records(pd.DataFrame(rows))
+    prov = cli._provenance("onchain", Config(), records)
+    shares = prov["config"]["evidence_level_shares"]
+    assert shares[0] == pytest.approx(0.2)
+    assert shares[1] == pytest.approx(0.6)
+    assert shares[2] == pytest.approx(0.1)
+    assert shares[3] == pytest.approx(0.1)
 
 
 def test_report_latest_is_atomically_replaced_and_stale_files_removed(tmp_path):
