@@ -1,3 +1,4 @@
+import json
 import logging
 
 import pandas as pd
@@ -709,3 +710,67 @@ def test_fetch_help_recommends_env_var_for_etherscan_key():
     r = runner.invoke(app, ["fetch", "--help"])
     assert r.exit_code == 0
     assert "ETHERSCAN_API_KEY" in r.output
+
+
+# --- report ---------------------------------------------------------------------
+
+
+def test_report_writes_figures_markdown_and_json_under_block_and_latest(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+    assert "report written to" in r.output
+
+    with Store(db) as store:
+        last_block = store.get_sync("last_block")
+    block = int(last_block) if last_block is not None else 0
+
+    for target in (out_dir / str(block), out_dir / "latest"):
+        assert target.is_dir()
+        pngs = sorted(target.glob("*.png"))
+        assert len(pngs) == 5
+        for p in pngs:
+            assert p.stat().st_size > 500
+        md_path = target / "report.md"
+        json_path = target / "scores.json"
+        assert md_path.exists() and json_path.exists()
+        md = md_path.read_text()
+        assert f"block {block}" in md and "Limitations" in md and "Provenance" in md
+        data = json.loads(json_path.read_text())
+        assert data["block"] == block and data["schema_version"] == 1
+
+
+def test_report_no_records_exits_1(tmp_path):
+    db = tmp_path / "empty.db"
+    Store(db).close()
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(tmp_path / "reports")])
+    assert r.exit_code == 1
+    assert "no records" in r.output
+
+
+def test_report_config_value_error_exits_1(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db)
+
+    def _raise_cfg(*a, **k):
+        raise ValueError("bad cfg")
+
+    monkeypatch.setattr(cli, "Config", _raise_cfg)
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(tmp_path / "reports")])
+    assert r.exit_code == 1, r.output
+    assert "ERROR: bad cfg" in r.output
+
+
+def test_report_cluster_raters_value_error_exits_1(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db)
+
+    def _raise(*a, **k):
+        raise ValueError("too many candidate pairs")
+
+    monkeypatch.setattr(cli, "cluster_raters", _raise)
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(tmp_path / "reports")])
+    assert r.exit_code == 1, r.output
+    assert "ERROR: too many candidate pairs" in r.output

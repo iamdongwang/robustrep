@@ -17,46 +17,20 @@ import pandas as pd
 
 from robustrep import Config, score
 from robustrep.sybil import cluster_raters, profiles_from_records
-from robustrep.schema import validate_records
-
-CFG = Config(bootstrap_n=0)
-DAY = 86400
-
-
-def honest(ratee, n, val=80, start_ts=0):
-    # n independent raters, each with its own funder, spread weekly (28 days total for n=5)
-    return [dict(rater=f"h{i}", ratee=ratee, value=val, ts=start_ts + i * 7 * DAY, evidence_level=2)
-            for i in range(n)]
-
-
-def sybils(ratee, n, val, ts):
-    # all n raters share funder "F" (wired via meta_for's sybil_funder, not stored on the row itself)
-    return [dict(rater=f"s{i}", ratee=ratee, value=val, ts=ts + i * 60, evidence_level=0) for i in range(n)]
-
-
-def meta_for(rows, sybil_funder="F"):
-    raters = sorted({r["rater"] for r in rows})
-    return pd.DataFrame([dict(rater=r, first_seen_ts=min(x["ts"] for x in rows if x["rater"] == r),
-                              funder=(sybil_funder if r.startswith("s") else f"own-{r}")) for r in raters])
-
-
-def meta_distinct(rows):
-    """Every rater gets its own distinct funder ('own-<rater>') -- used where the scenario
-    must guarantee no funder-signal clustering regardless of timing/Jaccard."""
-    raters = sorted({r["rater"] for r in rows})
-    return pd.DataFrame([dict(rater=r, first_seen_ts=min(x["ts"] for x in rows if x["rater"] == r),
-                              funder=f"own-{r}") for r in raters])
-
-
-def build(rows):
-    return validate_records(pd.DataFrame([{**dict(scale="d0", tag="q", evidence_uri=None, source="t"), **r}
-                                          for r in rows]))
-
-
-def run(rows):
-    df = build(rows)
-    clusters = cluster_raters(profiles_from_records(df, meta_for(rows)), CFG)
-    return score(df, CFG, clusters=clusters).set_index("ratee").loc["A"]
+from robustrep.report.adversarial import (
+    CFG,
+    DAY,
+    build,
+    farm,
+    farmless_attackers,
+    funder_two_farms,
+    honest,
+    meta_distinct,
+    meta_for,
+    run,
+    scenario_table,
+    sybils,
+)
 
 
 def test_scenario_a_boosting_sybils_move_mean_not_robust():
@@ -136,24 +110,13 @@ def test_scenario_f_sybil_farm_split_across_two_funders():
     # into one cluster: n_clusters = 5 honest singletons + 2 farm clusters = 7.
     honest_rows = honest("A", 5)
 
-    def farm(prefix, n, val, ts0):
-        return [dict(rater=f"{prefix}{i}", ratee="A", value=val, ts=ts0 + i * 100, evidence_level=0)
-                for i in range(n)]
-
     f1 = farm("f1_", 25, 100, 100 * DAY)
     f2 = farm("f2_", 25, 100, 300 * DAY)
     rows = honest_rows + f1 + f2
 
-    def funder(r):
-        if r.startswith("f1_"):
-            return "F1"
-        if r.startswith("f2_"):
-            return "F2"
-        return f"own-{r}"
-
     raters = sorted({r["rater"] for r in rows})
     meta = pd.DataFrame([dict(rater=r, first_seen_ts=min(x["ts"] for x in rows if x["rater"] == r),
-                              funder=funder(r)) for r in raters])
+                              funder=funder_two_farms(r)) for r in raters])
     df = build(rows)
     clusters = cluster_raters(profiles_from_records(df, meta), CFG)
     row = score(df, CFG, clusters=clusters).set_index("ratee").loc["A"]
@@ -225,19 +188,12 @@ def test_scenario_g2_boost_direction():
 
 def test_scenario_h_evasive_attacker_defeats_sybil_signals_but_not_the_weighted_median():
     # The key limitation attack: k attackers, each on a DISTINCT funder, registered > 24h
-    # apart (2 days), each ALSO rating a decoy ratee from a pool of 6 ("D1".."D6") so that no
-    # two attackers -- and no attacker and any honest rater -- share an identical ratee set,
-    # keeping the Jaccard signal below 0.8 for the overwhelming majority of pairs (the rare
-    # same-decoy pair still fails on funder+window, so nothing ever reaches 2 of 3 signals).
+    # apart (2 days), each ALSO rating a decoy ratee from a pool of 6 ("D1".."D6"). A pair
+    # sharing the same decoy DOES reach Jaccard 1.0 (identical ratee sets {"A", "D_x"}) --
+    # but it still fails to cluster: that pair is > 24h apart in first_seen_ts (decoys repeat
+    # every 6 attackers, i.e. a >= 12-day gap) and each attacker has its own distinct funder,
+    # so only 1 of the 3 signals (Jaccard) ever fires for it, short of the 2-of-3 threshold.
     # Every attacker evades sybil clustering entirely: cluster_raters gives it its own cluster.
-    def farmless_attackers(n, start_ts):
-        rows = []
-        for i in range(n):
-            ts = start_ts + i * 2 * DAY
-            rows.append(dict(rater=f"atk{i}", ratee="A", value=0, ts=ts, evidence_level=0))
-            rows.append(dict(rater=f"atk{i}", ratee=f"D{(i % 6) + 1}", value=0, ts=ts, evidence_level=0))
-        return rows
-
     def clusters_and_row(k):
         rows = honest("A", 5) + farmless_attackers(k, start_ts=1000 * DAY)
         df = build(rows)
@@ -304,36 +260,20 @@ def test_scenario_i_insufficient_clusters_refuses_to_score():
     assert math.isnan(row["robust_score"])
 
 
-def scenario_table() -> pd.DataFrame:
-    """Naive-vs-robust numbers for scenarios A, B, D, E, for the report (Task 14) to import.
-
-    Side-effect free: computes and returns a DataFrame, never writes a file. Tests below call
-    it to assert on the same numbers cited in the report.
-    """
-    a = run(honest("A", 5) + sybils("A", 50, val=100, ts=100 * DAY))
-    b = run(honest("A", 5) + sybils("A", 50, val=0, ts=100 * DAY))
-    d_rows = honest("A", 5, val=80) + [dict(rater=f"z{i}", ratee="A", value=0, ts=i * 3 * DAY, evidence_level=0)
-                                       for i in range(20)]
-    d = score(build(d_rows), CFG).set_index("ratee").loc["A"]
-    e_rows = ([dict(rater=f"e{i}", ratee="A", value=90, ts=i * 7 * DAY, evidence_level=3, tag="q")
-               for i in range(3)]
-              + [dict(rater=f"j{i}", ratee="A", value=0, ts=i * 7 * DAY, evidence_level=0, tag="junk")
-                 for i in range(4)])
-    e = score(build(e_rows), CFG).set_index("ratee").loc["A"]
-
-    rows = []
-    for name, row in (("A_boosting", a), ("B_smearing", b), ("D_evidence_free_flood", d), ("E_fresh_tag", e)):
-        rows.append(dict(scenario=name, naive_mean=row["naive_mean"], robust_score=row["robust_score"],
-                          n_clusters=row["n_clusters"], sybil_flag=row["sybil_flag"],
-                          zero_evidence_ratio=row["zero_evidence_ratio"]))
-    return pd.DataFrame(rows)
-
-
 def test_report_numbers_table():
-    """The naive-vs-robust table the report cites for scenarios A, B, D, E."""
+    """The naive-vs-robust table (robustrep.report.adversarial.scenario_table) the report
+    cites for scenarios A, B, D, E, F, H(k=20)."""
     table = scenario_table().set_index("scenario")
-    assert table["robust_score"].tolist() == [0.8, 0.8, 0.8, 0.9]
+    assert list(table.index) == [
+        "A_boosting", "B_smearing", "D_evidence_free_flood", "E_fresh_tag",
+        "F_split_funders", "H_evasive_k20",
+    ]
+    assert table["robust_score"].tolist() == [0.8, 0.8, 0.8, 0.9, 0.8, 0.8]
     assert math.isclose(table.loc["A_boosting", "naive_mean"], 54 / 55, rel_tol=1e-3)
     assert math.isclose(table.loc["B_smearing", "naive_mean"], 4 / 55, rel_tol=1e-3)
     assert math.isclose(table.loc["D_evidence_free_flood", "naive_mean"], 0.16, rel_tol=1e-3)
     assert math.isclose(table.loc["E_fresh_tag", "naive_mean"], 2.7 / 7, rel_tol=1e-3)
+    assert table.loc["F_split_funders", "n_clusters"] == 7
+    assert table.loc["F_split_funders", "sybil_flag"] == 0
+    assert table.loc["H_evasive_k20", "sybil_flag"] == 0
+    assert table.loc["H_evasive_k20", "zero_evidence_ratio"] >= 0.8
