@@ -4,7 +4,9 @@ import pandas as pd
 import pytest
 
 from robustrep.config import Config
-from robustrep.sybil import RaterProfile, _candidate_pairs, _jaccard, cluster_raters, profiles_from_records
+from robustrep.sybil import (
+    RaterProfile, _candidate_pairs, _jaccard, _ratee_group_pairs, cluster_raters, profiles_from_records,
+)
 from robustrep.schema import validate_records
 
 H = 3600
@@ -201,3 +203,50 @@ def test_meta_bad_first_seen_rejected(records_factory):
     negative = pd.DataFrame([dict(rater="a", first_seen_ts=-5, funder="F")])
     with pytest.raises(ValueError):
         profiles_from_records(df, negative)
+
+
+def test_meta_non_integer_first_seen_rejected(records_factory):
+    df = validate_records(records_factory([dict(rater="a", ratee="1", value=1, ts=1)]))
+    fractional = pd.DataFrame([dict(rater="a", first_seen_ts=5.9, funder="F")])
+    with pytest.raises(ValueError, match="first_seen_ts"):
+        profiles_from_records(df, fractional)
+
+    whole_float = pd.DataFrame([dict(rater="a", first_seen_ts=5.0, funder="F")])
+    p = profiles_from_records(df, whole_float)[0]
+    assert p.first_seen_ts == 5
+
+
+def test_farm_rating_two_agents_clusters_within_budget():
+    # 2000 same-funder raters, all within 1h, each rating the same 2 ratees:
+    # the same-funder sub-bucket must not regenerate every pair once per
+    # shared ratee, or this blows past the default sybil_max_pairs budget.
+    n = 2000
+    profiles = [P(f"f{i}", i, "F", {"agent1", "agent2"}) for i in range(n)]
+    start = time.perf_counter()
+    c = cluster_raters(profiles, Config())
+    elapsed = time.perf_counter() - start
+    assert len(set(c.values())) == 1
+    assert elapsed < 5.0
+
+
+def test_same_funder_pair_emitted_once_across_shared_ratees():
+    profiles = [
+        P("a", 0, "F", {"1", "2", "3"}),
+        P("b", 10 * 24 * H, "F", {"1", "2", "3"}),  # out of window, same funder, 3 shared ratees
+    ]
+    pairs = [p for p in _candidate_pairs(profiles, Config()) if set(p) == {"a", "b"}]
+    assert pairs == [("a", "b")]
+
+
+def test_same_funder_subbucket_mixed_window_skips_in_window_pair():
+    # a-b and b-c are each in-window (already covered by _funder_group_pairs)
+    # but the whole sub-bucket's span (a to c) exceeds the window, so the
+    # per-pair in-window check inside the combinatorial loop must still fire
+    # individually for a-b and b-c, leaving only the out-of-window a-c pair.
+    profiles = [
+        P("a", 0, "F", {"1"}),
+        P("b", 50_000, "F", {"1"}),
+        P("c", 100_000, "F", {"1"}),
+    ]
+    pairs = list(_ratee_group_pairs("1", profiles, Config(), {"1"}))
+    assert pairs == [("a", "c")]

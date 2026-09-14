@@ -20,6 +20,7 @@ not be clustered. The report must state this limitation explicitly.
 """
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import combinations
@@ -28,6 +29,8 @@ from typing import Optional
 import pandas as pd
 
 from .config import Config
+
+logger = logging.getLogger(__name__)
 
 _META_COLUMNS = {"rater", "first_seen_ts", "funder"}
 
@@ -107,7 +110,7 @@ def _funder_group_pairs(group: list[RaterProfile], cfg: Config):
             yield _pair_key(p, q)
 
 
-def _ratee_group_pairs(group: list[RaterProfile], cfg: Config):
+def _ratee_group_pairs(ratee: str, group: list[RaterProfile], cfg: Config, small: set):
     # Skip ratees with more than sybil_max_group raters entirely (see module
     # "Limitations"). Without a shared funder, a pair needs in-window +
     # Jaccard, so out-of-window pairs are pruned via a sorted sliding window
@@ -119,18 +122,46 @@ def _ratee_group_pairs(group: list[RaterProfile], cfg: Config):
         return
     ordered = sorted(group, key=lambda p: p.first_seen_ts)
     n = len(ordered)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if ordered[j].first_seen_ts - ordered[i].first_seen_ts > cfg.sybil_window_s:
-                break
-            yield _pair_key(ordered[i], ordered[j])
+    funders = {_norm_funder(p.funder) for p in group}
+    # If every rater sharing this ratee has the SAME funder, no window-sliding
+    # pair below could ever pass the funder-exclusion check (every pair is
+    # same-funder), so skip the O(n^2)-worst-case double loop entirely rather
+    # than iterate it just to discard everything.
+    if len(funders) > 1 or None in funders:
+        for i in range(n):
+            for j in range(i + 1, n):
+                if ordered[j].first_seen_ts - ordered[i].first_seen_ts > cfg.sybil_window_s:
+                    break
+                pi, pj = ordered[i], ordered[j]
+                # Same-funder + in-window pairs are already fully covered
+                # (and correctly transitively closed) by `_funder_group_pairs`,
+                # so skip them here rather than re-emitting once per ratee.
+                if _norm_funder(pi.funder) is None or _norm_funder(pi.funder) != _norm_funder(pj.funder):
+                    yield _pair_key(pi, pj)
     by_funder: dict = defaultdict(list)
     for p in group:
         if p.funder is not None:
             by_funder[_norm_funder(p.funder)].append(p)
     for sub in by_funder.values():
+        sub_by_ts = sorted(sub, key=lambda p: p.first_seen_ts)
+        # If the whole sub-bucket's timestamps fit in one window, every pair
+        # in it is in-window and thus already covered by `_funder_group_pairs`
+        # (same argument as above) -- skip the O(k^2) loop below entirely.
+        if sub_by_ts[-1].first_seen_ts - sub_by_ts[0].first_seen_ts <= cfg.sybil_window_s:
+            continue
         for p, q in combinations(sub, 2):
-            yield _pair_key(p, q)
+            if abs(p.first_seen_ts - q.first_seen_ts) <= cfg.sybil_window_s:
+                continue
+            # A same-funder, out-of-window pair may share several small
+            # ratees, and this sub-bucket runs once per ratee -- naively
+            # yielding here would regenerate the same pair once per shared
+            # ratee (a farm sharing k small ratees inflates candidate pairs
+            # ~k-fold, enough to blow the sybil_max_pairs budget). Emit it
+            # exactly once, at the lexicographically smallest of its shared
+            # small ratees.
+            shared = p.ratees & q.ratees & small
+            if shared and min(shared) == ratee:
+                yield _pair_key(p, q)
 
 
 def _candidate_pairs(profiles: list[RaterProfile], cfg: Config):
@@ -146,10 +177,11 @@ def _candidate_pairs(profiles: list[RaterProfile], cfg: Config):
             by_funder[_norm_funder(p.funder)].append(p)
         for r in p.ratees:
             by_ratee[r].append(p)
+    small = {ratee for ratee, group in by_ratee.items() if len(group) <= cfg.sybil_max_group}
     for group in by_funder.values():
         yield from _funder_group_pairs(group, cfg)
-    for group in by_ratee.values():
-        yield from _ratee_group_pairs(group, cfg)
+    for ratee, group in by_ratee.items():
+        yield from _ratee_group_pairs(ratee, group, cfg, small)
 
 
 def cluster_raters(profiles: list[RaterProfile], cfg: Config) -> dict[str, str]:
@@ -171,10 +203,12 @@ def cluster_raters(profiles: list[RaterProfile], cfg: Config) -> dict[str, str]:
         if pair_count > cfg.sybil_max_pairs:
             raise ValueError(
                 f"sybil candidate pairs exceed sybil_max_pairs={cfg.sybil_max_pairs}; "
-                "raise the budget or lower sybil_max_group/window"
+                "raise sybil_max_pairs first; lowering sybil_max_group also helps but "
+                "trades sybil-detection recall for speed"
             )
         if _signals(by_id[a], by_id[b], cfg) >= 2:
             uf.union(a, b)
+    logger.info("sybil candidate pairs: %d", pair_count)
     return {r: uf.find(r) for r in by_id}
 
 
@@ -191,8 +225,11 @@ def _validate_meta(meta: pd.DataFrame) -> pd.DataFrame:
         out["first_seen_ts"] = pd.to_numeric(out["first_seen_ts"], errors="raise")
     except (ValueError, TypeError) as e:
         raise ValueError(f"meta.first_seen_ts: {e}") from e
-    if (out["first_seen_ts"].dropna() < 0).any():
+    ts = out["first_seen_ts"].dropna()
+    if (ts < 0).any():
         raise ValueError("meta.first_seen_ts: negative values not allowed")
+    if (ts % 1 != 0).any():
+        raise ValueError("meta.first_seen_ts: non-integer values not allowed")
     return out
 
 
