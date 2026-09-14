@@ -1,4 +1,5 @@
 import json
+import re
 
 import numpy as np
 import pandas as pd
@@ -204,6 +205,29 @@ def test_render_markdown_tolerates_missing_revoked_column_and_bare_adversarial(r
         [dict(variant="base", spearman_top=1.0)]), adversarial=bare_adversarial)
     assert "0 revoked" in md
     assert "Measured boundaries" not in md
+
+
+def test_render_markdown_nan_cells_render_blank_not_literal_nan(records_factory):
+    """Item 1: NaN cells in the sensitivity/adversarial tables must render as a
+    blank Markdown cell, never the literal string "nan"."""
+    rec, sc = _data(records_factory)
+    adv = scenario_table()  # break_even_k/break_even_k_boost are NaN on most rows
+    sensitivity = pd.DataFrame([dict(variant="base", spearman_top=1.0),
+                                dict(variant="window_72h", spearman_top=float("nan"))])
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=sensitivity, adversarial=adv)
+    assert not re.search(r"\bnan\b", md.lower())
+
+
+def test_measured_boundaries_paragraph_handles_missing_break_even_k_boost(records_factory):
+    """Item 3: `break_even_k_boost` missing entirely from the adversarial table
+    (not just NaN on the H row) must not raise -- the boost side renders "n/a"."""
+    rec, sc = _data(records_factory)
+    adv = scenario_table().drop(columns=["break_even_k_boost"])
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=pd.DataFrame(
+        [dict(variant="base", spearman_top=1.0)]), adversarial=adv)
+    assert "Measured boundaries" in md
+    assert "boost at n/a" in md
+    assert not re.search(r"\bnan\b", md.lower())
 
 
 def test_export_json_config_key(tmp_path, records_factory):
