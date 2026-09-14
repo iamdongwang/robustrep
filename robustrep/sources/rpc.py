@@ -16,7 +16,20 @@ import requests
 
 
 class RpcError(RuntimeError):
-    """Raised when a JSON-RPC call/batch fails on every configured retry."""
+    """Raised when a JSON-RPC call/batch fails on every configured retry, or
+    immediately for a non-retryable error (see ``NON_RETRYABLE``)."""
+
+
+# Substrings (case-insensitive) of a JSON-RPC error message/code that indicate the
+# request itself is malformed or permanently rejected -- retrying identically (or
+# rotating URL) cannot help, so these are raised immediately instead of consuming
+# the retry budget.
+NON_RETRYABLE = ("limited to a", "invalid params", "-32602", "-32600")
+
+
+def _is_non_retryable(message: str) -> bool:
+    low = message.lower()
+    return any(s.lower() in low for s in NON_RETRYABLE)
 
 
 class RpcClient:
@@ -45,7 +58,10 @@ class RpcClient:
     def _with_retry(self, payload, check: Callable[[object], Optional[str]]):
         """Post ``payload``, retrying (rotating URL, sleeping with backoff) while
         ``check(body)`` returns a non-``None`` error message. Raises ``RpcError``
-        naming the last failure once ``retries`` attempts are exhausted."""
+        naming the last failure once ``retries`` attempts are exhausted, or
+        immediately (no rotation, no sleep, no further attempts) if ``check``
+        reports a ``NON_RETRYABLE`` error. The final failed attempt is never
+        followed by a sleep, since nothing more will be tried afterwards."""
         last: Optional[Exception] = None
         for attempt in range(self.retries):
             try:
@@ -53,38 +69,54 @@ class RpcClient:
                 err = check(body)
                 if err is None:
                     return body
+                if _is_non_retryable(err):
+                    raise RpcError(f"non-retryable error: {err}")
                 last = RpcError(err)
             except (requests.RequestException, ValueError) as e:
                 last = e
             self.i += 1
-            self.sleep(min(2 ** attempt, 30))
+            if attempt < self.retries - 1:
+                self.sleep(min(2 ** attempt, 30))
         raise RpcError(f"gave up after {self.retries} attempts: {last}")
 
     @staticmethod
-    def _check_single(body) -> Optional[str]:
+    def _error_message(err) -> str:
+        return err.get("message", "error") if isinstance(err, dict) else str(err)
+
+    @classmethod
+    def _check_single(cls, body) -> Optional[str]:
         if not isinstance(body, dict):
             return "malformed response: expected an object"
-        if "error" in body:
-            return body["error"].get("message", "error") if isinstance(body["error"], dict) else str(body["error"])
+        err = body.get("error")
+        if err is not None:
+            return cls._error_message(err)
         if "result" not in body:
             return "malformed response: no 'result' or 'error' field"
         return None
 
-    @staticmethod
-    def _check_batch(body) -> Optional[str]:
-        if not isinstance(body, list):
-            return "malformed batch response: expected a list"
+    @classmethod
+    def _check_batch(cls, n: int, body) -> Optional[str]:
+        if not isinstance(body, list) or len(body) != n:
+            got = len(body) if isinstance(body, list) else type(body).__name__
+            return f"malformed batch response: expected {n} entries, got {got}"
+        ids = sorted(x.get("id") for x in body if isinstance(x, dict))
+        if ids != list(range(1, n + 1)):
+            return f"malformed batch response: ids {ids} != 1..{n}"
         for item in body:
-            if not isinstance(item, dict) or "result" not in item:
-                return f"batch entry error: {item}"
+            err = item.get("error")
+            if err is not None:
+                return f"batch entry id={item.get('id')}: {cls._error_message(err)}"
+            if item.get("result") is None:
+                return f"batch entry id={item.get('id')}: missing result"
         return None
 
     def call(self, method: str, params: list):
         """Make a single JSON-RPC call and return its ``result``.
 
         Raises ``RpcError`` if every retry either transport-fails, returns a
-        JSON-RPC ``error``, or returns a body with neither ``result`` nor
-        ``error`` (a malformed response).
+        JSON-RPC ``error`` (a null ``error`` is not treated as one), or returns
+        a body with neither ``result`` nor ``error`` (a malformed response). A
+        non-retryable error (see ``NON_RETRYABLE``) raises immediately.
         """
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         body = self._with_retry(payload, self._check_single)
@@ -92,11 +124,17 @@ class RpcClient:
 
     def batch(self, calls: list[tuple[str, list]]) -> list:
         """Make a JSON-RPC batch call and return results in the same order as
-        ``calls`` (regardless of the order the server returns them in).
+        ``calls``, matched by response ``id`` (not response position -- servers
+        are free to return batch entries in any order).
 
-        Raises ``RpcError`` if every retry either transport-fails or returns a
-        batch containing an entry without a ``result`` (i.e. an error entry).
+        Raises ``RpcError`` if every retry either transport-fails, returns a
+        response that isn't a list of exactly ``len(calls)`` entries, returns
+        entries whose ids aren't exactly ``{1..len(calls)}``, or contains an
+        entry with a non-null ``error`` or a missing/null ``result``. A
+        non-retryable error (see ``NON_RETRYABLE``) raises immediately.
         """
+        n = len(calls)
         payload = [{"jsonrpc": "2.0", "id": i + 1, "method": m, "params": p} for i, (m, p) in enumerate(calls)]
-        body = self._with_retry(payload, self._check_batch)
-        return [x["result"] for x in sorted(body, key=lambda x: x["id"])]
+        body = self._with_retry(payload, lambda b: self._check_batch(n, b))
+        by_id = {x["id"]: x for x in body}
+        return [by_id[i + 1]["result"] for i in range(n)]

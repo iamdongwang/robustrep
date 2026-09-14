@@ -23,6 +23,9 @@ class Config:
     rpc_urls: tuple[str, ...] = ("https://mainnet.base.org",)
     chunk_blocks: int = 2000
     user_agent: str = "robustrep/0.1 (+https://github.com/iamdongwang/robustrep)"
+    # blocks to lag behind the chain head before ingesting: guards against a re-org
+    # near the tip leaving phantom feedback rows behind.
+    confirmations: int = 20
 
     def __post_init__(self) -> None:
         if len(self.evidence_weights) != 4:
@@ -47,3 +50,5 @@ class Config:
             raise ValueError("chunk_blocks must be >= 1")
         if len(self.rpc_urls) < 1:
             raise ValueError("rpc_urls must have at least 1 entry")
+        if self.confirmations < 0:
+            raise ValueError("confirmations must be >= 0")
