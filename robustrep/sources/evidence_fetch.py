@@ -95,16 +95,20 @@ def _is_disallowed_ip(ip_str: str) -> bool:
     """True if ``ip_str`` is not a valid IP literal, or is one that must never
     be fetched from a server processing untrusted URIs.
 
-    ``is_multicast or not is_global`` covers private, loopback, link-local,
-    reserved, unspecified and CGNAT (100.64.0.0/10) addresses in one check.
-    6to4 (2002::/16) is unwrapped and its embedded IPv4 re-checked, since
-    ``is_global`` alone does not see through it (see ``_SIX_TO_FOUR``).
+    ``is_multicast or is_reserved or not is_global`` covers private, loopback,
+    link-local, reserved, unspecified and CGNAT (100.64.0.0/10) addresses in
+    one check; ``is_reserved`` additionally catches NAT64 (``64:ff9b::/96``
+    and the RFC 8215 local-use ``64:ff9b:1::/48``), both of which Python's
+    ipaddress module reports as ``is_global=True`` despite embedding an IPv4
+    address that itself may be private/loopback. 6to4 (2002::/16) is
+    similarly ``is_global=True`` but *not* ``is_reserved``, so it is unwrapped
+    separately and its embedded IPv4 re-checked (see ``_SIX_TO_FOUR``).
     """
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return True
-    if ip.is_multicast or not ip.is_global:
+    if ip.is_multicast or ip.is_reserved or not ip.is_global:
         return True
     if isinstance(ip, ipaddress.IPv6Address) and ip in _SIX_TO_FOUR:
         embedded = ipaddress.IPv4Address(ip.packed[2:6])
@@ -332,6 +336,10 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
     session = requests.Session()
     processed = 0
     try:
+        # The query's correlated NOT EXISTS re-reads evidence_cache on every row as
+        # the cursor is scanned; safe here only because each upsert_evidence() below
+        # inserts a row for the URI the scan just visited (never one still ahead of
+        # it) -- do not reorder this loop to insert speculatively or out of order.
         for uri, clients, owners in cursor:
             processed += 1
             parties = {p for p in (clients or "").split(",") + (owners or "").split(",") if p}
