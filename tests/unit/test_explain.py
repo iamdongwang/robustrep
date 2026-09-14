@@ -93,6 +93,30 @@ def test_explain_consistent_with_score(records_factory):
     assert int(out2["is_median_vote"].sum()) == 1
 
 
+def test_is_median_vote_multi_tag(records_factory):
+    # tag q: 3 votes, scores 0.2/0.4/0.9, evidence levels 3/3/0 -> weights 1.0/1.0/0.1
+    # tag u: 2 votes, scores 0.6/0.8, evidence levels 1/1 -> weights 0.3/0.3
+    # distinct raters/clusters (no `clusters` passed -> each rater its own cluster).
+    # per-tag weighted median: q -> 0.4 (weight 2.1), u -> 0.6 (weight 0.6); across
+    # tags, weighted median of [0.4, 0.6] under [2.1, 0.6] is 0.4 -> rater q2's vote.
+    df = records_factory([
+        dict(rater="q1", ratee="C", value=20, evidence_level=3, tag="q"),
+        dict(rater="q2", ratee="C", value=40, evidence_level=3, tag="q"),
+        dict(rater="q3", ratee="C", value=90, evidence_level=0, tag="q"),
+        dict(rater="u1", ratee="C", value=60, evidence_level=1, tag="u"),
+        dict(rater="u2", ratee="C", value=80, evidence_level=1, tag="u"),
+    ])
+    cfg = Config(bootstrap_n=0)
+    out = explain(df, "C", cfg)
+    marked = out[out["is_median_vote"]]
+    # exactly one (tag, cluster) vote is marked
+    assert marked[["tag", "cluster"]].drop_duplicates().shape[0] == 1
+    assert marked["rater"].tolist() == ["q2"]
+    robust_score = score(df, cfg).set_index("ratee").loc["C", "robust_score"]
+    assert math.isclose(robust_score, 0.4)
+    assert math.isclose(marked["score"].median(), robust_score)
+
+
 def test_ratee_int_accepted(records_factory):
     df = records_factory([dict(rater="h1", ratee=1, value=80, evidence_level=3)])
     out = explain(df, 1, Config(bootstrap_n=0))
