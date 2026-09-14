@@ -16,16 +16,26 @@ VALID_LEVELS = {0, 1, 2, 3}
 VALID_REVOKED = {0, 1}
 
 
+MAX_SCALE_DECIMALS = 18  # ERC-8004 valueDecimals is 0-18
+
+
 def make_scale(decimals: int) -> str:
     if not isinstance(decimals, (int, np.integer)) or isinstance(decimals, bool) or decimals < 0:
         raise ValueError(f"decimals must be a non-negative integer, got {decimals!r}")
+    if decimals > MAX_SCALE_DECIMALS:
+        raise ValueError(
+            f"decimals must be 0-{MAX_SCALE_DECIMALS} (ERC-8004 valueDecimals range), got {decimals!r}")
     return f"d{int(decimals)}"
 
 
 def scale_decimals(scale: str) -> int:
     if not isinstance(scale, str) or not scale.startswith("d") or not scale[1:].isdigit():
         raise ValueError(f"bad scale {scale!r}; expected like 'd0'")
-    return int(scale[1:])
+    decimals = int(scale[1:])
+    if decimals > MAX_SCALE_DECIMALS:
+        raise ValueError(
+            f"bad scale {scale!r}; decimals must be 0-{MAX_SCALE_DECIMALS} (ERC-8004 valueDecimals range)")
+    return decimals
 
 
 def _coerce_numeric(out: pd.DataFrame, col: str, dtype: str) -> None:
@@ -75,6 +85,15 @@ def validate_records(df: pd.DataFrame) -> pd.DataFrame:
     out["tag"] = out["tag"].fillna("").astype(str)
     out["scale"] = out["scale"].fillna("").astype(str)
     out["source"] = out["source"].fillna("").astype(str)
+    bad_scales = []
+    for s in out["scale"].unique():
+        try:
+            scale_decimals(s)
+        except ValueError:
+            bad_scales.append(s)
+    if bad_scales:
+        rows = out.index[out["scale"].isin(bad_scales)].tolist()[:5]
+        raise ValueError(f"column 'scale': bad values {bad_scales[:5]} at rows {rows}")
     _coerce_numeric(out, "value", "float")
     _coerce_numeric(out, "ts", "int64")
     for col in ("evidence_level", "revoked"):

@@ -128,6 +128,19 @@ def test_evidence_level_non_numeric_rejected(records_factory):
         validate_records(df)
 
 
+def test_bad_scale_rejected_at_boundary(records_factory):
+    df = records_factory([dict(rater="a", ratee="1", value=1, scale="percent")])
+    with pytest.raises(ValueError, match="column 'scale'"):
+        validate_records(df)
+
+
+def test_scale_decimals_over_18_rejected():
+    with pytest.raises(ValueError):
+        scale_decimals("d19")
+    with pytest.raises(ValueError):
+        make_scale(19)
+
+
 def test_config_more_checks():
     from robustrep.config import Config
 
