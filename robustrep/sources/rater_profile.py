@@ -85,9 +85,10 @@ class EtherscanClient:
         body, or an Etherscan rate-limit message), or immediately -- without
         retrying -- for a non-retryable one: any other HTTP 4xx, or an
         invalid/rejected API key. Raises ``ValueError`` naming ``address`` for
-        a malformed response: a missing ``status`` field, a ``status: "1"``
-        body whose ``result`` isn't a list, a transaction entry missing
-        required fields, or (after retries) a body that never parses as JSON.
+        a malformed response: a body that isn't a JSON object (e.g. ``null``
+        or a bare list), a missing ``status`` field, a ``status: "1"`` body
+        whose ``result`` isn't a list, a transaction entry missing required
+        fields, or (after retries) a body that never parses as JSON.
         """
         address = address.lower()
         params = dict(chainid=self.chain_id, module="account", action="txlist", address=address,
@@ -111,6 +112,8 @@ class EtherscanClient:
                     except ValueError:
                         transient, last_kind = True, "json"
                     else:
+                        if not isinstance(body, dict):
+                            raise ValueError(f"Etherscan response is not a JSON object for {address}")
                         outcome = self._parse_body(body, address)
                         if outcome is _RETRY:
                             transient, last_kind = True, "body"
@@ -226,11 +229,12 @@ def enrich_raters(store: Store, client: Optional[EtherscanClient]) -> int:
         return 0
 
     if client is None:
-        if store.n_missing_block_ts() > 0:
+        n_missing = store.n_missing_block_ts()
+        if n_missing > 0:
             logger.warning(
                 "rater_profile: %d block(s) have no cached timestamp - "
                 "run fill_block_timestamps first for accurate fallback first-seen times",
-                store.n_missing_block_ts())
+                n_missing)
         store.set_sync("rater_profile_mode", "fallback")
         return len(addrs)
 
