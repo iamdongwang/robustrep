@@ -107,3 +107,35 @@ def test_config_post_init():
         Config(ci_level=1.5)
     with pytest.raises(ValueError):
         Config(evidence_weights=(1, 2, 3))
+
+
+def test_non_finite_value_rejected(records_factory):
+    df = records_factory([dict(rater="a", ratee="1", value=float("inf"))])
+    with pytest.raises(ValueError, match="non-finite"):
+        validate_records(df)
+
+
+def test_duplicated_columns_rejected(records_factory):
+    df = records_factory([dict(rater="a", ratee="1", value=1)])
+    df.columns = ["rater" if c == "scale" else c for c in df.columns]
+    with pytest.raises(ValueError, match="duplicated"):
+        validate_records(df)
+
+
+def test_evidence_level_non_numeric_rejected(records_factory):
+    df = records_factory([dict(rater="a", ratee="1", value=1, evidence_level="x")])
+    with pytest.raises(ValueError, match="evidence_level"):
+        validate_records(df)
+
+
+def test_config_more_checks():
+    from robustrep.config import Config
+
+    with pytest.raises(ValueError):
+        Config(sybil_jaccard=5.0)
+    with pytest.raises(ValueError):
+        Config(rpc_urls=())
+    with pytest.raises(ValueError):
+        Config(bootstrap_n=-1)
+    with pytest.raises(ValueError):
+        Config(min_clusters=0)

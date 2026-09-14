@@ -34,6 +34,7 @@ include = ["robustrep*"]
 testpaths = ["tests"]
 markers = ["live: needs network; run weekly, not on every push"]
 addopts = "-m 'not live'"
+filterwarnings = ["error"]
 
 [tool.coverage.run]
 source = ["robustrep"]

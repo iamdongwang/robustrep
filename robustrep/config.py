@@ -32,3 +32,13 @@ class Config:
             raise ValueError("bootstrap_n must be >= 0")
         if self.min_clusters < 1:
             raise ValueError("min_clusters must be >= 1")
+        if not 0 <= self.sybil_jaccard <= 1:
+            raise ValueError("sybil_jaccard must be in [0, 1]")
+        if not 0 <= self.sybil_flag_share <= 1:
+            raise ValueError("sybil_flag_share must be in [0, 1]")
+        if self.sybil_window_s < 0:
+            raise ValueError("sybil_window_s must be >= 0")
+        if self.chunk_blocks < 1:
+            raise ValueError("chunk_blocks must be >= 1")
+        if len(self.rpc_urls) < 1:
+            raise ValueError("rpc_urls must have at least 1 entry")

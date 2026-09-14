@@ -33,14 +33,17 @@ def _coerce_numeric(out: pd.DataFrame, col: str, dtype: str) -> None:
         out[col] = pd.to_numeric(out[col], errors="raise")
     except (ValueError, TypeError) as e:
         raise ValueError(f"column {col!r}: {e}") from e
-    if not np.isfinite(out[col].to_numpy(dtype=float)).all():
-        bad = out.index[~np.isfinite(out[col].to_numpy(dtype=float))].tolist()[:5]
+    finite = np.isfinite(out[col].to_numpy(dtype=float))
+    if not finite.all():
+        bad = out.index[~finite].tolist()[:5]
         raise ValueError(f"column {col!r}: non-finite values at rows {bad}")
     out[col] = out[col].astype(dtype)
 
 
 def _check_domain(out: pd.DataFrame, col: str, allowed: set) -> None:
     vals = out[col].to_numpy(dtype=float)
+    if not np.isfinite(vals).all():
+        raise ValueError(f"column {col!r}: non-finite values")
     if not np.array_equal(vals, np.floor(vals)):
         raise ValueError(f"column {col!r}: non-integer values")
     bad = sorted(set(vals.astype(int)) - allowed)
@@ -50,7 +53,10 @@ def _check_domain(out: pd.DataFrame, col: str, allowed: set) -> None:
 
 
 def validate_records(df: pd.DataFrame) -> pd.DataFrame:
-    """Boundary check + coercion. Returns a new frame; the input is never modified."""
+    """Boundary check + coercion. Returns a new frame; the input is never modified.
+
+    ts is truncated to integer seconds.
+    """
     if df.columns.duplicated().any():
         raise ValueError(f"duplicated columns: {df.columns[df.columns.duplicated()].tolist()}")
     missing = [c for c in RECORD_COLUMNS if c not in df.columns]
@@ -67,12 +73,15 @@ def validate_records(df: pd.DataFrame) -> pd.DataFrame:
     out["rater"] = out["rater"].astype(str)
     out["ratee"] = out["ratee"].astype(str)
     out["tag"] = out["tag"].fillna("").astype(str)
-    out["scale"] = out["scale"].astype(str)
-    out["source"] = out["source"].astype(str)
+    out["scale"] = out["scale"].fillna("").astype(str)
+    out["source"] = out["source"].fillna("").astype(str)
     _coerce_numeric(out, "value", "float")
     _coerce_numeric(out, "ts", "int64")
-    out["evidence_level"] = out["evidence_level"].fillna(0)
-    out["revoked"] = out["revoked"].fillna(0)
+    for col in ("evidence_level", "revoked"):
+        try:
+            out[col] = pd.to_numeric(out[col].where(out[col].notna(), 0), errors="raise")
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"column {col!r}: {e}") from e
     _check_domain(out, "evidence_level", VALID_LEVELS)
     _check_domain(out, "revoked", VALID_REVOKED)
     out["cluster"] = out["cluster"].where(out["cluster"].notna(), out["rater"]).astype(str)
