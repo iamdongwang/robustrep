@@ -1,4 +1,5 @@
 import logging
+import threading
 from urllib.parse import urlsplit
 
 import pytest
@@ -542,6 +543,9 @@ def test_classify_all_log_every_zero_disables_progress_logging(tmp_path, caplog)
 
 
 def test_classify_all_reuses_one_session_across_uris(tmp_path):
+    # With a single worker thread (workers=1), classify_all behaves like the
+    # old sequential implementation: one thread -> one lazily-created,
+    # thread-local requests.Session, reused for every URI.
     s = Store(tmp_path / "t4.db")
     rows = [{**_fb(f"https://s{i}"), "feedback_index": i} for i in range(3)]
     s.upsert_feedback(rows)
@@ -551,7 +555,7 @@ def test_classify_all_reuses_one_session_across_uris(tmp_path):
         seen_sessions.append(session)
         return None
 
-    classify_all(s, fetch_text=fetch)
+    classify_all(s, fetch_text=fetch, workers=1)
     assert len(seen_sessions) == 3
     assert len({id(x) for x in seen_sessions}) == 1
     assert all(x is not None for x in seen_sessions)
@@ -601,3 +605,102 @@ def test_dns_rebinding_not_mitigated_in_v0_1():
     sess = RebindingSession()
     http_fetch_text("http://rebind.example/x", session=sess, resolver=resolver)
     assert sess.connected_to == ["93.184.216.34"]
+
+
+# --- classify_all: concurrent workers -------------------------------------------------
+
+def _seed_many(store: Store, n: int, prefix: str = "u") -> None:
+    rows = [{**_fb(f"https://{prefix}{i}"), "feedback_index": i} for i in range(n)]
+    store.upsert_feedback(rows)
+
+
+def _mixed_fetch(uri, session=None):
+    """Deterministic per-URI outcome (by trailing int in the uri) covering all
+    three ``classify_all`` note branches: unfetchable, fetched-with-evidence,
+    fetched-with-no-evidence."""
+    i = int("".join(ch for ch in uri.rsplit("/", 1)[-1] if ch.isdigit()))
+    if i % 7 == 0:
+        return None  # unfetchable
+    if i % 5 == 0:
+        return f"tx {TX}"  # fetched, evidence found -> level 3
+    return "just some prose, no evidence markers"  # fetched, no evidence -> level 1
+
+
+def test_classify_all_workers_4_matches_workers_1(tmp_path):
+    s1 = Store(tmp_path / "seq.db")
+    _seed_many(s1, 50, prefix="p")
+    n1 = classify_all(s1, fetch_text=_mixed_fetch, workers=1)
+
+    s2 = Store(tmp_path / "par.db")
+    _seed_many(s2, 50, prefix="p")
+    n2 = classify_all(s2, fetch_text=_mixed_fetch, workers=4)
+
+    assert n1 == n2 == 50
+    rows1 = s1.conn.execute("SELECT uri, level, note FROM evidence_cache ORDER BY uri").fetchall()
+    rows2 = s2.conn.execute("SELECT uri, level, note FROM evidence_cache ORDER BY uri").fetchall()
+    assert rows1 == rows2
+    assert len(rows1) == 50
+
+
+def test_classify_all_worker_exception_still_yields_fetch_error(tmp_path):
+    s = Store(tmp_path / "werr.db")
+    _seed_many(s, 10, prefix="e")
+
+    def fetch(uri, session=None):
+        if uri == "https://e3":
+            raise RuntimeError("boom")
+        return None
+
+    n = classify_all(s, fetch_text=fetch, workers=4)
+    assert n == 10
+    level, note = s.conn.execute(
+        "SELECT level, note FROM evidence_cache WHERE uri='https://e3'").fetchone()
+    assert level == 1 and note == "fetch-error"
+
+
+def test_classify_all_writes_store_only_from_main_thread(tmp_path):
+    s = Store(tmp_path / "tthread.db")
+    _seed_many(s, 50, prefix="w")
+    main_thread_id = threading.get_ident()
+    write_thread_ids = []
+    orig_upsert = s.upsert_evidence
+
+    def recording_upsert(uri, level, note=""):
+        write_thread_ids.append(threading.get_ident())
+        return orig_upsert(uri, level, note)
+
+    s.upsert_evidence = recording_upsert
+
+    def fetch(uri, session=None):
+        return None
+
+    n = classify_all(s, fetch_text=fetch, workers=4)
+    assert n == 50
+    assert len(write_thread_ids) == 50
+    assert all(tid == main_thread_id for tid in write_thread_ids)
+
+
+def test_classify_all_each_worker_thread_gets_its_own_session(tmp_path):
+    s = Store(tmp_path / "tsess.db")
+    _seed_many(s, 40, prefix="s")
+    seen = []  # (thread_ident, session_id)
+    lock = threading.Lock()
+
+    def fetch(uri, session=None):
+        with lock:
+            seen.append((threading.get_ident(), id(session)))
+        return None
+
+    classify_all(s, fetch_text=fetch, workers=4)
+
+    by_thread: dict = {}
+    for tid, sid in seen:
+        by_thread.setdefault(tid, set()).add(sid)
+    # Each worker thread reused exactly one session for every URI it handled
+    # (thread-local caching), never a fresh one per call.
+    assert all(len(sids) == 1 for sids in by_thread.values())
+    # Distinct worker threads (if more than one actually ran) never share a
+    # session object.
+    if len(by_thread) > 1:
+        session_ids_by_thread = [next(iter(sids)) for sids in by_thread.values()]
+        assert len(set(session_ids_by_thread)) == len(by_thread)
