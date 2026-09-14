@@ -97,10 +97,14 @@ def score(records: pd.DataFrame, cfg: Config = Config(), clusters: Optional[dict
     if df.empty:
         return pd.DataFrame(columns=RESULT_COLUMNS)
     votes = collapse(df)
+    # Group votes by ratee once, up front: an O(1) dict lookup per ratee below
+    # instead of rescanning the whole `votes` frame per ratee (which would be
+    # O(n_ratees * n_votes) and too slow at ~28k ratees).
+    votes_by_ratee = dict(tuple(votes.groupby("ratee", sort=False)))
     rng = np.random.default_rng(cfg.bootstrap_seed)
     rows = []
     for ratee, raw in df.groupby("ratee", sort=True):
-        v = votes[votes["ratee"] == ratee]
+        v = votes_by_ratee[ratee]
         n_clusters = int(v["cluster"].nunique())
         share = raw.groupby("cluster").size().max() / len(raw)
         row = dict(ratee=ratee, n_clusters=n_clusters, n_raw=int(len(raw)),
