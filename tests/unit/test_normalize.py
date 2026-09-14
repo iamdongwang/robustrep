@@ -80,13 +80,14 @@ def test_norm_rule_recorded(records_factory):
 
 def test_duplicate_index_groups_do_not_mix(records_factory):
     a = validate_records(records_factory([dict(rater="a", ratee="1", value=1, tag="quality"),
-                                           dict(rater="b", ratee="2", value=0, tag="quality")]))
-    b = validate_records(records_factory([dict(rater="c", ratee="3", value=1, tag="delivery"),
-                                           dict(rater="d", ratee="4", value=0, tag="delivery")]))
+                                           dict(rater="b", ratee="1", value=0, tag="quality")]))
+    b = validate_records(records_factory([dict(rater="c", ratee="1", value=87, tag="delivery"),
+                                           dict(rater="d", ratee="1", value=40, tag="delivery")]))
     combined = pd.concat([a, b])
     assert list(combined.index) == [0, 1, 0, 1]
     df = normalize(combined)
-    assert list(df["score"]) == [1.0, 0.0, 1.0, 0.0]
+    assert list(df["score"]) == [1.0, 0.0, 0.87, 0.40]
+    assert list(df["norm_rule"]) == ["binary", "binary", "percent", "percent"]
 
 
 def test_empty_frame_returns_score_column(records_factory):
