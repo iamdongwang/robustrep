@@ -1,3 +1,4 @@
+import pandas as pd
 import logging
 import sqlite3
 import time
@@ -158,7 +159,7 @@ def test_load_records_dtypes(tmp_path):
     assert df["revoked"].iloc[0] == 0 and str(df["revoked"].dtype).startswith("int")
     assert str(df["ts"].dtype).startswith("int")
     assert str(df["value"].dtype) == "float64"
-    assert df["scale"].dtype == object and isinstance(df["scale"].iloc[0], str)
+    assert pd.api.types.is_string_dtype(df["scale"]) and isinstance(df["scale"].iloc[0], str)
 
 
 # --- fixes: order-independent revocations, NULL-safe distinct, atomic pop, conflict visibility ---
