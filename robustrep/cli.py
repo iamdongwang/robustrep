@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
@@ -41,7 +42,28 @@ OWNER_LOG_EVERY = 500
 @app.callback()
 def main(verbose: bool = typer.Option(False, "--verbose", help="Enable INFO-level logging.")) -> None:
     """Robust, transport-agnostic reputation scoring for AI agents."""
-    logging.basicConfig(level=logging.INFO if verbose else logging.WARNING, force=True)
+    # Only ever *adjust the level* of our own package logger -- never call
+    # logging.basicConfig(..., force=True), which tears down and replaces every
+    # handler on the root logger (including one belonging to a caller embedding
+    # this CLI, or pytest's caplog) with a fresh StreamHandler bound to
+    # whatever sys.stderr happens to be *at this exact call*. Under repeated
+    # `typer.testing.CliRunner.invoke()` calls in one process, that snapshot is
+    # a redirected stream that gets closed once the invocation ends, so a
+    # later log call reusing that handler raises "I/O operation on closed
+    # file." Adding a handler only when the root logger has none yet avoids
+    # ever rebinding a handler to a stream that may later be closed.
+    # Non-verbose resets to NOTSET (defer to the root logger's own level,
+    # WARNING by default) rather than pinning WARNING explicitly on this
+    # named logger: an explicit level here would otherwise outlive this call
+    # (loggers are process-global singletons) and, unlike NOTSET, would block
+    # a later `caplog.at_level(logging.INFO)` (which only raises the ROOT
+    # logger's level) from ever reaching child loggers under "robustrep" --
+    # Python's level lookup stops at the first ancestor with an explicit
+    # level, so an explicit WARNING here would shadow root's override.
+    logging.getLogger("robustrep").setLevel(logging.INFO if verbose else logging.NOTSET)
+    root = logging.getLogger()
+    if not root.handlers:
+        root.addHandler(logging.StreamHandler(sys.stderr))
 
 
 def _no_blank(value: Optional[str]) -> Optional[str]:

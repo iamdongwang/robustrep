@@ -314,13 +314,36 @@ def test_verbose_flag_sets_info_logging(tmp_path, monkeypatch):
 
     r = runner.invoke(app, ["--verbose", "fetch", "--db", str(db)])
     assert r.exit_code == 0, r.output
-    assert logging.getLogger().level == logging.INFO
+    assert logging.getLogger("robustrep").level == logging.INFO
 
 
 def test_help_lists_fetch_and_score():
     r = runner.invoke(app, ["--help"])
     assert r.exit_code == 0
     assert "fetch" in r.output and "score" in r.output
+
+
+def test_repeated_invoke_never_binds_handler_to_a_closed_stream(tmp_path, capsys):
+    # Regression test: main() used to call logging.basicConfig(force=True),
+    # which rebuilds the root logger's handlers on every invocation, binding a
+    # fresh StreamHandler to whatever sys.stderr CliRunner had redirected to
+    # *at that call*. That redirected stream is closed once invoke() returns,
+    # so a later direct log call reusing the (now-closed) handler used to
+    # raise "I/O operation on closed file" (caught internally by logging's
+    # Handler.handleError, which prints a "--- Logging error ---" diagnostic
+    # to stderr instead of propagating -- so the regression must be checked
+    # via captured stderr, not just "did calling .warning() raise").
+    db = tmp_path / "t.db"
+    r1 = runner.invoke(app, ["--verbose", "fetch", "--db", str(db), "--dry-run"])
+    assert r1.exit_code == 0, r1.output
+    r2 = runner.invoke(app, ["--verbose", "fetch", "--db", str(db), "--dry-run"])
+    assert r2.exit_code == 0, r2.output
+
+    capsys.readouterr()  # discard anything captured so far
+    logging.getLogger("robustrep").warning("x")  # must not raise / print a logging error
+    captured = capsys.readouterr()
+    assert "Logging error" not in captured.err
+    assert "closed file" not in captured.err
 
 
 # --- RPC error handling (redacted, exit 3) -------------------------------------
