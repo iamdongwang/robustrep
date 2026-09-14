@@ -140,7 +140,7 @@ def test_fetch_end_to_end_with_stubs(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 3)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 2)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: "0xowner")
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: "0xowner" for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 5)
 
@@ -161,7 +161,7 @@ def test_fetch_skip_evidence_skips_classify_all(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: calls.append(1))
 
@@ -178,7 +178,7 @@ def test_fetch_skip_raters_skips_enrich_raters(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: calls.append(1))
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
@@ -202,7 +202,7 @@ def test_fetch_etherscan_key_overrides_env_and_is_not_echoed(tmp_path, monkeypat
     monkeypatch.setattr(cli, "EtherscanClient", _FakeEtherscanClient)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
@@ -232,7 +232,7 @@ def test_fetch_rpc_url_and_confirmations_reach_config(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli.base, "sync_feedback", _capture_sync)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
@@ -257,7 +257,7 @@ def test_fetch_to_block_and_chunk_reach_sync_feedback(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli.base, "sync_feedback", _capture_sync)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
@@ -273,7 +273,7 @@ def test_fetch_warns_when_block_timestamps_still_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
     monkeypatch.setattr(Store, "n_missing_block_ts", lambda self: 3)
@@ -290,7 +290,7 @@ def test_fetch_partial_rater_failure_continues_and_exits_2(tmp_path, monkeypatch
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
 
     def _raise(*a, **k):
         raise RuntimeError("2 rater(s) failed: 0xdead, 0xbeef")
@@ -338,7 +338,7 @@ def test_verbose_flag_sets_debug_logging(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
@@ -405,7 +405,7 @@ def test_fetch_rpc_error_from_evidence_step_exits_3(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
 
     def _raise(*a, **k):
@@ -449,7 +449,8 @@ def test_step_owners_records_unresolved_and_skips_on_rerun(tmp_path, monkeypatch
     db = tmp_path / "t.db"
     _seed_agents(db, ["1"])
     calls = []
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: calls.append(1) or None)
+    monkeypatch.setattr(cli.base, "owners_of",
+                         lambda rpc, agent_ids, **k: calls.append(1) or {a: None for a in agent_ids})
 
     with Store(db) as store:
         summary = cli._step_owners(store, _FakeRpc())
@@ -466,7 +467,7 @@ def test_step_owners_records_unresolved_and_skips_on_rerun(tmp_path, monkeypatch
 def test_step_owners_progress_logged_every_n(tmp_path, monkeypatch, caplog):
     db = tmp_path / "t.db"
     _seed_agents(db, ["1", "2", "3", "4"])
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
 
     with Store(db) as store:
         with caplog.at_level(logging.INFO, logger=cli.__name__):
@@ -478,14 +479,14 @@ def test_step_owners_progress_logged_every_n(tmp_path, monkeypatch, caplog):
     assert progress == ["fetch: agent owners resolved 2/4", "fetch: agent owners resolved 4/4"]
 
 
-def test_fetch_skip_owners_skips_owner_of(tmp_path, monkeypatch):
+def test_fetch_skip_owners_skips_owners_of(tmp_path, monkeypatch):
     db = tmp_path / "t.db"
     _seed(db, n=1)
     calls = []
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: calls.append(1))
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
@@ -493,6 +494,43 @@ def test_fetch_skip_owners_skips_owner_of(tmp_path, monkeypatch):
     assert r.exit_code == 0, r.output
     assert calls == []
     assert "agent owner resolution skipped" in r.output
+
+
+def test_fetch_owner_batch_controls_batch_call_count(tmp_path, monkeypatch):
+    # base.owners_of is deliberately NOT mocked here -- this exercises the real
+    # chunking/batching path end to end, through a fake RpcClient whose
+    # .batch() records how many calls it received and how big each was.
+    db = tmp_path / "t.db"
+    _seed_agents(db, [str(i) for i in range(5)])
+    created = []
+
+    class _BatchTrackingRpc:
+        def __init__(self, *a, **k):
+            self.batch_calls = 0
+            self.batch_sizes = []
+            created.append(self)
+
+        def batch(self, calls):
+            self.batch_calls += 1
+            self.batch_sizes.append(len(calls))
+            return ["0x" + "00" * 32 for _ in calls]  # zero address -> unresolved
+
+    monkeypatch.setattr(cli, "RpcClient", _BatchTrackingRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--owner-batch", "2"])
+    assert r.exit_code == 0, r.output
+    assert "agent owners resolved: 0/5" in r.output  # summary line format unchanged
+    assert created[0].batch_calls == 3  # ceil(5/2)
+    assert created[0].batch_sizes == [2, 2, 1]
+
+
+def test_fetch_rejects_non_positive_owner_batch(tmp_path):
+    r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--owner-batch", "0", "--dry-run"])
+    assert r.exit_code == 2
 
 
 # --- ValueError handling (Config / cluster_raters / validate_records) ---------
@@ -606,7 +644,7 @@ def test_fetch_closes_store_on_success(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
@@ -655,7 +693,7 @@ def test_fetch_eta_branch_prints_estimate(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
-    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
     class _FakeEtherscanClient:

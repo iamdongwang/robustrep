@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 from eth_abi import encode
 
@@ -413,3 +415,97 @@ def test_owner_of_other_rpcerror_propagates():
     rpc = FailingRpc({})
     with pytest.raises(RpcError):
         b.owner_of(rpc, "1")
+
+
+# --- owners_of: batched owner resolution ---------------------------------------
+
+def _owner_hex(addr: str) -> str:
+    """Encode a 20-byte ``0x``-address as a 32-byte-padded eth_call result hex string."""
+    return "0x" + "00" * 12 + addr[2:]
+
+
+class OwnerBatchRpc(FakeRpc):
+    """FakeRpc extended with an eth_call-aware batch()/call() for owners_of.
+
+    ``owners`` maps agent id -> owner address; an id absent from it (or mapped
+    to ``None``) resolves to the zero address. ``revert_agents`` names ids
+    whose ``eth_call`` reverts -- inside a batch, per RpcClient.batch's
+    contract, one reverting entry fails the *whole* batch call, not just that
+    entry. ``fail_batch`` makes every ``batch()`` call raise ``RpcError``
+    outright (mimicking an endpoint that doesn't support batching, or returns
+    a malformed response, e.g. a dict instead of a list).
+    """
+
+    def __init__(self, owners, revert_agents=(), fail_batch=False):
+        super().__init__({})
+        self.owners = owners
+        self.revert_agents = set(revert_agents)
+        self.fail_batch = fail_batch
+        self.batch_sizes = []
+
+    @staticmethod
+    def _agent_id_from_data(data: str) -> str:
+        return str(int(data[len(b._OWNER_OF_SELECTOR):], 16))
+
+    def _result_for(self, agent_id: str) -> str:
+        owner = self.owners.get(agent_id)
+        return _owner_hex(owner) if owner else "0x" + "00" * 32
+
+    def batch(self, calls):
+        self.batch_calls += 1
+        self.batch_sizes.append(len(calls))
+        if self.fail_batch:
+            raise RpcError("batch endpoint down")
+        results = []
+        for _method, params in calls:
+            agent_id = self._agent_id_from_data(params[0]["data"])
+            if agent_id in self.revert_agents:
+                raise RpcError(f"execution reverted for agent {agent_id}")
+            results.append(self._result_for(agent_id))
+        return results
+
+    def call(self, method, params):
+        if method == "eth_call":
+            self.calls.append((method, params))
+            agent_id = self._agent_id_from_data(params[0]["data"])
+            if agent_id in self.revert_agents:
+                raise RpcError("execution reverted: nonexistent token")
+            return self._result_for(agent_id)
+        return super().call(method, params)
+
+
+def test_owners_of_decodes_owner_and_zero_address_from_one_batch():
+    rpc = OwnerBatchRpc({"1": "0x" + "11" * 20, "2": None})
+    out = b.owners_of(rpc, ["1", "2"])
+    assert out == {"1": "0x" + "11" * 20, "2": None}
+    assert rpc.batch_calls == 1
+
+
+def test_owners_of_reverting_entry_falls_back_to_per_agent(caplog):
+    rpc = OwnerBatchRpc({"1": "0x" + "11" * 20, "3": None}, revert_agents={"2"})
+    with caplog.at_level(logging.WARNING, logger=b.__name__):
+        out = b.owners_of(rpc, ["1", "2", "3"])
+    assert out == {"1": "0x" + "11" * 20, "2": None, "3": None}  # revert -> None via owner_of fallback
+    assert rpc.batch_calls == 1  # one failed batch attempt covering the whole chunk
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1  # logged once, not once per fallen-back agent
+    assert len([c for c in rpc.calls if c[0] == "eth_call"]) == 3  # fallback queried every agent in the chunk
+
+
+def test_owners_of_batch_rpcerror_falls_back_and_returns_full_dict(caplog):
+    rpc = OwnerBatchRpc({"1": "0x" + "11" * 20, "2": "0x" + "22" * 20}, fail_batch=True)
+    with caplog.at_level(logging.WARNING, logger=b.__name__):
+        out = b.owners_of(rpc, ["1", "2"])
+    assert out == {"1": "0x" + "11" * 20, "2": "0x" + "22" * 20}
+    assert rpc.batch_calls == 1
+    assert len([c for c in rpc.calls if c[0] == "eth_call"]) == 2
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_owners_of_chunks_250_ids_into_3_batches():
+    owners = {str(i): "0x" + f"{i % 100:02x}" * 20 for i in range(250)}
+    rpc = OwnerBatchRpc(owners)
+    out = b.owners_of(rpc, [str(i) for i in range(250)])
+    assert len(out) == 250
+    assert rpc.batch_calls == 3
+    assert rpc.batch_sizes == [100, 100, 50]

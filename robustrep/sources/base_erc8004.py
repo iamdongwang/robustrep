@@ -243,6 +243,23 @@ def fill_block_timestamps(store: Store, rpc, batch_size: int = 100) -> int:
     return len(missing)
 
 
+def _owner_call_data(agent_id: str) -> str:
+    """``eth_call`` calldata for ``ownerOf(uint256 agent_id)`` on the
+    IdentityRegistry -- the 4-byte selector plus the id left-padded to 32 bytes."""
+    return _OWNER_OF_SELECTOR + int(agent_id).to_bytes(32, "big").hex()
+
+
+def _decode_owner_result(out) -> Optional[str]:
+    """Decode one ``eth_call`` result for ``ownerOf`` into a lowercase
+    ``0x``-prefixed address, or ``None`` if it's empty or the zero address
+    (agent burned/never minted). Shared by ``owner_of`` and ``owners_of`` so
+    both apply exactly the same decoding rules."""
+    if out in (None, "0x"):
+        return None
+    addr = "0x" + out[-40:].lower()
+    return None if addr == ZERO_ADDRESS else addr
+
+
 def owner_of(rpc, agent_id: str) -> Optional[str]:
     """Resolve the IdentityRegistry owner address of ``agent_id`` via ``eth_call``.
 
@@ -253,7 +270,7 @@ def owner_of(rpc, agent_id: str) -> Optional[str]:
     implementations; logged at DEBUG). Any other ``RpcError`` (network failure,
     rate limit, ...) propagates rather than being mistaken for "no owner".
     """
-    data = _OWNER_OF_SELECTOR + int(agent_id).to_bytes(32, "big").hex()
+    data = _owner_call_data(agent_id)
     try:
         out = rpc.call("eth_call", [{"to": IDENTITY_REGISTRY, "data": data}, "latest"])
     except RpcError as e:
@@ -261,10 +278,41 @@ def owner_of(rpc, agent_id: str) -> Optional[str]:
             logger.debug("owner_of: agent %s eth_call reverted (likely nonexistent): %s", agent_id, e)
             return None
         raise
-    if out in (None, "0x"):
-        return None
-    addr = "0x" + out[-40:].lower()
-    return None if addr == ZERO_ADDRESS else addr
+    return _decode_owner_result(out)
+
+
+def owners_of(rpc, agent_ids: list[str], batch_size: int = 100) -> dict[str, Optional[str]]:
+    """Resolve the IdentityRegistry owner address of every id in ``agent_ids``,
+    via JSON-RPC batches of ``batch_size`` ``eth_call``s instead of one request
+    per agent (``owner_of`` does ~104ms/call; batching cuts a ~48-minute walk of
+    28k agents down dramatically).
+
+    Each chunk is decoded with the same rules as ``owner_of`` (see
+    ``_decode_owner_result``): empty result or the zero address map to ``None``.
+    If a chunk's ``rpc.batch`` call raises ``RpcError`` -- e.g. the endpoint
+    doesn't support batching, rejects an oversized batch, returns a malformed
+    response (some public endpoints return a dict instead of a list for a
+    100-call batch), or one call in the chunk reverts (which fails the whole
+    batch, not just that entry) -- that chunk is retried one agent at a time via
+    ``owner_of`` (which already maps a revert to ``None``), logged once at
+    WARNING. Returns a dict covering every id in ``agent_ids``, regardless of
+    which chunks needed the fallback.
+    """
+    result: dict[str, Optional[str]] = {}
+    for i in range(0, len(agent_ids), batch_size):
+        chunk = agent_ids[i:i + batch_size]
+        calls = [("eth_call", [{"to": IDENTITY_REGISTRY, "data": _owner_call_data(a)}, "latest"]) for a in chunk]
+        try:
+            outs = rpc.batch(calls)
+        except RpcError as e:
+            logger.warning("owners_of: batch fetch failed for %d agent(s) (%s), "
+                            "falling back to per-agent calls", len(chunk), e)
+            for a in chunk:
+                result[a] = owner_of(rpc, a)
+            continue
+        for a, out in zip(chunk, outs):
+            result[a] = _decode_owner_result(out)
+    return result
 
 
 def tx_parties(rpc, tx_hash: str) -> Optional[set]:

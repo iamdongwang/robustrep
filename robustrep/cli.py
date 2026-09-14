@@ -49,6 +49,10 @@ logger = logging.getLogger(__name__)
 # Agent-owner resolution progress is logged (INFO) every this many agents.
 OWNER_LOG_EVERY = 500
 
+# Default number of agents resolved per JSON-RPC batch in _step_owners (see
+# --owner-batch).
+OWNER_BATCH_DEFAULT = 100
+
 
 @app.callback()
 def main(verbose: bool = typer.Option(False, "--verbose", help="Enable DEBUG-level logging.")) -> None:
@@ -123,24 +127,32 @@ def _step_timestamps(store: Store, rpc: RpcClient) -> str:
     return f"block timestamps filled: {n}"
 
 
-def _step_owners(store: Store, rpc: RpcClient, log_every: int = OWNER_LOG_EVERY) -> str:
+def _step_owners(store: Store, rpc: RpcClient, log_every: int = OWNER_LOG_EVERY,
+                  batch_size: int = OWNER_BATCH_DEFAULT) -> str:
     """Resolve the IdentityRegistry owner for every not-yet-resolved agent id.
 
-    Every agent id is recorded, even when no owner resolves -- as an empty
-    string (``Store.upsert_agent_owner`` accepts one; the evidence
+    Owners are resolved ``batch_size`` at a time via ``base.owners_of`` (one
+    JSON-RPC batch call per chunk instead of one ``eth_call`` per agent --
+    ``owners_of`` itself falls back to per-agent calls if a chunk's batch
+    fails). Every agent id is recorded, even when no owner resolves -- as an
+    empty string (``Store.upsert_agent_owner`` accepts one; the evidence
     classification join already filters falsy owners out of its parties set)
-    -- so an unresolved agent is never re-queried by ``owner_of`` on a later
-    run. Logs progress at INFO every ``log_every`` agents.
+    -- so an unresolved agent is never re-queried on a later run. Logs
+    progress at INFO every ``log_every`` agents (not every chunk).
     """
     agents = store.distinct_agents()
     resolved = 0
-    for i, agent_id in enumerate(agents, start=1):
-        owner = base.owner_of(rpc, agent_id)
-        store.upsert_agent_owner(agent_id, owner or "")
-        if owner:
-            resolved += 1
-        if log_every > 0 and i % log_every == 0:
-            logger.info("fetch: agent owners resolved %d/%d", i, len(agents))
+    for i in range(0, len(agents), batch_size):
+        chunk = agents[i:i + batch_size]
+        owners = base.owners_of(rpc, chunk, batch_size=batch_size)
+        for j, agent_id in enumerate(chunk):
+            owner = owners.get(agent_id)
+            store.upsert_agent_owner(agent_id, owner or "")
+            if owner:
+                resolved += 1
+            n_done = i + j + 1
+            if log_every > 0 and n_done % log_every == 0:
+                logger.info("fetch: agent owners resolved %d/%d", n_done, len(agents))
     return f"agent owners resolved: {resolved}/{len(agents)}"
 
 
@@ -188,6 +200,9 @@ def fetch(
         help="Etherscan API key. Prefer the ETHERSCAN_API_KEY environment variable instead: "
              "a command-line argument is visible to other local users (e.g. via `ps`)."),
     skip_owners: bool = typer.Option(False, "--skip-owners", help="Skip agent owner resolution."),
+    owner_batch: int = typer.Option(
+        OWNER_BATCH_DEFAULT, "--owner-batch", min=1,
+        help="Agents resolved per JSON-RPC batch call for owner resolution (1 = one call per agent)."),
     skip_raters: bool = typer.Option(False, "--skip-raters", help="Skip rater profile enrichment."),
     skip_evidence: bool = typer.Option(False, "--skip-evidence", help="Skip evidence URI classification."),
     dry_run: bool = typer.Option(
@@ -231,7 +246,7 @@ def fetch(
             if skip_owners:
                 typer.echo("agent owner resolution skipped")
             else:
-                typer.echo(_step_owners(store, rpc))
+                typer.echo(_step_owners(store, rpc, batch_size=owner_batch))
 
         if skip_raters:
             mode = store.get_sync("rater_profile_mode") or "unknown"
