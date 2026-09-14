@@ -1,3 +1,5 @@
+import logging
+import sqlite3
 import time
 
 import numpy as np
@@ -157,3 +159,128 @@ def test_load_records_dtypes(tmp_path):
     assert str(df["ts"].dtype).startswith("int")
     assert str(df["value"].dtype) == "float64"
     assert df["scale"].dtype == object and isinstance(df["scale"].iloc[0], str)
+
+
+# --- fixes: order-independent revocations, NULL-safe distinct, atomic pop, conflict visibility ---
+
+def test_revocation_before_insert_survives(tmp_path):
+    """A FeedbackRevoked event replayed (e.g. from a retried failed range) before its
+    FeedbackGiven row exists must not be lost when the feedback row is later inserted."""
+    s = Store(tmp_path / "t.db")
+    s.mark_revoked("7", "0xc", 1, block=99, tx_hash="0xrev")
+    s.upsert_feedback([FB])
+    assert s.load_records()["revoked"].iloc[0] == 1
+
+
+def test_revocation_after_insert_still_works(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([FB])
+    s.mark_revoked("7", "0xc", 1)
+    assert s.load_records()["revoked"].iloc[0] == 1
+
+
+def test_mark_revoked_idempotent(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.mark_revoked("7", "0xc", 1)
+    s.mark_revoked("7", "0xc", 1)
+    n = s.conn.execute("SELECT COUNT(*) FROM revocations").fetchone()[0]
+    assert n == 1
+
+
+@pytest.mark.parametrize("table,columns,values", [
+    ("evidence_cache", "uri,level,note", (None, 1, "")),
+    ("raters", "address,first_seen_ts,funder", (None, 1, "f")),
+    ("agents", "agent_id,owner", (None, "0xo")),
+    ("blocks", "number,ts", (None, 1)),
+])
+def test_null_primary_key_rejected(tmp_path, table, columns, values):
+    s = Store(tmp_path / "t.db")
+    placeholders = ",".join("?" * len(values))
+    with pytest.raises(sqlite3.IntegrityError):
+        s.conn.execute(f"INSERT INTO {table}({columns}) VALUES({placeholders})", values)
+
+
+def test_upsert_evidence_rejects_none_uri(tmp_path):
+    s = Store(tmp_path / "t.db")
+    with pytest.raises(ValueError, match="evidence_cache"):
+        s.upsert_evidence(None, 1)
+
+
+def test_upsert_rater_rejects_none_address(tmp_path):
+    s = Store(tmp_path / "t.db")
+    with pytest.raises(ValueError, match="raters"):
+        s.upsert_rater(None, first_seen_ts=1, funder="f")
+
+
+def test_upsert_agent_owner_rejects_none_agent_id(tmp_path):
+    s = Store(tmp_path / "t.db")
+    with pytest.raises(ValueError, match="agents"):
+        s.upsert_agent_owner(None, "0xo")
+
+
+def test_upsert_block_ts_rejects_none_number(tmp_path):
+    s = Store(tmp_path / "t.db")
+    with pytest.raises(ValueError, match="blocks"):
+        s.upsert_block_ts([(None, 1)])
+
+
+def test_pop_failed_ranges_atomic(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.add_failed_range(1, 100, "boom")
+    assert s.pop_failed_ranges() == [(1, 100)]
+    # a range added after the pop must not be lost or duplicated on the next pop
+    s.add_failed_range(200, 300, "again")
+    assert s.pop_failed_ranges() == [(200, 300)]
+    assert s.pop_failed_ranges() == []
+
+
+def test_upsert_feedback_returns_counts(tmp_path):
+    s = Store(tmp_path / "t.db")
+    counts = s.upsert_feedback([FB, {**FB, "feedback_index": 2}])
+    assert counts == (2, 0)
+    counts = s.upsert_feedback([FB, {**FB, "feedback_index": 2}])
+    assert counts == (0, 2)
+
+
+def test_upsert_feedback_logs_on_ignored(tmp_path, caplog):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([FB])
+    with caplog.at_level(logging.INFO, logger="robustrep.store"):
+        s.upsert_feedback([FB])
+    assert any("ignored" in r.message.lower() for r in caplog.records)
+
+
+def test_evidence_level_lookup(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_evidence("https://e", 2)
+    assert s.evidence_level("https://e") == 2
+    assert s.evidence_level("https://unknown") is None
+
+
+def test_add_response_rejects_missing_column(tmp_path):
+    s = Store(tmp_path / "t.db")
+    resp = dict(agent_id="7", client="0xc", feedback_index=1, responder="0xr",
+                response_uri="https://r", response_hash="0xrh", block=101, tx_hash="0xrt", log_index=0)
+    bad = {k: v for k, v in resp.items() if k != "responder"}
+    with pytest.raises(ValueError, match="responder"):
+        s.add_response(bad)
+
+
+def test_responses_index_exists(tmp_path):
+    s = Store(tmp_path / "t.db")
+    names = [r[0] for r in s.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='responses'").fetchall()]
+    assert len(names) >= 1
+
+
+def test_store_creates_parent_directories(tmp_path):
+    nested = tmp_path / "a" / "b" / "c.db"
+    s = Store(nested)
+    s.upsert_feedback([FB])
+    assert nested.exists()
+
+
+def test_store_in_memory_still_works():
+    s = Store(":memory:")
+    s.upsert_feedback([FB])
+    assert len(s.load_records()) == 1
