@@ -1,4 +1,6 @@
-"""Tunable parameters. All defaults are the ones reported in the paper's sensitivity analysis."""
+"""Tunable parameters. Defaults are provisional until the sensitivity analysis in the report confirms them."""
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
@@ -9,7 +11,7 @@ class Config:
     # sybil clustering
     sybil_window_s: int = 24 * 3600
     sybil_jaccard: float = 0.8
-    sybil_max_block: int = 2000  # skip ratees with more raters than this when generating pairs
+    sybil_max_group: int = 2000  # max raters per ratee considered when generating candidate sybil pairs
     sybil_flag_share: float = 0.5
     # aggregation
     min_clusters: int = 3
@@ -20,3 +22,13 @@ class Config:
     rpc_urls: tuple[str, ...] = ("https://mainnet.base.org",)
     chunk_blocks: int = 2000
     user_agent: str = "robustrep/0.1 (+https://github.com/iamdongwang/robustrep)"
+
+    def __post_init__(self) -> None:
+        if len(self.evidence_weights) != 4:
+            raise ValueError("evidence_weights must have exactly 4 entries")
+        if not 0 < self.ci_level < 1:
+            raise ValueError("ci_level must be in (0, 1)")
+        if self.bootstrap_n < 0:
+            raise ValueError("bootstrap_n must be >= 0")
+        if self.min_clusters < 1:
+            raise ValueError("min_clusters must be >= 1")

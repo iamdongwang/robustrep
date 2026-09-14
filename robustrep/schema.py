@@ -1,6 +1,7 @@
 """Column definitions and validation for the unified record table."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 RECORD_COLUMNS = ["rater", "ratee", "value", "scale", "tag", "ts", "evidence_uri", "source"]
@@ -10,8 +11,14 @@ RESULT_COLUMNS = [
     "zero_evidence_ratio", "sybil_flag", "naive_mean", "insufficient",
 ]
 
+REQUIRED_NON_NULL = ["rater", "ratee", "value", "ts"]
+VALID_LEVELS = {0, 1, 2, 3}
+VALID_REVOKED = {0, 1}
+
 
 def make_scale(decimals: int) -> str:
+    if not isinstance(decimals, (int, np.integer)) or isinstance(decimals, bool) or decimals < 0:
+        raise ValueError(f"decimals must be a non-negative integer, got {decimals!r}")
     return f"d{int(decimals)}"
 
 
@@ -21,20 +28,52 @@ def scale_decimals(scale: str) -> int:
     return int(scale[1:])
 
 
+def _coerce_numeric(out: pd.DataFrame, col: str, dtype: str) -> None:
+    try:
+        out[col] = pd.to_numeric(out[col], errors="raise")
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"column {col!r}: {e}") from e
+    if not np.isfinite(out[col].to_numpy(dtype=float)).all():
+        bad = out.index[~np.isfinite(out[col].to_numpy(dtype=float))].tolist()[:5]
+        raise ValueError(f"column {col!r}: non-finite values at rows {bad}")
+    out[col] = out[col].astype(dtype)
+
+
+def _check_domain(out: pd.DataFrame, col: str, allowed: set) -> None:
+    vals = out[col].to_numpy(dtype=float)
+    if not np.array_equal(vals, np.floor(vals)):
+        raise ValueError(f"column {col!r}: non-integer values")
+    bad = sorted(set(vals.astype(int)) - allowed)
+    if bad:
+        raise ValueError(f"column {col!r}: values {bad} not in {sorted(allowed)}")
+    out[col] = out[col].astype(int)
+
+
 def validate_records(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with required columns checked and optional columns filled."""
+    """Boundary check + coercion. Returns a new frame; the input is never modified."""
+    if df.columns.duplicated().any():
+        raise ValueError(f"duplicated columns: {df.columns[df.columns.duplicated()].tolist()}")
     missing = [c for c in RECORD_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"missing columns: {missing}")
     out = df.copy()
+    for col in REQUIRED_NON_NULL:
+        if out[col].isna().any():
+            rows = out.index[out[col].isna()].tolist()[:5]
+            raise ValueError(f"column {col!r}: null values at rows {rows}")
     for col, default in OPTIONAL_DEFAULTS.items():
         if col not in out.columns:
             out[col] = default
-    out["cluster"] = out["cluster"].where(out["cluster"].notna(), out["rater"])
-    out["evidence_level"] = out["evidence_level"].fillna(0).astype(int)
-    out["revoked"] = out["revoked"].fillna(0).astype(int)
-    out["value"] = pd.to_numeric(out["value"], errors="raise").astype(float)
     out["rater"] = out["rater"].astype(str)
     out["ratee"] = out["ratee"].astype(str)
     out["tag"] = out["tag"].fillna("").astype(str)
+    out["scale"] = out["scale"].astype(str)
+    out["source"] = out["source"].astype(str)
+    _coerce_numeric(out, "value", "float")
+    _coerce_numeric(out, "ts", "int64")
+    out["evidence_level"] = out["evidence_level"].fillna(0)
+    out["revoked"] = out["revoked"].fillna(0)
+    _check_domain(out, "evidence_level", VALID_LEVELS)
+    _check_domain(out, "revoked", VALID_REVOKED)
+    out["cluster"] = out["cluster"].where(out["cluster"].notna(), out["rater"]).astype(str)
     return out.reset_index(drop=True)
