@@ -1,7 +1,9 @@
 import numpy as np
 import pytest
 
-from robustrep.aggregate import Aggregator, WeightedMedian, weighted_median
+from robustrep.aggregate import (
+    Aggregator, WeightedMedian, _bootstrap_ci, bootstrap_ci_sorted, weighted_median,
+)
 from robustrep.config import Config
 
 
@@ -179,3 +181,53 @@ def test_from_config():
     assert agg.n_boot == 5
     assert agg.seed == 3
     assert agg.ci_level == 0.9
+
+
+def test_bootstrap_ci_sorted_matches_loop(rng):
+    # Random 6-vote input. The multinomial-vectorized path and the
+    # per-resample loop draw from different RNG streams so their raw
+    # quantiles need not match exactly, but with n_boot=2000 both should:
+    # (a) bracket the point estimate (widened the same way the pipeline
+    # widens its CIs, since neither raw bootstrap function guarantees
+    # containment on its own), (b) stay within the observed [min, max] of
+    # values, and (c) land close to each other.
+    vals = rng.uniform(0, 1, size=6)
+    weights = rng.uniform(0.1, 1.0, size=6)
+    point = weighted_median(vals, weights)
+
+    lo_loop, hi_loop = _bootstrap_ci(vals, weights, 2000, seed=1, ci_level=0.95)
+    lo_loop, hi_loop = min(lo_loop, point), max(hi_loop, point)
+
+    lo_vec, hi_vec = bootstrap_ci_sorted(vals, weights, 2000, np.random.default_rng(2), 0.95)
+    lo_vec, hi_vec = min(lo_vec, point), max(hi_vec, point)
+
+    assert lo_loop <= point <= hi_loop
+    assert lo_vec <= point <= hi_vec
+    assert vals.min() <= lo_loop <= hi_loop <= vals.max()
+    assert vals.min() <= lo_vec <= hi_vec <= vals.max()
+    assert abs(lo_loop - lo_vec) < 0.15
+    assert abs(hi_loop - hi_vec) < 0.15
+
+
+def test_bootstrap_ci_sorted_is_deterministic_given_same_rng_state():
+    vals = np.array([0.1, 0.4, 0.6, 0.9])
+    weights = np.ones(4)
+    r1 = bootstrap_ci_sorted(vals, weights, 500, np.random.default_rng(7), 0.95)
+    r2 = bootstrap_ci_sorted(vals, weights, 500, np.random.default_rng(7), 0.95)
+    assert r1 == r2
+
+
+def test_bootstrap_ci_sorted_degenerate_raises():
+    # Same reasoning as test_bootstrap_degenerate_raises: n=2, one weight is
+    # zero, n_boot=2 needs >= 2 valid resamples so a single all-zero
+    # resample already triggers the guard.
+    vals = np.array([0.5, 0.9])
+    weights = np.array([0.0, 1.0])
+    raised = False
+    for seed in range(200):
+        try:
+            bootstrap_ci_sorted(vals, weights, 2, np.random.default_rng(seed), 0.95)
+        except ValueError:
+            raised = True
+            break
+    assert raised is True

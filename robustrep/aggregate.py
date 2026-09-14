@@ -72,6 +72,60 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     return _weighted_median_sorted(v, w)
 
 
+def bootstrap_ci_sorted(
+    values: np.ndarray,
+    weights: np.ndarray,
+    n_boot: int,
+    rng: np.random.Generator,
+    ci_level: float,
+) -> tuple[float, float]:
+    """Vectorized bootstrap (lo, hi) quantiles of the weighted median.
+
+    Equivalent to resampling n `(value, weight)` pairs with replacement
+    `n_boot` times and taking the weighted median of each resample, but
+    without a Python-level loop over resamples. A resample's weighted
+    median depends only on how many times each *position* was drawn (its
+    resample count), not on the order of the draws, so after sorting
+    `values` once (stable), `rng.multinomial(n, [1/n]*n, size=n_boot)`
+    produces every resample's per-position counts in a single call --
+    equivalent to drawing n indices with replacement n_boot times -- and
+    the cumulative sum of `counts * sorted_weights` along each row gives
+    every resample's weighted median in one vectorized pass. This is what
+    keeps the per-ratee bootstrap affordable at ~28k ratees.
+
+    Same degenerate-resample handling as before: a resample whose weights
+    sum to zero has an undefined weighted median and is skipped rather than
+    counted. If fewer than `max(2, n_boot // 10)` resamples remain valid,
+    raises ValueError instead of silently reporting a CI built from too few
+    (or zero) samples. Skipping all-zero resamples conditions the CI on
+    non-zero weight; unreachable in-pipeline since Config forbids zero
+    weights.
+    """
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    n = len(values)
+    order = np.argsort(values, kind="stable")
+    v_sorted, w_sorted = values[order], weights[order]
+
+    counts = rng.multinomial(n, np.full(n, 1.0 / n), size=n_boot)
+    cum = np.cumsum(counts * w_sorted, axis=1)
+    totals = cum[:, -1]
+    valid = totals > 0
+
+    min_valid = max(2, int(n_boot * MIN_VALID_BOOT_FRACTION))
+    if int(valid.sum()) < min_valid:
+        raise ValueError("bootstrap degenerate: too many zero-weight resamples")
+
+    cum_valid = cum[valid]
+    half = 0.5 * cum_valid[:, -1:]
+    idx = (cum_valid >= half * (1 - _TIE_EPS)).argmax(axis=1)
+    boots = v_sorted[idx]
+
+    alpha = (1 - ci_level) / 2
+    lo, hi = np.quantile(boots, [alpha, 1 - alpha])
+    return float(lo), float(hi)
+
+
 def _bootstrap_ci(
     values: np.ndarray,
     weights: np.ndarray,
@@ -79,34 +133,12 @@ def _bootstrap_ci(
     seed: int,
     ci_level: float,
 ) -> tuple[float, float]:
-    """Bootstrap (lo, hi) quantiles of the weighted median.
-
-    Resamples (value, weight) pairs with replacement `n_boot` times. A
-    resample whose weights sum to zero has an undefined weighted median and
-    is skipped rather than counted. If fewer than `max(2, n_boot // 10)`
-    resamples remain valid, raises ValueError instead of silently reporting
-    a CI built from too few (or zero) samples. Skipping all-zero resamples
-    conditions the CI on non-zero weight; unreachable in-pipeline since
-    Config forbids zero weights.
+    """Bootstrap (lo, hi) quantiles of the weighted median, seeded by a plain
+    integer `seed`. Thin wrapper around `bootstrap_ci_sorted` (the one
+    bootstrap implementation) for callers that don't manage their own
+    `numpy.random.Generator`.
     """
-    n = len(values)
-    rng = np.random.default_rng(seed)
-    idx = rng.integers(0, n, size=(n_boot, n))
-    boots = []
-    for row in idx:
-        vi, wi = values[row], weights[row]
-        if wi.sum() <= 0:
-            continue
-        order = np.argsort(vi, kind="stable")
-        boots.append(_weighted_median_sorted(vi[order], wi[order]))
-
-    min_valid = max(2, int(n_boot * MIN_VALID_BOOT_FRACTION))
-    if len(boots) < min_valid:
-        raise ValueError("bootstrap degenerate: too many zero-weight resamples")
-
-    alpha = (1 - ci_level) / 2
-    lo, hi = np.quantile(np.array(boots), [alpha, 1 - alpha])
-    return float(lo), float(hi)
+    return bootstrap_ci_sorted(values, weights, n_boot, np.random.default_rng(seed), ci_level)
 
 
 class Aggregator(ABC):

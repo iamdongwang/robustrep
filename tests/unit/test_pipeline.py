@@ -3,6 +3,7 @@ import time
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from robustrep import Config, score
 from robustrep.schema import RECORD_COLUMNS, RESULT_COLUMNS
@@ -50,11 +51,36 @@ def test_zero_evidence_ratio_and_naive_mean(records_factory):
 
 
 def test_tags_combined_by_cluster_weighted_median(records_factory):
-    # tag q: 3 clusters at 0.9; tag u: 3 clusters at 0.1 -> weighted median of {0.9 w3, 0.1 w3} = 0.1 (lower median)
+    # tag q: 3 clusters at 0.9; tag u: 3 clusters at 0.1, all at the default
+    # evidence_level=0 so every vote carries the same weight -> equal-mass
+    # tags {0.9 mass=0.3, 0.1 mass=0.3} -> weighted median = 0.1 (lower
+    # median: two equal-mass tags resolve to the lower value by convention).
     rows = [dict(rater=f"q{i}", ratee="A", value=90, tag="q") for i in range(3)]
     rows += [dict(rater=f"u{i}", ratee="A", value=10, tag="u") for i in range(3)]
     row = score(records_factory(rows), _cfg()).set_index("ratee").loc["A"]
     assert row["robust_score"] == 0.1 and row["n_clusters"] == 6
+
+
+def test_fresh_evidence_free_tag_cannot_sink_score(records_factory):
+    # An attacker files a burst of evidence-free (level 0, weight 0.1) votes
+    # under a brand-new tag to try to drag the total down. tag B carries the
+    # real, well-evidenced signal (level 3, weight 1.0 each -> mass 3.0);
+    # tag A is the attack (4 votes * weight 0.1 -> mass 0.4). Cross-tag
+    # weighting by summed evidence weight means A's mass can't outvote B's.
+    rows = [dict(rater=f"b{i}", ratee="A", value=90, tag="B", evidence_level=3) for i in range(3)]
+    rows += [dict(rater=f"a{i}", ratee="A", value=0, tag="A", evidence_level=0) for i in range(4)]
+    row = score(records_factory(rows), _cfg()).set_index("ratee").loc["A"]
+    assert row["robust_score"] == 0.9
+
+
+def test_tag_dominance_by_evidence_mass(records_factory):
+    # tag A: 5 votes at 0.2, evidence_level=0 -> mass 5*0.1=0.5.
+    # tag B: 3 votes at 0.9, evidence_level=3 -> mass 3*1.0=3.0.
+    # B's evidence mass dominates even though A has more raw votes.
+    rows = [dict(rater=f"a{i}", ratee="A", value=20, tag="A", evidence_level=0) for i in range(5)]
+    rows += [dict(rater=f"b{i}", ratee="A", value=90, tag="B", evidence_level=3) for i in range(3)]
+    row = score(records_factory(rows), _cfg()).set_index("ratee").loc["A"]
+    assert row["robust_score"] == 0.9
 
 
 def test_empty_records_returns_empty_result_with_columns():
@@ -118,6 +144,52 @@ def test_result_dtypes(records_factory):
     assert pd.api.types.is_integer_dtype(out["sybil_flag"])
     assert pd.api.types.is_integer_dtype(out["insufficient"])
     assert pd.api.types.is_float_dtype(out["robust_score"])
+
+
+def test_ci_independent_of_other_ratees(records_factory):
+    m_rows = [dict(rater=f"m{i}", ratee="M", value=v) for i, v in enumerate([10, 40, 70, 95])]
+    solo = score(records_factory(m_rows), _cfg()).set_index("ratee").loc["M"]
+
+    combined_rows = m_rows + [dict(rater="a0", ratee="A", value=50)] + [dict(rater="z0", ratee="Z", value=50)]
+    combined = score(records_factory(combined_rows), _cfg()).set_index("ratee").loc["M"]
+
+    pd.testing.assert_series_equal(solo, combined)
+
+
+def test_custom_aggregator_not_implemented(records_factory):
+    df = records_factory([dict(rater=f"r{i}", ratee="A", value=80) for i in range(3)])
+    with pytest.raises(NotImplementedError):
+        score(df, _cfg(), aggregator=object())
+
+
+def test_single_and_multi_tag_paths_both_bracket_score(records_factory):
+    single_tag_rows = [dict(rater=f"c{i}", ratee="A", value=v) for i, v in enumerate([10, 30, 50, 70, 90])]
+    multi_tag_rows = [dict(rater=f"q{i}", ratee="B", value=90, tag="q") for i in range(3)]
+    multi_tag_rows += [dict(rater=f"u{i}", ratee="B", value=10, tag="u") for i in range(3)]
+    out = score(records_factory(single_tag_rows + multi_tag_rows), _cfg(bootstrap_n=200)).set_index("ratee")
+    for ratee in ("A", "B"):
+        row = out.loc[ratee]
+        assert row["ci_low"] <= row["robust_score"] <= row["ci_high"]
+
+
+def test_empty_result_has_explicit_dtypes():
+    out = score(pd.DataFrame(columns=RECORD_COLUMNS), _cfg())
+    assert pd.api.types.is_integer_dtype(out["n_clusters"])
+    assert pd.api.types.is_integer_dtype(out["n_raw"])
+    assert pd.api.types.is_integer_dtype(out["sybil_flag"])
+    assert pd.api.types.is_integer_dtype(out["insufficient"])
+    for col in ("robust_score", "ci_low", "ci_high", "zero_evidence_ratio", "naive_mean"):
+        assert pd.api.types.is_float_dtype(out[col])
+
+
+def test_cluster_dict_values_coerced_to_str(records_factory):
+    df = records_factory([dict(rater="r0", ratee="A", value=80), dict(rater="r1", ratee="A", value=80),
+                          dict(rater="r2", ratee="A", value=80)])
+    # r0's cluster is the int 7, r1's is the str "7": must collapse to one
+    # cluster rather than staying apart due to an int/str type mismatch.
+    clusters = {"r0": 7, "r1": "7", "r2": "other"}
+    out = score(df, _cfg(), clusters=clusters).set_index("ratee").loc["A"]
+    assert out["n_clusters"] == 2
 
 
 def test_performance_smoke(records_factory):

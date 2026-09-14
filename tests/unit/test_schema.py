@@ -172,3 +172,27 @@ def test_config_sybil_pair_and_jaccard_bounds():
         Config(sybil_jaccard=0)
     with pytest.raises(ValueError):
         Config(sybil_max_pairs=0)
+
+
+def test_config_rejects_invalid_timing_and_count_params():
+    from robustrep.config import Config
+
+    with pytest.raises(ValueError):
+        Config(bootstrap_n=-1)
+    with pytest.raises(ValueError):
+        Config(min_clusters=0)
+    with pytest.raises(ValueError):
+        Config(rpc_urls=())
+
+
+def test_config_rejects_invalid_window_share_and_chunk_params():
+    from robustrep.config import Config
+
+    with pytest.raises(ValueError):
+        Config(sybil_window_s=-1)
+    with pytest.raises(ValueError):
+        Config(chunk_blocks=0)
+    with pytest.raises(ValueError):
+        Config(sybil_flag_share=-0.1)
+    with pytest.raises(ValueError):
+        Config(sybil_flag_share=1.1)
