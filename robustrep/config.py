@@ -26,6 +26,8 @@ class Config:
     def __post_init__(self) -> None:
         if len(self.evidence_weights) != 4:
             raise ValueError("evidence_weights must have exactly 4 entries")
+        if any(w <= 0 for w in self.evidence_weights):
+            raise ValueError("evidence_weights must be > 0 (zero weights make bootstrap resamples degenerate)")
         if not 0 < self.ci_level < 1:
             raise ValueError("ci_level must be in (0, 1)")
         if self.bootstrap_n < 0:

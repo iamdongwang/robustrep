@@ -43,9 +43,11 @@ def test_weights_for_empty_series():
 
 
 def test_weights_use_config_values():
-    cfg = Config(evidence_weights=(0, 0.5, 0.5, 1))
+    # evidence_weights must be > 0 (see Config.__post_init__: zero weights
+    # make bootstrap resamples degenerate), so level 0 uses a small non-zero weight.
+    cfg = Config(evidence_weights=(0.05, 0.5, 0.5, 1))
     w = weights_for(pd.Series([0, 1, 2, 3]), cfg)
-    assert list(w) == [0.0, 0.5, 0.5, 1.0]
+    assert list(w) == [0.05, 0.5, 0.5, 1.0]
 
 
 def test_classify_case_insensitive_parties():

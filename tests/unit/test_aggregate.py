@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from robustrep.aggregate import Aggregator, WeightedMedian, weighted_median
+from robustrep.config import Config
 
 
 def test_weighted_median_equal_weights_is_median():
@@ -90,7 +91,8 @@ def test_bootstrap_is_deterministic(rng):
     r2 = a2.aggregate(vals, weights)
     r3 = a3.aggregate(vals, weights)
     assert r1 == r2
-    assert r1 != r3
+    # point estimate is independent of the bootstrap seed; only the CI may differ
+    assert r1[0] == r3[0]
 
 
 def test_aggregate_zero_boot_returns_point():
@@ -114,3 +116,57 @@ def test_aggregate_does_not_mutate_inputs():
     agg.aggregate(vals, weights)
     np.testing.assert_array_equal(vals, vals_copy)
     np.testing.assert_array_equal(weights, weights_copy)
+
+
+def test_scale_invariance():
+    # cumulative-sum drift must not make the result depend on the weight scale
+    rng = np.random.default_rng(0)
+    weight_choices = np.array([0.1, 0.3, 0.7, 1.0])
+    for _ in range(200):
+        n = rng.integers(2, 16)
+        v = rng.uniform(0, 1, size=n)
+        w = rng.choice(weight_choices, size=n)
+        assert weighted_median(v, w) == weighted_median(v, 0.3 * w)
+
+
+def test_exact_half_tie_returns_lower():
+    vals = np.array([0.14, 0.36, 0.58, 0.71, 0.79, 0.99])
+    weights = np.array([0.3] * 6)
+    assert weighted_median(vals, weights) == 0.58
+
+
+def test_zero_weight_extreme_never_returned():
+    assert weighted_median(np.array([0.0, 1.0]), np.array([0.0, 1.0])) == 1.0
+    assert weighted_median(np.array([0.0, 1.0]), np.array([1.0, 0.0])) == 0.0
+
+
+def test_bootstrap_with_some_zero_weights_does_not_crash():
+    vals = np.array([0.5, 0.9, 0.7, 0.6])
+    weights = np.array([0.0, 1.0, 1.0, 1.0])
+    agg = WeightedMedian(n_boot=200, seed=0)
+    score, lo, hi = agg.aggregate(vals, weights)
+    assert np.isfinite([score, lo, hi]).all()
+    assert lo <= score <= hi
+
+
+def test_bootstrap_degenerate_raises():
+    # n=2, weights=[0, 1]: only draws of {index1} keep any weight; with this
+    # seed and n_boot=4, fewer than max(2, n_boot // 10) = 2 resamples are valid.
+    vals = np.array([0.5, 0.9])
+    weights = np.array([0.0, 1.0])
+    agg = WeightedMedian(n_boot=4, seed=157)
+    with pytest.raises(ValueError, match="degenerate"):
+        agg.aggregate(vals, weights)
+
+
+def test_ndim_rejected():
+    with pytest.raises(ValueError, match="1-D"):
+        weighted_median(np.array([[0.1, 0.2], [0.3, 0.4]]), np.ones((2, 2)))
+
+
+def test_from_config():
+    cfg = Config(bootstrap_n=5, bootstrap_seed=3, ci_level=0.9)
+    agg = WeightedMedian.from_config(cfg)
+    assert agg.n_boot == 5
+    assert agg.seed == 3
+    assert agg.ci_level == 0.9

@@ -156,3 +156,10 @@ def test_config_more_checks():
         Config(bootstrap_n=-1)
     with pytest.raises(ValueError):
         Config(min_clusters=0)
+
+
+def test_config_rejects_zero_evidence_weight():
+    from robustrep.config import Config
+
+    with pytest.raises(ValueError):
+        Config(evidence_weights=(0, 0.3, 0.7, 1))
