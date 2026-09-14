@@ -349,12 +349,14 @@ def _write_report(target: Path, result, records, clusters, sens, adv, block: int
 
 
 def _publish_latest(out_dir: Path, block_dir: Path) -> None:
-    """Atomically publish a copy of `block_dir` as `out_dir/latest/`.
+    """Publish a copy of `block_dir` as `out_dir/latest/`.
 
-    Builds the new `latest/` contents in a temp directory first, then performs
-    the actual publish as a single `os.replace` -- atomic on POSIX. `os.replace`
-    can only atomically swap onto an EMPTY directory (or none at all), so any
-    previous `latest/` is removed immediately before that final replace: stale
+    Near-atomic: the old `latest/` is removed then the staged copy is moved in
+    -- a reader may briefly see no `latest/` at all, in the gap between the
+    removal and the move. Builds the new contents in a temp directory first, so
+    that gap is as short as a single `os.replace` (moving the fully-staged
+    directory into place, no partial writes ever visible) rather than however
+    long the figures/report.md/scores.json themselves take to generate; stale
     files from an earlier run never linger alongside the new ones.
     """
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -88,7 +88,7 @@ def fig_sensitivity(table: pd.DataFrame, out: Path) -> None:
         ax.set_ylim(-1.05, 1.05)
         ax.set_ylabel("Spearman rho (top-N vs base)")
         plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
-    ax.set_title("Fig 5. ranking stability")
+    ax.set_title("Fig 5. Ranking stability")
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)

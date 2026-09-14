@@ -17,6 +17,12 @@ _PAPER_CITATION = (
 _BREAKEVEN_ROWS = ("G_smear_breakeven", "G2_boost_breakeven", "H_evasive_breakeven")
 
 
+def _markdown_table(df: pd.DataFrame) -> str:
+    """Render `df` as a Markdown table with NaN cells shown as a blank string,
+    never the literal "nan" pandas/tabulate would otherwise print."""
+    return df.astype(object).where(df.notna(), "").to_markdown(index=False)
+
+
 def _flag_rate(scored: pd.DataFrame) -> tuple[int, float]:
     """Sybil-flag count/rate among `insufficient == 0` rows only -- a NaN'd,
     insufficient ratee was never even scored, so it has no meaningful flag."""
@@ -41,7 +47,9 @@ def _measured_boundaries_paragraph(adversarial: pd.DataFrame) -> Optional[str]:
     break-even rows (see `robustrep.report.adversarial`) -- every number here is
     read out of that table, never hand-typed into this string. Returns `None` if
     `adversarial` doesn't carry the expected rows (e.g. a caller passed a custom
-    table without them)."""
+    table without them). `break_even_k_boost` is part of that column guard too --
+    when it's missing, the H row's boost-direction k is reported as `None`
+    (rendered "n/a") rather than raising a KeyError."""
     if not {"scenario", "break_even_k"} <= set(adversarial.columns):
         return None
     t = adversarial.set_index("scenario")
@@ -50,16 +58,20 @@ def _measured_boundaries_paragraph(adversarial: pd.DataFrame) -> Optional[str]:
     g_smear_k = int(t.loc["G_smear_breakeven", "break_even_k"])
     g_boost_k = int(t.loc["G2_boost_breakeven", "break_even_k"])
     h_smear_k = int(t.loc["H_evasive_breakeven", "break_even_k"])
-    h_boost_k = int(t.loc["H_evasive_breakeven", "break_even_k_boost"])
+    if "break_even_k_boost" in t.columns and pd.notna(t.loc["H_evasive_breakeven", "break_even_k_boost"]):
+        h_boost_k = int(t.loc["H_evasive_breakeven", "break_even_k_boost"])
+    else:
+        h_boost_k = None
     zr = t.loc[list(_BREAKEVEN_ROWS), "zero_evidence_ratio"]
     sybil_flags_zero = bool((t.loc[list(_BREAKEVEN_ROWS), "sybil_flag"] == 0).all())
     return (
         f"**Measured boundaries.** Against 3 level-3 honest votes (mass 3.0), a smear "
         f"campaign flips the score at k={g_smear_k} evidence-free raters (the exact "
         f"tie), a boost needs {g_boost_k}. Against 5 level-2 honest votes (mass 3.5) "
-        f"under the evasive pattern, smear flips at {h_smear_k}, boost at {h_boost_k}; "
-        f"`sybil_flag` stays {'0' if sybil_flags_zero else 'non-zero'} throughout while "
-        f"`zero_evidence_ratio` is {zr.min():.2f}-{zr.max():.2f}."
+        f"under the evasive pattern, smear flips at {h_smear_k}, boost at "
+        f"{h_boost_k if h_boost_k is not None else 'n/a'}; `sybil_flag` stays "
+        f"{'0' if sybil_flags_zero else 'non-zero'} throughout while `zero_evidence_ratio` "
+        f"is {zr.min():.2f}-{zr.max():.2f}."
     )
 
 
@@ -110,14 +122,14 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
               "Pearson correlation of the two rank sequences (no scipy dependency). A blank "
               "cell means too few ratees overlapped with the base top-N to define a "
               "correlation at all.",
-              "", sensitivity.to_markdown(index=False), ""]
+              "", _markdown_table(sensitivity), ""]
 
     lines += ["## Adversarial evidence",
               "Known-answer attack scenarios (see `robustrep.report.adversarial.scenario_table`), "
               "each computed with **bootstrap_n=0**: point estimates only -- no confidence-interval "
               "claims are made from this table.", ""]
     if adversarial is not None:
-        lines += [adversarial.to_markdown(index=False), ""]
+        lines += [_markdown_table(adversarial), ""]
         boundaries = _measured_boundaries_paragraph(adversarial)
         if boundaries:
             lines += [boundaries, ""]

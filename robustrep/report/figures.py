@@ -102,7 +102,7 @@ def fig_evidence(records: pd.DataFrame, out: Path) -> None:
             _empty_note(ax, "no records")
         else:
             ax.pie(counts, labels=[f"level {i}" for i in counts.index], autopct="%1.1f%%")
-    ax.set_title("Fig 3. evidence levels of all ratings")
+    ax.set_title("Fig 3. Evidence levels of all ratings")
     _save(fig, out)
 
 
