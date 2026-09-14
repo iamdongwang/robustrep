@@ -56,15 +56,25 @@ def _validate(values: np.ndarray, weights: np.ndarray, name: str) -> tuple[np.nd
     return values, weights
 
 
+def _weighted_median_pos(cum: np.ndarray) -> int:
+    """Position in an ascending cumulative-weight array selected by the lower-weighted-
+    median convention: the first index at which cumulative weight reaches >= half the
+    total (`np.searchsorted(..., side="left")`), with the half-weight threshold nudged
+    down by `_TIE_EPS` to absorb float64 cumsum drift at exact ties. Shared by
+    `_weighted_median_sorted` and `weighted_median_index` so this tie-tolerance logic
+    lives in exactly one place. `cum` must be non-empty and non-decreasing (a cumsum).
+    """
+    half = 0.5 * cum[-1]
+    return int(np.searchsorted(cum, half * (1 - _TIE_EPS), side="left"))
+
+
 def _weighted_median_sorted(v: np.ndarray, w: np.ndarray) -> float:
     """Weighted median of already-sorted, already-validated inputs.
 
     Assumes `v` is sorted ascending and `w` is finite, non-negative, and sums
     to > 0. Not for external use (no validation) — see `weighted_median`.
     """
-    cum = np.cumsum(w)
-    half = 0.5 * cum[-1]
-    return float(v[np.searchsorted(cum, half * (1 - _TIE_EPS), side="left")])
+    return float(v[_weighted_median_pos(np.cumsum(w))])
 
 
 def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
@@ -101,9 +111,7 @@ def weighted_median_index(values: np.ndarray, weights: np.ndarray) -> int:
     values, weights = _validate(values, weights, "weighted_median_index")
     order = np.argsort(values, kind="stable")
     cum = np.cumsum(weights[order])
-    half = 0.5 * cum[-1]
-    pos = np.searchsorted(cum, half * (1 - _TIE_EPS), side="left")
-    return int(order[pos])
+    return int(order[_weighted_median_pos(cum)])
 
 
 def _bootstrap_draws(

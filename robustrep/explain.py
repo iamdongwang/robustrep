@@ -78,7 +78,11 @@ def explain(records: pd.DataFrame, ratee: str, cfg: Config = Config(),
     chosen, within its tag, by the per-tag weighted median, in the tag chosen, across
     tags, by the weighted median of per-tag scores (tag weight = summed vote weight;
     see `pipeline._total`). Exactly one (tag, cluster) vote is selected, so exactly the
-    records collapsed into that one vote are marked True; all others are False.
+    records collapsed into that one vote are marked True; all others are False. This
+    chain runs unconditionally on `ratee`'s votes -- for an `insufficient` ratee (fewer
+    than `cfg.min_clusters` distinct clusters), `score()` itself issues no score
+    (`robust_score` is NaN), but `is_median_vote` here still marks the vote the chain
+    *would* select if the ratee were scored.
 
     `records` must be the same frame you pass (or would pass) to `score()` --
     normalization is dataset-relative (`normalize()` groups by (tag, scale) across the
