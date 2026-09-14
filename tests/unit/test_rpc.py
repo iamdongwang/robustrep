@@ -79,3 +79,71 @@ def test_post_sends_user_agent_header():
     c = RpcClient(["http://a"], user_agent="my-ua/1.0", session=s, sleep=lambda _: None)
     c.call("m", [])
     assert s.headers[0]["user-agent"] == "my-ua/1.0"
+
+
+def test_batch_short_response_raises():
+    # 3 requested, only 2 returned
+    s = FakeSession([[{"id": 1, "result": "a"}, {"id": 2, "result": "b"}]] * 2)
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None, retries=2)
+    with pytest.raises(RpcError):
+        c.batch([("m", [1]), ("m", [2]), ("m", [3])])
+
+
+def test_batch_id_mismatch_raises():
+    s = FakeSession([[{"id": 1, "result": "a"}, {"id": 2, "result": "b"}, {"id": 4, "result": "c"}]] * 2)
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None, retries=2)
+    with pytest.raises(RpcError):
+        c.batch([("m", [1]), ("m", [2]), ("m", [3])])
+
+
+def test_batch_null_result_raises():
+    s = FakeSession([[{"id": 1, "result": "a"}, {"id": 2, "result": None}]] * 2)
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None, retries=2)
+    with pytest.raises(RpcError):
+        c.batch([("m", [1]), ("m", [2])])
+
+
+def test_batch_builds_result_by_id_not_position():
+    # server returns entries out of order and mixed with extra whitespace-ish id ordering
+    s = FakeSession([[{"id": 3, "result": "c"}, {"id": 1, "result": "a"}, {"id": 2, "result": "b"}]])
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None)
+    assert c.batch([("m", [1]), ("m", [2]), ("m", [3])]) == ["a", "b", "c"]
+
+
+def test_error_null_is_not_treated_as_error():
+    s = FakeSession([{"jsonrpc": "2.0", "id": 1, "result": "ok", "error": None}])
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None)
+    assert c.call("m", []) == "ok"
+
+
+def test_batch_error_null_is_not_treated_as_error():
+    s = FakeSession([[{"id": 1, "result": "a", "error": None}, {"id": 2, "result": "b", "error": None}]])
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None)
+    assert c.batch([("m", [1]), ("m", [2])]) == ["a", "b"]
+
+
+def test_no_sleep_after_final_failed_attempt():
+    s = FakeSession([{"error": {"message": "x"}}] * 3)
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=3)
+    with pytest.raises(RpcError):
+        c.call("m", [])
+    assert sleeps == [1, 2]
+
+
+def test_non_retryable_error_raises_immediately_without_rotation_or_sleep():
+    s = FakeSession([{"error": {"code": -32602, "message": "invalid params"}}])
+    sleeps = []
+    c = RpcClient(["http://a", "http://b"], user_agent="ua", session=s, sleep=sleeps.append, retries=5)
+    with pytest.raises(RpcError):
+        c.call("m", [])
+    assert len(s.calls) == 1
+    assert sleeps == []
+
+
+def test_non_retryable_error_by_message_substring():
+    s = FakeSession([{"error": {"message": "eth_getLogs is limited to a 2000 range"}}])
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None, retries=5)
+    with pytest.raises(RpcError):
+        c.call("m", [])
+    assert len(s.calls) == 1

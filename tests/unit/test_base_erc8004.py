@@ -1,7 +1,9 @@
 import pytest
 from eth_abi import encode
 
+from robustrep.config import Config
 from robustrep.sources import base_erc8004 as b
+from robustrep.sources.rpc import RpcError
 from robustrep.store import Store
 
 
@@ -100,10 +102,12 @@ def test_sync_chunks_and_checkpoints(tmp_path):
     log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=42)
     rpc = FakeRpc({(0, 1999): [log]}, head=3999)
     store = Store(tmp_path / "t.db")
-    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0)
+    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
     assert n == 1 and store.get_sync("last_block") == "3999"
     ranges = [(int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16)) for m, p in rpc.calls if m == "eth_getLogs"]
     assert ranges == [(0, 1999), (2000, 3999)]
+    first_getlogs_params = next(p for m, p in rpc.calls if m == "eth_getLogs")[0]
+    assert first_getlogs_params["topics"] == [[b.TOPIC_NEW_FEEDBACK, b.TOPIC_REVOKED, b.TOPIC_RESPONSE]]
     b.fill_block_timestamps(store, rpc)
     assert store.load_records()["ts"].iloc[0] == 1042
     assert b.owner_of(rpc, "3") == "0x" + "ee" * 20
@@ -113,7 +117,7 @@ def test_sync_chunks_and_checkpoints(tmp_path):
 def test_first_chunk_fails_last_block_still_advances(tmp_path):
     rpc = FakeRpc({}, head=3999, fail_ranges={(0, 1999)})
     store = Store(tmp_path / "t1.db")
-    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0)
+    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
     assert n == 0
     assert store.get_sync("last_block") == "3999"
     assert store.pop_failed_ranges() == [(0, 1999)]
@@ -127,14 +131,14 @@ def test_failed_range_retried_and_does_not_rewind_checkpoint(tmp_path):
 
     rpc = FakeRpc({}, head=3999, fail_ranges={(0, 1999)})
     store = Store(tmp_path / "t2.db")
-    n1 = b.sync_feedback(store, rpc, chunk=2000, start_block=0)
+    n1 = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
     assert n1 == 0
     assert store.get_sync("last_block") == "3999"
 
     # the failed range now succeeds and has a log to deliver
     rpc.fail_ranges.clear()
     rpc.logs_by_range[(0, 1999)] = [log0]
-    n2 = b.sync_feedback(store, rpc, chunk=2000, start_block=0)
+    n2 = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
     ranges_called = [(int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16))
                       for m, p in rpc.calls if m == "eth_getLogs"]
     assert (0, 1999) in ranges_called
@@ -147,7 +151,7 @@ def test_sync_feedback_no_op_when_checkpoint_at_head(tmp_path):
     rpc = FakeRpc({}, head=100)
     store = Store(tmp_path / "t3.db")
     store.set_sync("last_block", "100")
-    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0)
+    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
     assert n == 0
     assert not any(m == "eth_getLogs" for m, _ in rpc.calls)
 
@@ -192,3 +196,176 @@ def test_tx_parties_not_found_returns_none():
     rpc = FakeRpc({})
     rpc.call = lambda method, params: None
     assert b.tx_parties(rpc, "0xh") is None
+
+
+# --- confirmations lag -----------------------------------------------------------
+
+def test_sync_feedback_confirmations_lag_behind_head(tmp_path):
+    rpc = FakeRpc({}, head=10_019)
+    store = Store(tmp_path / "t_conf.db")
+    n = b.sync_feedback(store, rpc, chunk=20_000, start_block=0)  # default confirmations=20
+    assert n == 0
+    assert store.get_sync("last_block") == "9999"
+
+
+def test_config_confirmations_default_and_validation():
+    assert Config().confirmations == 20
+    with pytest.raises(ValueError):
+        Config(confirmations=-1)
+
+
+# --- crash safety of failed ranges ------------------------------------------------
+
+def test_sync_feedback_decode_failure_raises_and_records_range(tmp_path):
+    bad_log = {"topics": [b.TOPIC_NEW_FEEDBACK, "0x" + (1).to_bytes(32, "big").hex()], "data": "0x",
+               "blockNumber": hex(1500), "transactionHash": "0xbad", "logIndex": "0x0"}
+    rpc = FakeRpc({(0, 999): [], (1000, 1999): [bad_log]}, head=1999)
+    store = Store(tmp_path / "t_crash1.db")
+    with pytest.raises(ValueError):
+        b.sync_feedback(store, rpc, chunk=1000, start_block=0, confirmations=0)
+    assert store.get_sync("last_block") == "999"
+    assert store.pop_failed_ranges() == [(1000, 1999)]
+
+
+def test_sync_feedback_interrupt_during_fetch_requeues_remaining(tmp_path):
+    store = Store(tmp_path / "t_crash2.db")
+    store.add_failed_range(100, 199, "prior failure")
+    store.add_failed_range(200, 299, "prior failure")
+    store.add_failed_range(300, 399, "prior failure")
+    store.set_sync("last_block", "1000")
+
+    class InterruptingRpc(FakeRpc):
+        def call(self, method, params):
+            if method == "eth_getLogs":
+                f, t = int(params[0]["fromBlock"], 16), int(params[0]["toBlock"], 16)
+                self.calls.append((method, params))
+                if (f, t) == (200, 299):
+                    raise KeyboardInterrupt()
+                return []
+            return super().call(method, params)
+
+    rpc = InterruptingRpc({})
+    with pytest.raises(KeyboardInterrupt):
+        b.sync_feedback(store, rpc, chunk=100, start_block=0, end_block=1000, confirmations=0)
+    assert store.pop_failed_ranges() == [(200, 299), (300, 399)]
+
+
+def test_sync_feedback_applies_feedback_revoked_and_response(tmp_path):
+    fb_data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                      [1, 5, 0, "q", "", "", "", b"\x00" * 32])
+    agent = "0x" + (9).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+    fb_log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], fb_data, block=10, tx="0xfb", idx=0)
+
+    idx_topic = "0x" + (1).to_bytes(32, "big").hex()
+    rv_log = _log(b.TOPIC_REVOKED, [agent, client, idx_topic], b"", block=10, tx="0xrv", idx=1)
+
+    resp_data = encode(["uint64", "string", "bytes32"], [1, "https://r", b"\x03" * 32])
+    responder = "0x" + "00" * 12 + "cd" * 20
+    resp_log = _log(b.TOPIC_RESPONSE, [agent, client, responder], resp_data, block=10, tx="0xrp", idx=2)
+
+    rpc = FakeRpc({(0, 1999): [fb_log, rv_log, resp_log]}, head=1999)
+    store = Store(tmp_path / "t_combo.db")
+    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
+    assert n == 1
+    recs = store.load_records()
+    assert recs["revoked"].iloc[0] == 1
+    row = store.conn.execute("SELECT responder, response_uri FROM responses").fetchone()
+    assert row == ("0x" + "cd" * 20, "https://r")
+
+
+# --- decode_log: _hexint and topic-count validation --------------------------------
+
+def test_decode_log_accepts_int_block_and_log_index():
+    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+    agent = "0x" + (2).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+    log = {"topics": [b.TOPIC_NEW_FEEDBACK, agent, client, "0x" + "00" * 32], "data": "0x" + data.hex(),
+           "blockNumber": 555, "transactionHash": "0xt", "logIndex": 3}
+    out = b.decode_log(log)
+    assert out["block"] == 555 and out["log_index"] == 3
+
+
+def test_decode_log_short_topics_raises_valueerror():
+    agent = "0x" + (2).to_bytes(32, "big").hex()
+    log = _log(b.TOPIC_NEW_FEEDBACK, [agent], b"")  # missing client + tag1 topics
+    with pytest.raises(ValueError, match="NewFeedback"):
+        b.decode_log(log)
+
+
+def test_decode_log_empty_topics_raises_valueerror():
+    log = {"topics": [], "data": "0x", "blockNumber": "0x1", "transactionHash": "0xt", "logIndex": "0x0"}
+    with pytest.raises(ValueError, match="empty topics"):
+        b.decode_log(log)
+
+
+# --- fill_block_timestamps: batch RpcError fallback, null block ---------------------
+
+class FlakyBatchRpc(FakeRpc):
+    """Batch endpoint always fails; per-block eth_getBlockByNumber works."""
+
+    def batch(self, calls):
+        self.batch_calls += 1
+        raise RpcError("batch endpoint down")
+
+    def call(self, method, params):
+        if method == "eth_getBlockByNumber":
+            self.calls.append((method, params))
+            blk = int(params[0], 16)
+            return {"timestamp": hex(1000 + blk)}
+        return super().call(method, params)
+
+
+def test_fill_block_timestamps_falls_back_to_per_block_on_rpcerror(tmp_path):
+    store = Store(tmp_path / "t_fallback.db")
+    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+    agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+    log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=7)
+    store.upsert_feedback([b.decode_log(log)])
+    rpc = FlakyBatchRpc({})
+    n = b.fill_block_timestamps(store, rpc)
+    assert n == 1
+    assert store.load_records()["ts"].iloc[0] == 1007
+
+
+def test_fill_block_timestamps_null_block_raises_rpcerror(tmp_path):
+    store = Store(tmp_path / "t_nullblock.db")
+    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+    agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+    log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=9)
+    store.upsert_feedback([b.decode_log(log)])
+
+    class NullBlockRpc(FakeRpc):
+        def batch(self, calls):
+            self.batch_calls += 1
+            return [None for _ in calls]
+
+    rpc = NullBlockRpc({})
+    with pytest.raises(RpcError, match="9"):
+        b.fill_block_timestamps(store, rpc)
+
+
+# --- owner_of: revert handling ------------------------------------------------------
+
+def test_owner_of_revert_returns_none():
+    class RevertingRpc(FakeRpc):
+        def call(self, method, params):
+            if method == "eth_call":
+                raise RpcError("execution reverted: ERC721: owner query for nonexistent token")
+            return super().call(method, params)
+
+    rpc = RevertingRpc({})
+    assert b.owner_of(rpc, "999999") is None
+
+
+def test_owner_of_other_rpcerror_propagates():
+    class FailingRpc(FakeRpc):
+        def call(self, method, params):
+            if method == "eth_call":
+                raise RpcError("connection reset")
+            return super().call(method, params)
+
+    rpc = FailingRpc({})
+    with pytest.raises(RpcError):
+        b.owner_of(rpc, "1")
