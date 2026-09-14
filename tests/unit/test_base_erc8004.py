@@ -5,7 +5,7 @@ from eth_abi import encode
 
 from robustrep.config import Config
 from robustrep.sources import base_erc8004 as b
-from robustrep.sources.rpc import RpcError
+from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcError
 from robustrep.store import Store
 
 
@@ -392,6 +392,95 @@ def test_fill_block_timestamps_null_block_raises_rpcerror(tmp_path):
         b.fill_block_timestamps(store, rpc)
 
 
+def _feedback_rows(n: int) -> list:
+    rows = []
+    for i in range(n):
+        data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                      [i, 1, 0, "q", "", "", "", b"\x00" * 32])
+        agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+        log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=i)
+        rows.append(b.decode_log(log))
+    return rows
+
+
+class _StructuralOnceRpc(FakeRpc):
+    """``rpc.batch()`` raises a structural ``RpcBatchStructureError`` on its
+    first call only; any later call (which must never happen once
+    ``BatchState`` has learned batching is unsupported) would otherwise
+    succeed -- proving via ``batch_calls == 1`` that a multi-chunk caller
+    never retries the doomed batch call chunk after chunk."""
+
+    def batch(self, calls):
+        self.batch_calls += 1
+        if self.batch_calls == 1:
+            raise RpcBatchStructureError("malformed batch response: expected 100 entries, got dict")
+        return [{"timestamp": hex(1000 + int(p[0], 16))} for _, p in calls]
+
+    def call(self, method, params):
+        if method == "eth_getBlockByNumber":
+            self.calls.append((method, params))
+            return {"timestamp": hex(1000 + int(params[0], 16))}
+        return super().call(method, params)
+
+
+def test_fill_block_timestamps_structural_batch_error_stops_batching_for_rest_of_run(tmp_path, caplog):
+    store = Store(tmp_path / "t_structural_ts.db")
+    store.upsert_feedback([r for r in _feedback_rows(250) if r["kind"] == "feedback"])
+    rpc = _StructuralOnceRpc({})
+    with caplog.at_level(logging.WARNING, logger=b.__name__):
+        n = b.fill_block_timestamps(store, rpc)  # 250 missing -> chunks of 100, 100, 50
+    assert n == 250
+    assert rpc.batch_calls == 1  # only the first chunk ever attempted a batch call
+    assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 250
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1  # logged once, not once per remaining chunk
+    assert "base-rpc.publicnode.com" in warnings[0].message
+
+
+def test_fill_block_timestamps_batch_size_le_1_never_calls_batch(tmp_path):
+    class NoBatchRpc(FakeRpc):
+        def batch(self, calls):
+            raise AssertionError("rpc.batch must not be called when batch_size <= 1")
+
+        def call(self, method, params):
+            if method == "eth_getBlockByNumber":
+                self.calls.append((method, params))
+                return {"timestamp": hex(1000 + int(params[0], 16))}
+            return super().call(method, params)
+
+    store = Store(tmp_path / "t_nobatch_ts.db")
+    store.upsert_feedback([r for r in _feedback_rows(3) if r["kind"] == "feedback"])
+    rpc = NoBatchRpc({})
+    n = b.fill_block_timestamps(store, rpc, batch_size=1)
+    assert n == 3
+    assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 3
+
+
+def test_fill_block_timestamps_batch_rate_limit_error_stops_batching_for_rest_of_run(tmp_path, caplog):
+    class _RateLimitedOnceRpc(FakeRpc):
+        def batch(self, calls):
+            self.batch_calls += 1
+            if self.batch_calls == 1:
+                raise RpcBatchRateLimitError("batch entry id=1: [-32016] over rate limit")
+            return [{"timestamp": hex(1000 + int(p[0], 16))} for _, p in calls]
+
+        def call(self, method, params):
+            if method == "eth_getBlockByNumber":
+                self.calls.append((method, params))
+                return {"timestamp": hex(1000 + int(params[0], 16))}
+            return super().call(method, params)
+
+    store = Store(tmp_path / "t_ratelimit_ts.db")
+    store.upsert_feedback([r for r in _feedback_rows(150) if r["kind"] == "feedback"])
+    rpc = _RateLimitedOnceRpc({})
+    with caplog.at_level(logging.WARNING, logger=b.__name__):
+        n = b.fill_block_timestamps(store, rpc)  # 150 missing -> chunks of 100, 50
+    assert n == 150
+    assert rpc.batch_calls == 1
+    assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 150
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
 # --- owner_of: revert handling ------------------------------------------------------
 
 def test_owner_of_revert_returns_none():
@@ -509,3 +598,72 @@ def test_owners_of_chunks_250_ids_into_3_batches():
     assert len(out) == 250
     assert rpc.batch_calls == 3
     assert rpc.batch_sizes == [100, 100, 50]
+
+
+# --- owners_of: batching permanently abandoned after one structural/rate-limit error --
+
+class _StructuralOnceOwnerRpc(OwnerBatchRpc):
+    """First ``rpc.batch()`` call raises a structural ``RpcBatchStructureError``;
+    any later call (which must never happen once ``BatchState`` has learned
+    batching is unsupported) would otherwise succeed -- proving via
+    ``batch_calls == 1`` that ``owners_of`` never retries the doomed batch
+    call chunk after chunk."""
+
+    def batch(self, calls):
+        self.batch_calls += 1
+        if self.batch_calls == 1:
+            raise RpcBatchStructureError("malformed batch response: expected 100 entries, got dict")
+        return [self._result_for(self._agent_id_from_data(p[0]["data"])) for _, p in calls]
+
+
+def test_owners_of_structural_batch_error_stops_batching_for_rest_of_run(caplog):
+    owners = {str(i): "0x" + f"{i % 100:02x}" * 20 for i in range(250)}
+    rpc = _StructuralOnceOwnerRpc(owners)
+    with caplog.at_level(logging.WARNING, logger=b.__name__):
+        out = b.owners_of(rpc, [str(i) for i in range(250)])  # chunks of 100, 100, 50
+    assert len(out) == 250
+    assert rpc.batch_calls == 1  # only the first chunk ever attempted a batch call
+    assert len([c for c in rpc.calls if c[0] == "eth_call"]) == 250  # rest resolved per-agent
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1  # logged once, not once per remaining chunk
+    assert "base-rpc.publicnode.com" in warnings[0].message
+
+
+def test_owners_of_batch_rate_limit_error_stops_batching_for_rest_of_run(caplog):
+    class _RateLimitedOnceRpc(OwnerBatchRpc):
+        def batch(self, calls):
+            self.batch_calls += 1
+            if self.batch_calls == 1:
+                raise RpcBatchRateLimitError("batch entry id=2: [-32016] over rate limit")
+            return [self._result_for(self._agent_id_from_data(p[0]["data"])) for _, p in calls]
+
+    owners = {"1": "0x" + "11" * 20, "2": "0x" + "22" * 20, "3": "0x" + "33" * 20}
+    rpc = _RateLimitedOnceRpc(owners)
+    with caplog.at_level(logging.WARNING, logger=b.__name__):
+        out = b.owners_of(rpc, ["1", "2", "3"], batch_size=2)  # chunks: [1,2], [3]
+    assert out == owners
+    assert rpc.batch_calls == 1
+    assert len([c for c in rpc.calls if c[0] == "eth_call"]) == 3
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_owners_of_ordinary_batch_error_does_not_disable_batching_for_later_chunks():
+    # a per-call revert (an ordinary RpcError, not RpcBatchUnsupportedError)
+    # must only fall back for the chunk it hit -- later chunks still try
+    # rpc.batch normally.
+    rpc = OwnerBatchRpc({"1": "0x" + "11" * 20, "3": "0x" + "33" * 20, "4": "0x" + "44" * 20},
+                         revert_agents={"2"})
+    out = b.owners_of(rpc, ["1", "2", "3", "4"], batch_size=2)
+    assert out == {"1": "0x" + "11" * 20, "2": None, "3": "0x" + "33" * 20, "4": "0x" + "44" * 20}
+    assert rpc.batch_calls == 2  # second chunk's batch was still attempted
+
+
+def test_owners_of_batch_size_le_1_never_calls_batch():
+    class NoBatchRpc(OwnerBatchRpc):
+        def batch(self, calls):
+            raise AssertionError("rpc.batch must not be called when batch_size <= 1")
+
+    rpc = NoBatchRpc({"1": "0x" + "11" * 20, "2": None})
+    out = b.owners_of(rpc, ["1", "2"], batch_size=1)
+    assert out == {"1": "0x" + "11" * 20, "2": None}
+    assert len([c for c in rpc.calls if c[0] == "eth_call"]) == 2

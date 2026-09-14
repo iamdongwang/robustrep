@@ -1,7 +1,9 @@
+import threading
+
 import pytest
 import requests
 
-from robustrep.sources.rpc import RpcClient, RpcError
+from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcClient, RpcError
 
 
 class FakeSession:
@@ -179,6 +181,97 @@ def test_gives_up_message_never_includes_raw_exception_text_or_url():
     assert "rpc.example.com" in msg  # bare scheme+host is fine, not a secret
 
 
+# --- structural batch failures: non-retryable, 1 attempt, no sleep ----------------
+
+def test_batch_dict_response_is_non_retryable_one_attempt_no_sleep():
+    # a dict "error object" instead of a list -- observed on mainnet.base.org
+    # for a 100-call batch. Must not burn the full retry/backoff schedule.
+    s = FakeSession([{"error": {"message": "something went wrong"}}])
+    sleeps = []
+    c = RpcClient(["http://a", "http://b"], user_agent="ua", session=s, sleep=sleeps.append, retries=5)
+    with pytest.raises(RpcBatchStructureError, match="expected 2 entries, got dict"):
+        c.batch([("m", [1]), ("m", [2])])
+    assert len(s.calls) == 1
+    assert sleeps == []
+
+
+def test_batch_short_list_is_non_retryable_one_attempt_no_sleep():
+    s = FakeSession([[{"id": 1, "result": "a"}]])  # 1 entry, 2 requested
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=5)
+    with pytest.raises(RpcBatchStructureError):
+        c.batch([("m", [1]), ("m", [2])])
+    assert len(s.calls) == 1
+    assert sleeps == []
+
+
+def test_batch_id_mismatch_is_non_retryable_one_attempt():
+    s = FakeSession([[{"id": 1, "result": "a"}, {"id": 4, "result": "b"}]])
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=5)
+    with pytest.raises(RpcBatchStructureError):
+        c.batch([("m", [1]), ("m", [2])])
+    assert len(s.calls) == 1
+    assert sleeps == []
+
+
+def test_batch_missing_result_is_non_retryable_one_attempt():
+    s = FakeSession([[{"id": 1, "result": "a"}, {"id": 2, "result": None}]])
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=5)
+    with pytest.raises(RpcBatchStructureError):
+        c.batch([("m", [1]), ("m", [2])])
+    assert len(s.calls) == 1
+    assert sleeps == []
+
+
+def test_batch_entry_json_rpc_error_still_retries_normally():
+    # a legitimate per-call JSON-RPC error (not a structural/rate-limit
+    # failure) must keep the existing retry behavior.
+    s = FakeSession([[{"id": 1, "result": "a"}, {"id": 2, "error": {"message": "bad"}}],
+                      [{"id": 1, "result": "a"}, {"id": 2, "result": "b"}]])
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=3)
+    assert c.batch([("m", [1]), ("m", [2])]) == ["a", "b"]
+    assert len(s.calls) == 2
+    assert sleeps == [1]
+
+
+# --- batch rate-limit errors: non-retryable, 1 attempt, no sleep ------------------
+
+def test_batch_rate_limit_error_by_code_is_non_retryable_one_attempt():
+    s = FakeSession([[{"id": 1, "result": "a"}, {"id": 2, "error": {"code": -32016, "message": "over rate limit"}}]])
+    sleeps = []
+    c = RpcClient(["http://a", "http://b"], user_agent="ua", session=s, sleep=sleeps.append, retries=5)
+    with pytest.raises(RpcBatchRateLimitError, match="over rate limit"):
+        c.batch([("m", [1]), ("m", [2])])
+    assert len(s.calls) == 1
+    assert sleeps == []
+
+
+def test_batch_rate_limit_error_by_alternate_code_is_non_retryable():
+    s = FakeSession([[{"id": 1, "error": {"code": -32005, "message": "limited"}}]])
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=5)
+    with pytest.raises(RpcBatchRateLimitError):
+        c.batch([("m", [1])])
+    assert len(s.calls) == 1
+    assert sleeps == []
+
+
+def test_single_call_rate_limit_error_still_retries_normally():
+    # the same "over rate limit"/-32016 signal on a *single* call (not a
+    # batch) must keep retrying as normal -- only batching is abandoned.
+    s = FakeSession([{"error": {"code": -32016, "message": "over rate limit"}},
+                      {"error": {"code": -32016, "message": "over rate limit"}},
+                      {"result": "ok"}])
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=3)
+    assert c.call("m", []) == "ok"
+    assert len(s.calls) == 3
+    assert sleeps == [1, 2]
+
+
 def test_gives_up_message_includes_http_status_code():
     class FakeResponse:
         status_code = 503
@@ -194,3 +287,63 @@ def test_gives_up_message_includes_http_status_code():
     assert "SUPER_SECRET" not in msg
     assert "503" in msg
     assert "rpc.example.com" in msg
+
+
+# --- thread-local session (no session injected) ------------------------------------
+
+def test_session_is_thread_local_when_none_injected():
+    # classify_all drives tx_parties (and so RpcClient.call) from a thread
+    # pool; a bare requests.Session is not guaranteed safe to share across
+    # threads, so each thread must get its own lazily-created session.
+    c = RpcClient(["http://a"], user_agent="ua", sleep=lambda _: None)
+    seen = {}
+    lock = threading.Lock()
+    # A barrier keeps both threads alive at the point they grab (and again
+    # until both have recorded) their session, so the OS can't reuse a
+    # terminated thread's ident for the other thread before both idents are
+    # captured -- which would make this test flaky rather than a real check
+    # of thread-local isolation.
+    barrier = threading.Barrier(2)
+
+    def grab():
+        barrier.wait()
+        sess = c.session
+        with lock:
+            seen[threading.get_ident()] = sess
+        barrier.wait()
+
+    threads = [threading.Thread(target=grab) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(seen) == 2
+    sessions = list(seen.values())
+    assert sessions[0] is not sessions[1]
+    assert all(isinstance(s, requests.Session) for s in sessions)
+
+
+def test_session_is_stable_within_one_thread():
+    c = RpcClient(["http://a"], user_agent="ua", sleep=lambda _: None)
+    assert c.session is c.session
+
+
+def test_injected_session_is_shared_across_all_threads():
+    injected = FakeSession([])
+    c = RpcClient(["http://a"], user_agent="ua", session=injected, sleep=lambda _: None)
+    seen = []
+    lock = threading.Lock()
+
+    def grab():
+        with lock:
+            seen.append(c.session)
+
+    threads = [threading.Thread(target=grab) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(seen) == 3
+    assert all(s is injected for s in seen)

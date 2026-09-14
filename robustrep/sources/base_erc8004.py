@@ -36,7 +36,7 @@ from eth_hash.auto import keccak
 
 from ..config import DEFAULT_CONFIRMATIONS
 from ..store import Store
-from .rpc import RpcError
+from .rpc import RpcBatchUnsupportedError, RpcError
 
 logger = logging.getLogger(__name__)
 
@@ -212,28 +212,78 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
     return n
 
 
-def fill_block_timestamps(store: Store, rpc, batch_size: int = 100) -> int:
+# Suggested in the fallback WARNING once an endpoint's batching is given up on
+# for the rest of the run (see ``BatchState``/``_warn_batch_fallback``): a
+# public Base endpoint known to handle JSON-RPC batches correctly.
+_BATCH_FALLBACK_HINT = "consider --rpc-url https://base-rpc.publicnode.com"
+
+
+class BatchState:
+    """Remembers, for the duration of one call site's run (e.g. one
+    ``robustrep fetch`` invocation), whether this RPC endpoint has already
+    been found unable to batch (see ``RpcBatchUnsupportedError``) -- so
+    ``fill_block_timestamps``/``owners_of`` stop re-attempting ``rpc.batch``
+    on every remaining chunk once it's known to be futile, and go straight to
+    per-item calls instead. Pass the *same* instance across multiple calls
+    (e.g. once per chunk, as ``robustrep.cli._step_owners`` does) to share
+    that knowledge across the whole run; a call given no ``state`` gets a
+    private, call-scoped one, which still short-circuits correctly for any
+    later chunks *within* that one call."""
+
+    def __init__(self) -> None:
+        self.batch_unsupported = False
+
+
+def _warn_batch_fallback(op: str, exc: RpcError, state: BatchState) -> None:
+    """Log a chunk's ``rpc.batch`` failure at WARNING and fall back to
+    per-item calls for that chunk. If ``exc`` is an ``RpcBatchUnsupportedError``
+    (batching itself is the problem -- a structurally wrong response or a
+    batch-specific rate limit, not an ordinary transient/per-call failure),
+    also flip ``state.batch_unsupported`` so every *remaining* chunk in this
+    run skips ``rpc.batch`` entirely rather than re-attempting (and
+    re-failing) an identical, doomed batch call."""
+    if isinstance(exc, RpcBatchUnsupportedError):
+        state.batch_unsupported = True
+        logger.warning("%s: batch fetch failed (%s); batching unsupported by this endpoint, falling back "
+                        "to per-item calls for the rest of this run (%s)", op, exc, _BATCH_FALLBACK_HINT)
+    else:
+        logger.warning("%s: batch fetch failed (%s), falling back to per-item calls", op, exc)
+
+
+def fill_block_timestamps(store: Store, rpc, batch_size: int = 100, state: Optional[BatchState] = None) -> int:
     """Resolve and cache ``eth_getBlockByNumber`` timestamps for every block
     referenced by feedback rows that isn't already cached (``Store.missing_block_ts``).
 
-    Blocks are resolved in JSON-RPC batches of ``batch_size``. If a batch call
-    itself fails (``RpcError`` -- e.g. the endpoint doesn't support batching, or
-    rejects an oversized batch), that batch is retried one block at a time via
-    individual ``eth_getBlockByNumber`` calls (logged once at WARNING). Raises
+    Blocks are resolved in JSON-RPC batches of ``batch_size`` (or one at a
+    time, without ever calling ``rpc.batch``, when ``batch_size <= 1``). If a
+    batch call itself fails (``RpcError`` -- e.g. the endpoint doesn't support
+    batching, or rejects an oversized batch), that batch is retried one block
+    at a time via individual ``eth_getBlockByNumber`` calls (logged once at
+    WARNING; see ``_warn_batch_fallback``). When the failure is an
+    ``RpcBatchUnsupportedError`` -- batching itself doesn't work against this
+    endpoint, not just this one chunk -- every later chunk in this call also
+    skips straight to per-item calls (see ``BatchState``) instead of
+    re-attempting (and re-failing) ``rpc.batch`` for nothing; pass a shared
+    ``state`` to carry that knowledge across multiple calls too. Raises
     ``RpcError`` naming the block if any resolved block comes back ``null``
     (should not happen for an already-mined block; treated as a hard error
     rather than silently caching a missing timestamp). Returns the number of
     blocks that were missing (and are now cached), 0 if none were missing (in
     which case no RPC calls are made at all).
     """
+    state = state or BatchState()
     missing = store.missing_block_ts()
-    for i in range(0, len(missing), batch_size):
-        block_nums = missing[i:i + batch_size]
-        try:
-            blocks = rpc.batch([("eth_getBlockByNumber", [hex(b), False]) for b in block_nums])
-        except RpcError as e:
-            logger.warning("fill_block_timestamps: batch fetch failed (%s), falling back to per-block calls", e)
+    step = max(batch_size, 1)
+    for i in range(0, len(missing), step):
+        block_nums = missing[i:i + step]
+        if batch_size <= 1 or state.batch_unsupported:
             blocks = [rpc.call("eth_getBlockByNumber", [hex(b), False]) for b in block_nums]
+        else:
+            try:
+                blocks = rpc.batch([("eth_getBlockByNumber", [hex(b), False]) for b in block_nums])
+            except RpcError as e:
+                _warn_batch_fallback("fill_block_timestamps", e, state)
+                blocks = [rpc.call("eth_getBlockByNumber", [hex(b), False]) for b in block_nums]
         pairs = []
         for block_num, blk in zip(block_nums, blocks):
             if blk is None:
@@ -281,32 +331,46 @@ def owner_of(rpc, agent_id: str) -> Optional[str]:
     return _decode_owner_result(out)
 
 
-def owners_of(rpc, agent_ids: list[str], batch_size: int = 100) -> dict[str, Optional[str]]:
+def owners_of(rpc, agent_ids: list[str], batch_size: int = 100,
+              state: Optional[BatchState] = None) -> dict[str, Optional[str]]:
     """Resolve the IdentityRegistry owner address of every id in ``agent_ids``,
     via JSON-RPC batches of ``batch_size`` ``eth_call``s instead of one request
     per agent (``owner_of`` does ~104ms/call; batching cuts a ~48-minute walk of
-    28k agents down dramatically).
+    28k agents down dramatically). ``batch_size <= 1`` resolves every agent via
+    ``owner_of`` directly, without ever calling ``rpc.batch``.
 
     Each chunk is decoded with the same rules as ``owner_of`` (see
     ``_decode_owner_result``): empty result or the zero address map to ``None``.
     If a chunk's ``rpc.batch`` call raises ``RpcError`` -- e.g. the endpoint
     doesn't support batching, rejects an oversized batch, returns a malformed
     response (some public endpoints return a dict instead of a list for a
-    100-call batch), or one call in the chunk reverts (which fails the whole
-    batch, not just that entry) -- that chunk is retried one agent at a time via
-    ``owner_of`` (which already maps a revert to ``None``), logged once at
-    WARNING. Returns a dict covering every id in ``agent_ids``, regardless of
+    100-call batch), rate-limits batches specifically, or one call in the
+    chunk reverts (which fails the whole batch, not just that entry) -- that
+    chunk is retried one agent at a time via ``owner_of`` (which already maps
+    a revert to ``None``), logged once at WARNING (see ``_warn_batch_fallback``).
+    When the failure is an ``RpcBatchUnsupportedError`` -- batching itself
+    doesn't work against this endpoint, not just this one chunk -- every
+    later chunk in this call also skips straight to per-agent calls (see
+    ``BatchState``) instead of re-attempting (and re-failing) ``rpc.batch``
+    for nothing; pass a shared ``state`` to carry that knowledge across
+    multiple calls too (e.g. one per chunk, as ``robustrep.cli._step_owners``
+    does). Returns a dict covering every id in ``agent_ids``, regardless of
     which chunks needed the fallback.
     """
+    state = state or BatchState()
     result: dict[str, Optional[str]] = {}
-    for i in range(0, len(agent_ids), batch_size):
-        chunk = agent_ids[i:i + batch_size]
+    step = max(batch_size, 1)
+    for i in range(0, len(agent_ids), step):
+        chunk = agent_ids[i:i + step]
+        if batch_size <= 1 or state.batch_unsupported:
+            for a in chunk:
+                result[a] = owner_of(rpc, a)
+            continue
         calls = [("eth_call", [{"to": IDENTITY_REGISTRY, "data": _owner_call_data(a)}, "latest"]) for a in chunk]
         try:
             outs = rpc.batch(calls)
         except RpcError as e:
-            logger.warning("owners_of: batch fetch failed for %d agent(s) (%s), "
-                            "falling back to per-agent calls", len(chunk), e)
+            _warn_batch_fallback("owners_of", e, state)
             for a in chunk:
                 result[a] = owner_of(rpc, a)
             continue
