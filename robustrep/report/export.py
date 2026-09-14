@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import numpy
 import pandas as pd
@@ -24,10 +25,13 @@ SCHEMA_VERSION = 1
 _INT_COLUMNS = ("n_clusters", "n_raw", "sybil_flag", "insufficient")
 
 
-def export_json(scores: pd.DataFrame, block: int, out: Path) -> Path:
+def export_json(scores: pd.DataFrame, block: int, out: Path, config: Optional[dict] = None) -> Path:
     """Write `scores` (RESULT_COLUMNS) to `out` as JSON: {schema_version, block,
-    generated_at, versions, scores}. Rows are sorted by robust_score descending
-    with NaN (insufficient ratees) last. Parent directories are created as needed.
+    generated_at, config, versions, scores}. Rows are sorted by robust_score
+    descending with NaN (insufficient ratees) last. `config` (e.g. bootstrap_n,
+    evidence_weights, the sybil_* thresholds -- the scoring parameters actually
+    used) is written verbatim next to `versions`, defaulting to `{}` when not
+    given. Parent directories are created as needed.
     """
     ordered = scores.sort_values("robust_score", ascending=False, na_position="last").copy()
     for col in _INT_COLUMNS:
@@ -40,8 +44,9 @@ def export_json(scores: pd.DataFrame, block: int, out: Path) -> Path:
         "schema_version": SCHEMA_VERSION,
         "block": block,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "config": config or {},
         "versions": {"robustrep": __version__, "numpy": numpy.__version__, "pandas": pd.__version__},
         "scores": rows,
     }
-    out.write_text(json.dumps(payload, indent=0))
+    out.write_text(json.dumps(payload, indent=None))
     return out
