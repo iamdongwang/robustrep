@@ -234,6 +234,15 @@ def test_first_tx_non_retryable_4xx_raises_immediately():
     assert len(http.calls) == 1
 
 
+def test_first_tx_non_dict_body_raises_value_error():
+    c = EtherscanClient("KEY", session=FakeHttp([None]), sleep=lambda _: None)
+    try:
+        c.first_tx("0xA")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "0xa" in str(e).lower()
+
+
 def test_first_tx_missing_status_raises_value_error():
     c = EtherscanClient("KEY", session=FakeHttp([{"result": []}]), sleep=lambda _: None)
     try:
@@ -417,6 +426,24 @@ def test_enrich_fallback_returns_same_count_every_call_not_sticky(tmp_path):
     # run (fallback again, or with a real key) can still see and profile it.
     assert enrich_raters(s, None) == 1
     assert len(s.load_rater_meta()) == 0
+
+
+def test_keyed_run_after_fallback_upgrades_rows(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa")])
+    s.upsert_block_ts([(1, 555)])
+
+    assert enrich_raters(s, None) == 1
+    assert len(s.load_rater_meta()) == 0
+    assert s.get_sync("rater_profile_mode") == "fallback"
+
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+    c = EtherscanClient("K", session=http, sleep=lambda _: None)
+    assert enrich_raters(s, c) == 1
+    assert len(http.calls) == 1
+    m = s.load_rater_meta().iloc[0]
+    assert m["rater"] == "0xa" and m["first_seen_ts"] == 99 and m["funder"] == "0xf"
+    assert s.get_sync("rater_profile_mode") == "etherscan"
 
 
 # --- enrich_raters: nothing to do ----------------------------------------------------
