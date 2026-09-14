@@ -1,9 +1,10 @@
 """SQLite persistence for raw chain events, enrichment caches and sync state.
 
 One SQLite file holds everything the ``sources/base_erc8004.py`` adapter (and its
-sibling enrichment tasks) need: raw ``FeedbackGiven``/``ResponseAppended`` events,
-a block-number -> timestamp cache, an evidence-URI enrichment cache, rater/agent
-metadata caches, sync-cursor bookkeeping and a log of failed block ranges to retry.
+sibling enrichment tasks) need: raw ``NewFeedback``/``FeedbackRevoked``/
+``ResponseAppended`` chain events, a block-number -> timestamp cache, an
+evidence-URI enrichment cache, rater/agent metadata caches, sync-cursor
+bookkeeping and a log of failed block ranges to retry.
 
 ``load_records`` projects the raw tables into the eight-field record frame that
 ``robustrep.schema.validate_records`` expects (plus ``evidence_level`` and
@@ -11,14 +12,25 @@ metadata caches, sync-cursor bookkeeping and a log of failed block ranges to ret
 (``NaN`` for anything non-numeric — left for ``validate_records`` to reject),
 ``ts`` is an ``int`` that is ``0`` when the block timestamp is not yet known
 (``validate_records`` accepts 0; ``n_missing_block_ts`` lets callers warn).
+
+A ``Store`` wraps one ``sqlite3.Connection`` and is a single-writer object: it is
+not safe to share across threads (``sqlite3`` connections default to
+``check_same_thread=True``, and no locking is added here) — open one ``Store``
+per thread/process if you need concurrent writers. ``load_records`` materializes
+the whole feedback table into memory as a ``pandas.DataFrame`` (at roughly
+500k rows this is on the order of ~200 MB); callers processing much larger
+histories should page or filter at the SQL level instead.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Iterable, Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 SOURCE = "base-erc8004"
 
@@ -26,22 +38,31 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS feedback(
   chain TEXT, block INTEGER, tx_hash TEXT, log_index INTEGER, agent_id TEXT, client TEXT,
   feedback_index INTEGER, value TEXT, value_decimals INTEGER, tag1 TEXT, tag2 TEXT, endpoint TEXT,
-  feedback_uri TEXT, feedback_hash TEXT, revoked INTEGER DEFAULT 0,
+  feedback_uri TEXT, feedback_hash TEXT,
+  PRIMARY KEY(agent_id, client, feedback_index));
+CREATE TABLE IF NOT EXISTS revocations(
+  agent_id TEXT NOT NULL, client TEXT NOT NULL, feedback_index INTEGER NOT NULL,
+  block INTEGER, tx_hash TEXT,
   PRIMARY KEY(agent_id, client, feedback_index));
 CREATE TABLE IF NOT EXISTS responses(
   agent_id TEXT, client TEXT, feedback_index INTEGER, responder TEXT, response_uri TEXT,
   response_hash TEXT, block INTEGER, tx_hash TEXT, log_index INTEGER,
   PRIMARY KEY(tx_hash, log_index));
-CREATE TABLE IF NOT EXISTS blocks(number INTEGER PRIMARY KEY, ts INTEGER);
-CREATE TABLE IF NOT EXISTS evidence_cache(uri TEXT PRIMARY KEY, level INTEGER, note TEXT);
-CREATE TABLE IF NOT EXISTS raters(address TEXT PRIMARY KEY, first_seen_ts INTEGER, funder TEXT);
-CREATE TABLE IF NOT EXISTS agents(agent_id TEXT PRIMARY KEY, owner TEXT);
+-- number uses "INT" (not "INTEGER") PRIMARY KEY: a bare INTEGER PRIMARY KEY column
+-- is a rowid alias in SQLite, and inserting NULL into it silently auto-assigns a
+-- new rowid instead of enforcing NOT NULL. "INT" avoids that rowid-alias special
+-- case so NULL block numbers are correctly rejected.
+CREATE TABLE IF NOT EXISTS blocks(number INT PRIMARY KEY NOT NULL, ts INTEGER);
+CREATE TABLE IF NOT EXISTS evidence_cache(uri TEXT PRIMARY KEY NOT NULL, level INTEGER, note TEXT);
+CREATE TABLE IF NOT EXISTS raters(address TEXT PRIMARY KEY NOT NULL, first_seen_ts INTEGER, funder TEXT);
+CREATE TABLE IF NOT EXISTS agents(agent_id TEXT PRIMARY KEY NOT NULL, owner TEXT);
 CREATE TABLE IF NOT EXISTS sync_state(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS failed_ranges(from_block INTEGER, to_block INTEGER, error TEXT,
   PRIMARY KEY(from_block, to_block));
 CREATE INDEX IF NOT EXISTS idx_feedback_block ON feedback(block);
 CREATE INDEX IF NOT EXISTS idx_feedback_client ON feedback(client);
 CREATE INDEX IF NOT EXISTS idx_feedback_uri ON feedback(feedback_uri);
+CREATE INDEX IF NOT EXISTS idx_responses_key ON responses(agent_id, client, feedback_index);
 """
 
 FB_COLS = ["chain", "block", "tx_hash", "log_index", "agent_id", "client", "feedback_index", "value",
@@ -51,15 +72,34 @@ RESPONSE_COLS = ["agent_id", "client", "feedback_index", "responder", "response_
                   "block", "tx_hash", "log_index"]
 
 
+def _row_values(row: dict, cols: list[str], what: str) -> list:
+    """Pull ``cols`` out of ``row`` in order, raising ``ValueError`` naming the
+    first missing column instead of letting a bare ``KeyError`` escape."""
+    values = []
+    for c in cols:
+        if c not in row:
+            raise ValueError(f"{what} row missing {c!r}")
+        values.append(row[c])
+    return values
+
+
 class Store:
     """SQLite-backed persistence for one chain adapter's raw events and caches.
 
     Opens (creating if needed) a single SQLite file at ``path``, applies the
     schema (idempotent ``CREATE TABLE/INDEX IF NOT EXISTS``), and enables WAL
     journaling for concurrent-friendly reads. Supports use as a context manager.
+
+    Not thread-shareable: this wraps one ``sqlite3.Connection`` opened with the
+    default ``check_same_thread=True`` and does no internal locking — treat a
+    ``Store`` as owned by a single writer (thread/process) at a time.
     """
 
     def __init__(self, path: str | Path):
+        if str(path) != ":memory:":
+            parent = Path(path).parent
+            if str(parent) not in ("", "."):
+                parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(path))
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -76,45 +116,58 @@ class Store:
         self.conn.close()
 
     # --- feedback -----------------------------------------------------------------
-    def upsert_feedback(self, rows: Iterable[dict]) -> None:
+    def upsert_feedback(self, rows: Iterable[dict]) -> tuple[int, int]:
         """Insert feedback rows, ignoring duplicates on (agent_id, client, feedback_index).
 
-        Raises ``ValueError`` naming the missing column if a row lacks one of the
-        required ``FB_COLS`` fields.
+        Returns ``(inserted, ignored)`` counts and logs at INFO when any rows were
+        ignored as duplicates. Raises ``ValueError`` naming the missing column if a
+        row lacks one of the required ``FB_COLS`` fields.
         """
         rows = list(rows)
-        values = []
-        for r in rows:
-            row_values = []
-            for c in FB_COLS:
-                if c not in r:
-                    raise ValueError(f"feedback row missing {c!r}")
-                row_values.append(r[c])
-            values.append(row_values)
+        values = [_row_values(r, FB_COLS, "feedback") for r in rows]
         q = f"INSERT OR IGNORE INTO feedback({','.join(FB_COLS)}) VALUES({','.join('?' * len(FB_COLS))})"
         with self.conn:
-            self.conn.executemany(q, values)
+            cur = self.conn.executemany(q, values)
+            inserted = cur.rowcount if cur.rowcount >= 0 else 0
+        ignored = len(rows) - inserted
+        if ignored > 0:
+            logger.info("upsert_feedback: %d inserted, %d ignored (already present)", inserted, ignored)
+        return inserted, ignored
 
-    def mark_revoked(self, agent_id: str, client: str, feedback_index: int) -> None:
-        """Mark a specific feedback row as revoked."""
+    def mark_revoked(self, agent_id: str, client: str, feedback_index: int,
+                      block: Optional[int] = None, tx_hash: Optional[str] = None) -> None:
+        """Record a revocation for (agent_id, client, feedback_index).
+
+        Written to a standalone ``revocations`` table (not a column on ``feedback``)
+        so that a ``FeedbackRevoked`` event replayed before its matching
+        ``NewFeedback`` row has been inserted (e.g. a retried failed block range
+        landing out of order) is never lost: ``load_records`` computes ``revoked``
+        by joining against this table, so the revocation is visible as soon as the
+        feedback row eventually arrives, regardless of insertion order.
+        """
         with self.conn:
             self.conn.execute(
-                "UPDATE feedback SET revoked=1 WHERE agent_id=? AND client=? AND feedback_index=?",
-                (agent_id, client, feedback_index))
+                "INSERT OR IGNORE INTO revocations(agent_id, client, feedback_index, block, tx_hash) "
+                "VALUES(?,?,?,?,?)",
+                (agent_id, client, feedback_index, block, tx_hash))
 
     def add_response(self, row: dict) -> None:
         """Insert a response row, ignoring duplicates on (tx_hash, log_index)."""
+        values = _row_values(row, RESPONSE_COLS, "response")
         with self.conn:
             self.conn.execute(
                 f"INSERT OR IGNORE INTO responses({','.join(RESPONSE_COLS)}) "
                 f"VALUES({','.join('?' * len(RESPONSE_COLS))})",
-                [row[c] for c in RESPONSE_COLS])
+                values)
 
     # --- caches (block timestamps, evidence, rater/agent metadata) ----------------
     def upsert_block_ts(self, pairs: Iterable[tuple[int, int]]) -> None:
         """Cache (block_number, unix_ts) pairs, replacing existing entries."""
-        with self.conn:
-            self.conn.executemany("INSERT OR REPLACE INTO blocks VALUES(?,?)", list(pairs))
+        try:
+            with self.conn:
+                self.conn.executemany("INSERT OR REPLACE INTO blocks VALUES(?,?)", list(pairs))
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"blocks: {e}") from e
 
     def missing_block_ts(self) -> list[int]:
         """Block numbers referenced by feedback rows with no cached timestamp yet."""
@@ -129,8 +182,11 @@ class Store:
 
     def upsert_evidence(self, uri: str, level: int, note: str = "") -> None:
         """Cache an evidence level (and optional note) for a URI."""
-        with self.conn:
-            self.conn.execute("INSERT OR REPLACE INTO evidence_cache VALUES(?,?,?)", (uri, level, note))
+        try:
+            with self.conn:
+                self.conn.execute("INSERT OR REPLACE INTO evidence_cache VALUES(?,?,?)", (uri, level, note))
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"evidence_cache: {e}") from e
 
     def evidence_level(self, uri: str) -> Optional[int]:
         """Cached evidence level for a URI, or ``None`` if not yet enriched."""
@@ -139,13 +195,19 @@ class Store:
 
     def upsert_rater(self, address: str, first_seen_ts: Optional[int], funder: Optional[str]) -> None:
         """Cache rater profile metadata (first-seen timestamp, funder address)."""
-        with self.conn:
-            self.conn.execute("INSERT OR REPLACE INTO raters VALUES(?,?,?)", (address, first_seen_ts, funder))
+        try:
+            with self.conn:
+                self.conn.execute("INSERT OR REPLACE INTO raters VALUES(?,?,?)", (address, first_seen_ts, funder))
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"raters: {e}") from e
 
     def upsert_agent_owner(self, agent_id: str, owner: str) -> None:
         """Cache the owner address for an agent id."""
-        with self.conn:
-            self.conn.execute("INSERT OR REPLACE INTO agents VALUES(?,?)", (agent_id, owner))
+        try:
+            with self.conn:
+                self.conn.execute("INSERT OR REPLACE INTO agents VALUES(?,?)", (agent_id, owner))
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"agents: {e}") from e
 
     def agent_owner(self, agent_id: str) -> Optional[str]:
         """Cached owner address for an agent id, or ``None`` if unknown."""
@@ -169,10 +231,12 @@ class Store:
             self.conn.execute("INSERT OR REPLACE INTO failed_ranges VALUES(?,?,?)", (from_block, to_block, error))
 
     def pop_failed_ranges(self) -> list[tuple[int, int]]:
-        """Return and clear all recorded failed block ranges, ordered by start block."""
-        rows = self.conn.execute(
-            "SELECT from_block,to_block FROM failed_ranges ORDER BY from_block").fetchall()
+        """Atomically return and clear all recorded failed block ranges, ordered by
+        start block. SELECT and DELETE run inside a single transaction so a range
+        added concurrently between the two statements is never silently dropped."""
         with self.conn:
+            rows = self.conn.execute(
+                "SELECT from_block,to_block FROM failed_ranges ORDER BY from_block").fetchall()
             self.conn.execute("DELETE FROM failed_ranges")
         return [(r[0], r[1]) for r in rows]
 
@@ -185,13 +249,23 @@ class Store:
         lose float precision on this coercion — accepted, since the pipeline only
         needs relative magnitude, not exact integer values. ``ts`` is 0 when the
         block timestamp is not yet cached (see ``missing_block_ts``/``n_missing_block_ts``).
+        ``revoked`` is computed by joining against the standalone ``revocations``
+        table (see ``mark_revoked``), so it reflects revocations recorded either
+        before or after the matching feedback row was inserted.
+
+        Materializes the whole feedback table as a DataFrame in memory — at
+        roughly 500k rows this is on the order of ~200 MB; callers with much
+        larger histories should filter/page at the SQL level instead.
         """
         q = """SELECT f.client AS rater, f.agent_id AS ratee, f.value AS value,
                       ('d' || f.value_decimals) AS scale, f.tag1 AS tag, b.ts AS ts,
                       f.feedback_uri AS evidence_uri, ? AS source,
-                      COALESCE(e.level, 0) AS evidence_level, f.revoked AS revoked
+                      COALESCE(e.level, 0) AS evidence_level,
+                      CASE WHEN r.agent_id IS NULL THEN 0 ELSE 1 END AS revoked
                FROM feedback f LEFT JOIN blocks b ON b.number=f.block
-               LEFT JOIN evidence_cache e ON e.uri=f.feedback_uri"""
+               LEFT JOIN evidence_cache e ON e.uri=f.feedback_uri
+               LEFT JOIN revocations r ON r.agent_id=f.agent_id AND r.client=f.client
+                                       AND r.feedback_index=f.feedback_index"""
         df = pd.read_sql_query(q, self.conn, params=(SOURCE,))
         df["value"] = pd.to_numeric(df["value"], errors="coerce").astype("float64")
         df["ts"] = pd.to_numeric(df["ts"], errors="coerce").fillna(0).astype("int64")
@@ -206,20 +280,20 @@ class Store:
     def distinct_uris(self) -> list[str]:
         """Feedback URIs not yet present (empty ones excluded) in the evidence cache."""
         rows = self.conn.execute(
-            "SELECT DISTINCT feedback_uri FROM feedback WHERE feedback_uri<>'' "
-            "AND feedback_uri NOT IN (SELECT uri FROM evidence_cache)").fetchall()
+            "SELECT DISTINCT feedback_uri FROM feedback f WHERE feedback_uri<>'' "
+            "AND NOT EXISTS (SELECT 1 FROM evidence_cache e WHERE e.uri=f.feedback_uri)").fetchall()
         return [r[0] for r in rows]
 
     def distinct_clients(self) -> list[str]:
         """Client (rater) addresses not yet profiled in the raters cache."""
         rows = self.conn.execute(
-            "SELECT DISTINCT client FROM feedback WHERE client NOT IN "
-            "(SELECT address FROM raters)").fetchall()
+            "SELECT DISTINCT client FROM feedback f WHERE "
+            "NOT EXISTS (SELECT 1 FROM raters ra WHERE ra.address=f.client)").fetchall()
         return [r[0] for r in rows]
 
     def distinct_agents(self) -> list[str]:
         """Agent ids not yet resolved in the agents (owner) cache."""
         rows = self.conn.execute(
-            "SELECT DISTINCT agent_id FROM feedback WHERE agent_id NOT IN "
-            "(SELECT agent_id FROM agents)").fetchall()
+            "SELECT DISTINCT agent_id FROM feedback f WHERE "
+            "NOT EXISTS (SELECT 1 FROM agents a WHERE a.agent_id=f.agent_id)").fetchall()
         return [r[0] for r in rows]
