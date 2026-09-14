@@ -4,6 +4,7 @@ import pandas as pd
 
 from robustrep import Config
 from robustrep.explain import COLUMNS, explain
+from robustrep.pipeline import score
 
 
 def test_explain_marks_collapsed_and_weights(records_factory):
@@ -21,6 +22,12 @@ def test_explain_marks_collapsed_and_weights(records_factory):
 def test_explain_unknown_ratee_is_empty(records_factory):
     out = explain(records_factory([dict(rater="a", ratee="A", value=1)]), "Z", Config(bootstrap_n=0))
     assert out.empty
+    assert list(out.columns) == COLUMNS
+    expected_dtypes = dict(rater=object, tag=object, score=float, norm_rule=object,
+                            evidence_level=int, weight=float, cluster=object, collapsed=bool,
+                            contribution=float, is_median_vote=bool)
+    for col, dt in expected_dtypes.items():
+        assert out[col].dtype == dt, f"{col}: expected {dt}, got {out[col].dtype}"
 
 
 def test_contributions_sum_to_one_multi_tag(records_factory):
@@ -53,15 +60,37 @@ def test_columns_and_order(records_factory):
 
 
 def test_explain_consistent_with_score(records_factory):
+    # (a) single-tag case: the records marked is_median_vote are the ones score()
+    # actually picked -- the median of their scores equals robust_score.
+    cfg = Config(bootstrap_n=0, min_clusters=1)
     df = records_factory([
         dict(rater="h1", ratee="A", value=80, evidence_level=3),
         dict(rater="h2", ratee="A", value=10, evidence_level=0),
     ])
-    out = explain(df, "A", Config(bootstrap_n=0),
-                  clusters={"h1": "h1", "h2": "h2"})
+    out = explain(df, "A", cfg, clusters={"h1": "h1", "h2": "h2"})
     top = out.sort_values("contribution", ascending=False).iloc[0]
     assert top["rater"] == "h1"
     assert top["weight"] == out["weight"].max()
+    robust_score = score(df, cfg, clusters={"h1": "h1", "h2": "h2"}
+                          ).set_index("ratee").loc["A", "robust_score"]
+    marked = out[out["is_median_vote"]]
+    assert not marked.empty
+    assert math.isclose(marked["score"].median(), robust_score)
+    assert marked["rater"].tolist() == ["h1"]
+
+    # (b) reviewer's example: one tag, three votes -- a (score 0.1, weight 1.0),
+    # b (score 0.5, weight 0.1), c (score 0.9, weight 1.0). weighted median of
+    # [0.1, 0.5, 0.9] under [1.0, 0.1, 1.0] is 0.5 -> only rater b is selected.
+    df2 = records_factory([
+        dict(rater="a", ratee="B", value=10, scale="d2", evidence_level=3, tag="quality"),
+        dict(rater="b", ratee="B", value=50, scale="d2", evidence_level=0, tag="quality"),
+        dict(rater="c", ratee="B", value=90, scale="d2", evidence_level=3, tag="quality"),
+    ])
+    out2 = explain(df2, "B", Config(bootstrap_n=0))
+    robust_score2 = score(df2, Config(bootstrap_n=0)).set_index("ratee").loc["B", "robust_score"]
+    assert math.isclose(robust_score2, 0.5)
+    assert out2.loc[out2["is_median_vote"], "rater"].tolist() == ["b"]
+    assert int(out2["is_median_vote"].sum()) == 1
 
 
 def test_ratee_int_accepted(records_factory):

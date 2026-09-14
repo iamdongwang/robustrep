@@ -3,7 +3,7 @@ import pytest
 
 from robustrep.aggregate import (
     Aggregator, WeightedMedian, _bootstrap_ci, _bootstrap_draws, _weighted_median_sorted,
-    bootstrap_ci, weighted_median,
+    bootstrap_ci, weighted_median, weighted_median_index,
 )
 from robustrep.config import Config
 
@@ -174,6 +174,45 @@ def test_bootstrap_degenerate_raises():
 def test_ndim_rejected():
     with pytest.raises(ValueError, match="1-D"):
         weighted_median(np.array([[0.1, 0.2], [0.3, 0.4]]), np.ones((2, 2)))
+
+
+def test_weighted_median_index_matches_value():
+    vals = np.array([0.3, 0.1, 0.9, 0.5, 0.7])
+    weights = np.array([1.0, 2.0, 1.0, 3.0, 1.0])
+    idx = weighted_median_index(vals, weights)
+    assert vals[idx] == weighted_median(vals, weights)
+
+
+def test_weighted_median_index_ties_and_ties_out_of_order():
+    # unsorted input, tie handling must match weighted_median's lower-median
+    # convention (side="left")
+    vals = np.array([0.8, 0.2])
+    weights = np.array([1.0, 1.0])
+    idx = weighted_median_index(vals, weights)
+    assert vals[idx] == 0.2 == weighted_median(vals, weights)
+
+
+def test_weighted_median_index_single_value():
+    vals = np.array([0.42])
+    weights = np.array([0.1])
+    assert weighted_median_index(vals, weights) == 0
+    assert vals[weighted_median_index(vals, weights)] == weighted_median(vals, weights)
+
+
+def test_weighted_median_index_rejects_bad_input():
+    with pytest.raises(ValueError, match="empty"):
+        weighted_median_index(np.array([]), np.array([]))
+    with pytest.raises(ValueError):
+        weighted_median_index(np.array([0.1, 0.2]), np.array([1.0, -1.0]))
+
+
+def test_weighted_median_index_ignores_input_order():
+    vals = np.array([0.3, 0.1, 0.9, 0.5, 0.7])
+    weights = np.array([1.0, 2.0, 1.0, 3.0, 1.0])
+    order = np.array([3, 0, 4, 1, 2])
+    idx1 = weighted_median_index(vals, weights)
+    idx2 = order[weighted_median_index(vals[order], weights[order])]
+    assert vals[idx1] == vals[idx2]
 
 
 def test_from_config():
