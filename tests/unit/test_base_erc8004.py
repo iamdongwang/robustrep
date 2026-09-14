@@ -328,6 +328,50 @@ def test_fill_block_timestamps_falls_back_to_per_block_on_rpcerror(tmp_path):
     assert store.load_records()["ts"].iloc[0] == 1007
 
 
+def test_fill_block_timestamps_accepts_int_timestamp_via_batch(tmp_path):
+    store = Store(tmp_path / "t_int_ts_batch.db")
+    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+    agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+    log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=7)
+    store.upsert_feedback([b.decode_log(log)])
+
+    class IntTsRpc(FakeRpc):
+        def batch(self, calls):
+            self.batch_calls += 1
+            return [{"timestamp": 1000 + int(p[0], 16)} for _, p in calls]  # int, not "0x..." hex
+
+    rpc = IntTsRpc({})
+    n = b.fill_block_timestamps(store, rpc)
+    assert n == 1
+    assert store.load_records()["ts"].iloc[0] == 1007
+
+
+def test_fill_block_timestamps_accepts_int_timestamp_via_fallback(tmp_path):
+    store = Store(tmp_path / "t_int_ts_fallback.db")
+    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+    agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+    log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=9)
+    store.upsert_feedback([b.decode_log(log)])
+
+    class IntTsFallbackRpc(FakeRpc):
+        def batch(self, calls):
+            self.batch_calls += 1
+            raise RpcError("batch endpoint down")
+
+        def call(self, method, params):
+            if method == "eth_getBlockByNumber":
+                self.calls.append((method, params))
+                return {"timestamp": 1000 + int(params[0], 16)}  # int, not "0x..." hex
+            return super().call(method, params)
+
+    rpc = IntTsFallbackRpc({})
+    n = b.fill_block_timestamps(store, rpc)
+    assert n == 1
+    assert store.load_records()["ts"].iloc[0] == 1009
+
+
 def test_fill_block_timestamps_null_block_raises_rpcerror(tmp_path):
     store = Store(tmp_path / "t_nullblock.db")
     data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
