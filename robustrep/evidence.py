@@ -26,7 +26,7 @@ def weights_for(levels: pd.Series, cfg: Config) -> pd.Series:
     Preserves the input index. Raises ValueError if any level is outside
     [0, 1, 2, 3] or null.
     """
-    bad = sorted(set(levels.dropna().astype(int)) - {0, 1, 2, 3})
+    bad = sorted(set(levels.dropna()) - {0, 1, 2, 3})
     if bad:
         raise ValueError(f"evidence_level values {bad} not in [0, 1, 2, 3]")
     if levels.isna().any():
@@ -38,10 +38,10 @@ def weights_for(levels: pd.Series, cfg: Config) -> pd.Series:
 def _verified(h: str, tx_parties: TxParties, parties_lc: set[str]) -> bool:
     try:
         found = tx_parties(h)
+        return bool(found) and bool({a.lower() for a in found if a} & parties_lc)
     except Exception:
         _log.debug("tx_parties(%s) failed; treating as unverified", h, exc_info=True)
         return False
-    return bool(found) and bool({a.lower() for a in found if a} & parties_lc)
 
 
 def classify(uri: Optional[str], fetch_text: FetchText, tx_parties: TxParties, parties: set[str]) -> int:
@@ -63,7 +63,7 @@ def classify(uri: Optional[str], fetch_text: FetchText, tx_parties: TxParties, p
     if not hashes and not TASK_KEY_RE.search(text):
         return 1
     parties_lc = {p.lower() for p in parties if p}
-    for h in dict.fromkeys(hashes):
+    for h in dict.fromkeys(x.lower() for x in hashes):
         if _verified(h, tx_parties, parties_lc):
             return 3
     return 2

@@ -140,3 +140,29 @@ def test_hash_prefix_of_longer_hex_not_matched():
 
 def test_whitespace_uri_is_level0():
     assert classify("   ", lambda u: "x", lambda h: set(), set()) == 0
+
+
+def test_weights_for_rejects_non_integer():
+    with pytest.raises(ValueError, match="not in"):
+        weights_for(pd.Series([3.9]), Config())
+
+
+def test_verified_non_string_member_does_not_crash():
+    result = classify(
+        "https://x", lambda u: f"tx {TX}", lambda h: {12345}, {"0xrater"}
+    )
+    assert result == 2
+
+
+def test_dedupe_hashes_case_insensitive():
+    calls = []
+
+    def tx_parties(h):
+        calls.append(h)
+        return None
+
+    tx_upper = "0x" + "AB" * 32
+    text = f"tx {TX} and {tx_upper}"
+    result = classify("https://x", lambda u: text, tx_parties, {"0xrater"})
+    assert result == 2
+    assert len(calls) == 1
