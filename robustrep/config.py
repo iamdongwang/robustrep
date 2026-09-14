@@ -12,6 +12,7 @@ class Config:
     sybil_window_s: int = 24 * 3600
     sybil_jaccard: float = 0.8
     sybil_max_group: int = 2000  # max raters per ratee considered when generating candidate sybil pairs
+    sybil_max_pairs: int = 5_000_000  # global cap on candidate pairs; cluster_raters fails fast past this
     sybil_flag_share: float = 0.5
     # aggregation
     min_clusters: int = 3
@@ -34,8 +35,10 @@ class Config:
             raise ValueError("bootstrap_n must be >= 0")
         if self.min_clusters < 1:
             raise ValueError("min_clusters must be >= 1")
-        if not 0 <= self.sybil_jaccard <= 1:
-            raise ValueError("sybil_jaccard must be in [0, 1]")
+        if not 0 < self.sybil_jaccard <= 1:
+            raise ValueError("sybil_jaccard must be in (0, 1]")  # 0 would match every pair's Jaccard signal
+        if self.sybil_max_pairs < 1:
+            raise ValueError("sybil_max_pairs must be >= 1")
         if not 0 <= self.sybil_flag_share <= 1:
             raise ValueError("sybil_flag_share must be in [0, 1]")
         if self.sybil_window_s < 0:

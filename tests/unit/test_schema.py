@@ -163,3 +163,12 @@ def test_config_rejects_zero_evidence_weight():
 
     with pytest.raises(ValueError):
         Config(evidence_weights=(0, 0.3, 0.7, 1))
+
+
+def test_config_sybil_pair_and_jaccard_bounds():
+    from robustrep.config import Config
+
+    with pytest.raises(ValueError):
+        Config(sybil_jaccard=0)
+    with pytest.raises(ValueError):
+        Config(sybil_max_pairs=0)
