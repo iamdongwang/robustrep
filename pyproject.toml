@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robustrep"
+version = "0.1.0"
+description = "Robust, transport-agnostic reputation scoring for AI agents"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Dong Wang" }]
+requires-python = ">=3.10"
+dependencies = [
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "eth-abi>=5.0",
+  "eth-hash[pycryptodome]>=0.5",
+  "requests>=2.31",
+  "tabulate>=0.9",
+  "matplotlib>=3.7",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "build", "twine"]
+
+[project.scripts]
+robustrep = "robustrep.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["robustrep*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs network; run weekly, not on every push"]
+addopts = "-m 'not live'"
+
+[tool.coverage.run]
+source = ["robustrep"]
+omit = ["robustrep/cli.py", "robustrep/report/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
