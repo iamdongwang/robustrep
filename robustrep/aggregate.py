@@ -85,7 +85,9 @@ def _bootstrap_ci(
     resample whose weights sum to zero has an undefined weighted median and
     is skipped rather than counted. If fewer than `max(2, n_boot // 10)`
     resamples remain valid, raises ValueError instead of silently reporting
-    a CI built from too few (or zero) samples.
+    a CI built from too few (or zero) samples. Skipping all-zero resamples
+    conditions the CI on non-zero weight; unreachable in-pipeline since
+    Config forbids zero weights.
     """
     n = len(values)
     rng = np.random.default_rng(seed)

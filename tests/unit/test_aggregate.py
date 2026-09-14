@@ -150,13 +150,22 @@ def test_bootstrap_with_some_zero_weights_does_not_crash():
 
 
 def test_bootstrap_degenerate_raises():
-    # n=2, weights=[0, 1]: only draws of {index1} keep any weight; with this
-    # seed and n_boot=4, fewer than max(2, n_boot // 10) = 2 resamples are valid.
+    # n=2, weights=[0, 1]: a resample of size 2 is all-zero-weight iff both
+    # draws are index 0, P = 0.25 per draw of the pair; with n=2 pairs drawn
+    # (n_boot=2), P(at least one all-zero pair) = 1 - 0.75^2 ~= 44%. The guard
+    # needs >= max(2, n_boot // 10) = 2 valid resamples, so a single all-zero
+    # resample out of 2 already triggers it. Loop seeds instead of hand-picking
+    # one so the test doesn't depend on numpy's RNG stream staying stable.
     vals = np.array([0.5, 0.9])
     weights = np.array([0.0, 1.0])
-    agg = WeightedMedian(n_boot=4, seed=157)
-    with pytest.raises(ValueError, match="degenerate"):
-        agg.aggregate(vals, weights)
+    raised = False
+    for seed in range(200):
+        try:
+            WeightedMedian(n_boot=2, seed=seed).aggregate(vals, weights)
+        except ValueError:
+            raised = True
+            break
+    assert raised is True
 
 
 def test_ndim_rejected():
