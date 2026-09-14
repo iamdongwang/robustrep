@@ -89,6 +89,23 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     return _weighted_median_sorted(values[order], weights[order])
 
 
+def weighted_median_index(values: np.ndarray, weights: np.ndarray) -> int:
+    """Return the *original* index of the element `weighted_median` would return.
+
+    Same validation, stable sort, and tie tolerance as `weighted_median` (see
+    `_validate` and `_weighted_median_sorted`) -- `values[weighted_median_index(values,
+    weights)] == weighted_median(values, weights)` always holds. Useful when a caller
+    needs to know *which* input element was selected (e.g. `explain()` marking the
+    vote/tag chosen by the weighted-median chain), not just its value.
+    """
+    values, weights = _validate(values, weights, "weighted_median_index")
+    order = np.argsort(values, kind="stable")
+    cum = np.cumsum(weights[order])
+    half = 0.5 * cum[-1]
+    pos = np.searchsorted(cum, half * (1 - _TIE_EPS), side="left")
+    return int(order[pos])
+
+
 def _bootstrap_draws(
     v_sorted: np.ndarray,
     w_sorted: np.ndarray,
