@@ -225,6 +225,8 @@ def test_fetch_rpc_url_and_confirmations_reach_config(tmp_path, monkeypatch):
 
     def _capture_sync(store, rpc, chunk=None, end_block=None, confirmations=None):
         seen["confirmations"] = confirmations
+        seen["chunk"] = chunk
+        seen["end_block"] = end_block
         return 0
 
     monkeypatch.setattr(cli.base, "sync_feedback", _capture_sync)
@@ -238,6 +240,30 @@ def test_fetch_rpc_url_and_confirmations_reach_config(tmp_path, monkeypatch):
     assert r.exit_code == 0, r.output
     assert seen["urls"] == ["https://a.example", "https://b.example"]
     assert seen["confirmations"] == 5
+
+
+def test_fetch_to_block_and_chunk_reach_sync_feedback(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    seen = {}
+
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+
+    def _capture_sync(store, rpc, chunk=None, end_block=None, confirmations=None):
+        seen["chunk"] = chunk
+        seen["end_block"] = end_block
+        return 0
+
+    monkeypatch.setattr(cli.base, "sync_feedback", _capture_sync)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owner_of", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--to-block", "123", "--chunk", "500"])
+    assert r.exit_code == 0, r.output
+    assert seen["end_block"] == 123
+    assert seen["chunk"] == 500
 
 
 def test_fetch_warns_when_block_timestamps_still_missing(tmp_path, monkeypatch):
@@ -302,7 +328,10 @@ def test_fetch_keyboard_interrupt_propagates(tmp_path, monkeypatch):
 # --- global options / help -----------------------------------------------------
 
 
-def test_verbose_flag_sets_info_logging(tmp_path, monkeypatch):
+def test_verbose_flag_sets_debug_logging(tmp_path, monkeypatch):
+    # DEBUG, not INFO: _rpc_guard's "re-run with --verbose for detail" message
+    # promises that --verbose actually surfaces the DEBUG-level detail rpc.py
+    # and _rpc_guard log on an RpcError -- INFO would not.
     db = tmp_path / "t.db"
     _seed(db, n=1)
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
@@ -314,7 +343,7 @@ def test_verbose_flag_sets_info_logging(tmp_path, monkeypatch):
 
     r = runner.invoke(app, ["--verbose", "fetch", "--db", str(db)])
     assert r.exit_code == 0, r.output
-    assert logging.getLogger("robustrep").level == logging.INFO
+    assert logging.getLogger("robustrep").level == logging.DEBUG
 
 
 def test_help_lists_fetch_and_score():
@@ -641,10 +670,16 @@ def test_fetch_eta_branch_prints_estimate(tmp_path, monkeypatch):
     assert "ETA" in r.output
 
 
-def test_step_raters_calls_distinct_clients_once(tmp_path, monkeypatch):
+def test_step_raters_with_real_enrich_raters_queries_distinct_clients_once(tmp_path, monkeypatch):
+    # Uses the REAL enrich_raters (not a stub) to prove _step_raters's
+    # `addresses=targets` actually reaches it and is honored: enrich_raters
+    # only calls store.distinct_clients() itself when NOT given `addresses`
+    # (see robustrep.sources.rater_profile.enrich_raters), so if the CLI's
+    # own single call plus enrich_raters's were both happening, this would
+    # count 2, not 1.
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
     db = tmp_path / "t.db"
     _seed_unprofiled(db, n=1)
-    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
 
     with Store(db) as store:
         calls = []
@@ -655,8 +690,9 @@ def test_step_raters_calls_distinct_clients_once(tmp_path, monkeypatch):
             return orig()
 
         store.distinct_clients = _counting
-        cli._step_raters(store, None)
+        summary = cli._step_raters(store, None)  # no key -> fallback mode
     assert len(calls) == 1
+    assert "raters profiled: 1" in summary
 
 
 def test_default_rps_exported_and_used_by_cli():
