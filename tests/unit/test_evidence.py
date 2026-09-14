@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from robustrep.config import Config
 from robustrep.evidence import classify, weights_for
@@ -82,4 +83,60 @@ def test_classify_mixed_case_hash_matches():
     result = classify(
         "https://x", lambda u: f"tx {tx_upper}", lambda h: None, {"0xrater"}
     )
-    assert result >= 2
+    assert result == 2
+
+
+def test_duplicate_hashes_looked_up_once():
+    calls = []
+
+    def tx_parties(h):
+        calls.append(h)
+        return None
+
+    result = classify(
+        "https://x", lambda u: f"tx {TX} {TX} {TX}", tx_parties, {"0xrater"}
+    )
+    assert result == 2
+    assert calls == [TX]
+
+
+def test_tx_parties_with_none_member_does_not_crash():
+    result = classify(
+        "https://x",
+        lambda u: f"tx {TX}",
+        lambda h: {"0xrater", None},
+        {"0xrater"},
+    )
+    assert result == 3
+
+
+def test_parties_with_none_ignored():
+    result = classify(
+        "https://x",
+        lambda u: f"tx {TX}",
+        lambda h: {"0xrater"},
+        {None, "0xrater"},
+    )
+    assert result == 3
+
+
+def test_weights_for_rejects_out_of_domain():
+    with pytest.raises(ValueError, match="not in"):
+        weights_for(pd.Series([0, 7]), Config())
+    with pytest.raises(ValueError, match="null"):
+        weights_for(pd.Series([1, None]), Config())
+
+
+def test_weights_for_preserves_index():
+    w = weights_for(pd.Series([0, 3], index=["x", "y"]), Config())
+    assert list(w.index) == ["x", "y"]
+
+
+def test_hash_prefix_of_longer_hex_not_matched():
+    text = "0x" + "a" * 65
+    result = classify("https://x", lambda u: text, lambda h: set(), set())
+    assert result == 1
+
+
+def test_whitespace_uri_is_level0():
+    assert classify("   ", lambda u: "x", lambda h: set(), set()) == 0
