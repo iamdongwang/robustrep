@@ -2,7 +2,15 @@ import logging
 
 import requests
 
-from robustrep.sources.rater_profile import EtherscanClient, client_from_env, enrich_raters, estimate_seconds
+from robustrep.sources.rater_profile import (
+    BLOCKSCOUT_BASE,
+    EtherscanClient,
+    EtherscanPlanError,
+    client_from_env,
+    default_client,
+    enrich_raters,
+    estimate_seconds,
+)
 from robustrep.store import Store
 
 FB = dict(chain="base", tx_hash="0x", value="1", value_decimals=0, tag1="", tag2="", endpoint="",
@@ -126,6 +134,75 @@ def test_first_tx_never_logs_params(caplog):
     with caplog.at_level(logging.DEBUG):
         c.first_tx("0xA")
     assert "SECRET-KEY" not in caplog.text
+
+
+# --- EtherscanClient.blockscout(): keyless Base Blockscout endpoint ---------------
+
+
+def test_blockscout_request_has_no_chainid_or_apikey_and_hits_blockscout_url():
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "42502816", "timeStamp": "1771794979",
+                                                   "from": "0x6463"}]}])
+    c = EtherscanClient.blockscout(session=http, sleep=lambda _: None)
+    assert c.first_tx("0xA") == (42502816, 1771794979, "0x6463")
+    assert http.calls[0] == {"module": "account", "action": "txlist", "address": "0xa",
+                              "page": 1, "offset": 1, "sort": "asc"}
+    assert "chainid" not in http.calls[0]
+    assert "apikey" not in http.calls[0]
+
+
+def test_blockscout_client_has_no_key_and_targets_blockscout_base_url():
+    c = EtherscanClient.blockscout(sleep=lambda _: None)
+    assert c.key is None
+    assert c.chain_id is None
+    assert c.base_url == BLOCKSCOUT_BASE
+    assert c.source == "blockscout"
+
+
+def test_blockscout_empty_result_returns_none_like_etherscan():
+    c = EtherscanClient.blockscout(
+        session=FakeHttp([{"status": "0", "message": "No transactions found", "result": []}]),
+        sleep=lambda _: None)
+    assert c.first_tx("0xA") is None
+
+
+def test_default_client_etherscan_still_sends_chainid_and_apikey():
+    c = default_client("etherscan", "KEY")
+    assert c.source == "etherscan"
+    assert c.chain_id == 8453
+    assert c.key == "KEY"
+    assert c.base_url == EtherscanClient(api_key="KEY").base_url
+
+
+# --- malformed address: ValueError, not None ---------------------------------------
+
+
+def test_first_tx_invalid_address_format_raises_value_error_naming_address():
+    http = FakeHttp([{"message": "Invalid address format", "result": None, "status": "0"}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    try:
+        c.first_tx("0xBAD")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "0xbad" in str(e).lower()
+        assert "invalid address" in str(e).lower()
+    assert len(http.calls) == 1  # non-retryable: no retry burned
+
+
+# --- unsupported plan (e.g. Etherscan free plan on Base): non-retryable ------------
+
+
+def test_first_tx_free_plan_unsupported_chain_raises_plan_error_mentioning_plan():
+    http = FakeHttp([{"status": "0", "message": "NOTOK",
+                       "result": "Free API access is not supported for this chain, "
+                                 "please subscribe to a plan"}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    try:
+        c.first_tx("0xA")
+        assert False, "expected EtherscanPlanError"
+    except EtherscanPlanError as e:
+        assert isinstance(e, RuntimeError)
+        assert "plan" in str(e).lower()
+    assert len(http.calls) == 1  # non-retryable: no retry burned
 
 
 # --- transient errors: retried with backoff, throttle in finally ------------------
@@ -385,6 +462,92 @@ def test_enrich_with_client_is_idempotent(tmp_path):
     assert enrich_raters(s, c) == 0
 
 
+# --- enrich_raters: blockscout mode ---------------------------------------------------
+
+
+def test_enrich_with_blockscout_client_sets_blockscout_mode(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa")])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+    c = EtherscanClient.blockscout(session=http, sleep=lambda _: None)
+    assert enrich_raters(s, c) == 1
+    m = s.load_rater_meta().iloc[0]
+    assert m["first_seen_ts"] == 99 and m["funder"] == "0xf"
+    assert s.get_sync("rater_profile_mode") == "blockscout"
+
+
+def test_enrich_with_blockscout_client_partial_failure_sets_blockscout_partial_mode(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1)])
+
+    class FlakyBlockscoutClient:
+        source = "blockscout"
+
+        def first_tx(self, address):
+            if address == "0xb":
+                raise RuntimeError("boom")
+            return (1, 100, "0xf")
+
+    try:
+        enrich_raters(s, FlakyBlockscoutClient())
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    assert s.get_sync("rater_profile_mode") == "blockscout-partial"
+
+
+# --- enrich_raters: EtherscanPlanError aborts on the first address -----------------
+
+
+def test_enrich_aborts_immediately_when_first_address_hits_plan_error(tmp_path):
+    from robustrep.sources.rater_profile import EtherscanPlanError
+
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1), fb("0xc", log_index=2)])
+
+    calls = []
+
+    class PlanRejectedClient:
+        def first_tx(self, address):
+            calls.append(address)
+            raise EtherscanPlanError(f"Etherscan plan does not support this chain for {address}")
+
+    try:
+        enrich_raters(s, PlanRejectedClient())
+        assert False, "expected EtherscanPlanError"
+    except EtherscanPlanError as e:
+        assert "plan" in str(e).lower()
+    # Only the first address was attempted -- no burning through the rest.
+    assert len(calls) == 1
+    assert len(s.load_rater_meta()) == 0
+    # Aborted before any mode was recorded for this run.
+    assert s.get_sync("rater_profile_mode") is None
+
+
+def test_enrich_plan_error_on_later_address_is_a_regular_failure(tmp_path):
+    from robustrep.sources.rater_profile import EtherscanPlanError
+
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1)])
+
+    class PlanRejectedOnSecondClient:
+        source = "etherscan"
+
+        def first_tx(self, address):
+            if address == "0xb":
+                raise EtherscanPlanError(f"Etherscan plan does not support this chain for {address}")
+            return (1, 100, "0xf")
+
+    try:
+        enrich_raters(s, PlanRejectedOnSecondClient())
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "0xb" in str(e)
+    meta = s.load_rater_meta()
+    assert set(meta["rater"]) == {"0xa"}
+    assert s.get_sync("rater_profile_mode") == "etherscan-partial"
+
+
 # --- enrich_raters: fallback mode (no client) -- no sticky rows ---------------------
 
 
@@ -493,3 +656,47 @@ def test_client_from_env(monkeypatch):
     assert isinstance(c, EtherscanClient) and c.key == "abc123"
     monkeypatch.setenv("ETHERSCAN_API_KEY", "  ")
     assert client_from_env() is None
+
+
+# --- default_client: --profile-source propagation -----------------------------------
+
+
+def test_default_client_none_returns_no_client():
+    assert default_client("none", "KEY") is None
+    assert default_client("none", None) is None
+
+
+def test_default_client_blockscout_ignores_any_key():
+    c = default_client("blockscout", "KEY")
+    assert c.source == "blockscout" and c.key is None and c.chain_id is None
+
+
+def test_default_client_etherscan_uses_given_key():
+    c = default_client("etherscan", "KEY")
+    assert c.source == "etherscan" and c.key == "KEY"
+
+
+def test_default_client_etherscan_without_key_raises_value_error():
+    try:
+        default_client("etherscan", None)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "etherscan" in str(e).lower()
+
+
+def test_default_client_auto_with_key_uses_etherscan():
+    c = default_client("auto", "KEY")
+    assert c.source == "etherscan" and c.key == "KEY"
+
+
+def test_default_client_auto_without_key_uses_blockscout():
+    c = default_client("auto", None)
+    assert c.source == "blockscout"
+
+
+def test_default_client_unknown_source_raises_value_error():
+    try:
+        default_client("bogus", None)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "bogus" in str(e)
