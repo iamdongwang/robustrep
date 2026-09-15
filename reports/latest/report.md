@@ -29,7 +29,8 @@ Data cut at block 51322403. Ratings: 476234 (87 revoked, excluded below). Agents
 ![Fig 5. Ranking stability](fig5_sensitivity.png)
 
 ## Sensitivity
-Rank stability of the top-N robust-score ranking under reasonable parameter perturbations (evidence-weight shape, sybil Jaccard threshold, sybil time window), each vs the base configuration -- Spearman's rho, computed as the Pearson correlation of the two rank sequences (no scipy dependency). A blank cell means too few ratees overlapped with the base top-N to define a correlation at all.
+Rank stability of the top-N robust-score ranking under reasonable parameter perturbations (evidence-weight shape, sybil Jaccard threshold, sybil time window), each vs the base configuration. Top sets are tie-inclusive (every agent scoring >= the N-th highest score). `top_set_jaccard` is the primary stability measure: the overlap of the base and variant top sets. Spearman's rho (Pearson correlation of average ranks over the union of the two top sets, no scipy dependency) is reported for completeness; a blank cell means one run ranked the whole union as a single tie while the other did not (zero variance on one side, so no correlation is defined).
+1090 of the 4964 scored agents tie at the top score (1.000), against a base top set of 1090. The top set is essentially one tie block in which every member holds the same rank, and Spearman's rho is therefore uninformative on this data: any value is driven by the few agents outside the block, and a value near 0 reflects tie order, not a ranking change. Read `top_set_jaccard`.
 
 | variant         |   spearman_union |   spearman_top |   top_set_jaccard |   top_set_size |
 |:----------------|-----------------:|---------------:|------------------:|---------------:|
