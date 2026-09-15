@@ -132,6 +132,22 @@ def _top_tie_block_lines(scored: pd.DataFrame, sensitivity: pd.DataFrame) -> lis
     return [text]
 
 
+def _budget_limited_variant_lines(sensitivity: pd.DataFrame) -> list:
+    """One sentence explaining the sensitivity table's `budget_limited` column,
+    or [] for a table that has no such column (an older//custom caller).
+
+    Each variant re-clusters from scratch, so a variant can hit a sybil pair
+    budget the base run did not; its row then measures the budget, not the
+    parameter, and must not be read as a parameter effect.
+    """
+    if "budget_limited" not in sensitivity.columns:
+        return []
+    return ["A variant whose `budget_limited` is True hit a sybil pair budget while clustering "
+            "(each variant re-clusters from scratch, and a wider sybil window generates more "
+            "candidate pairs), so its row may reflect the budget rather than the parameter being "
+            "varied; compare it against the base row's own `budget_limited`."]
+
+
 def _budget_limit_lines(scores: pd.DataFrame) -> list:
     """The budget-limited-clustering bullet, or [] when nothing was skipped (or
     the caller attached no stats at all).
@@ -228,6 +244,7 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
               "ranked the whole union as a single tie while the other did not (zero variance "
               "on one side, so no correlation is defined).",
               *_top_tie_block_lines(scored, sensitivity),
+              *_budget_limited_variant_lines(sensitivity),
               "", _markdown_table(sensitivity), ""]
 
     lines += ["## Adversarial evidence",

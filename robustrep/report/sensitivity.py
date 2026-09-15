@@ -24,7 +24,7 @@ import pandas as pd  # noqa: E402
 
 from ..config import Config  # noqa: E402
 from ..pipeline import score  # noqa: E402
-from ..sybil import cluster_raters, profiles_from_records  # noqa: E402
+from ..sybil import cluster_raters_with_stats, profiles_from_records  # noqa: E402
 
 # The 9 variants required by the report (spec Sec 5.5b): base plus four axes
 # (evidence-weight shape, sybil Jaccard threshold, sybil time window,
@@ -44,13 +44,21 @@ VARIANTS = {
 }
 
 
-def _scored_series(records: pd.DataFrame, cfg: Config, meta: Optional[pd.DataFrame]) -> pd.Series:
-    """`robust_score` indexed by `ratee`, scored agents only (`insufficient`
-    ratees are dropped -- they never had enough independent evidence for a
-    score to mean anything, tie-inclusive or not)."""
-    clusters = cluster_raters(profiles_from_records(records, meta), cfg)
+def _scored_series(records: pd.DataFrame, cfg: Config,
+                   meta: Optional[pd.DataFrame]) -> tuple[pd.Series, bool]:
+    """(`robust_score` indexed by `ratee`, was-clustering-budget-limited).
+
+    Scored agents only (`insufficient` ratees are dropped -- they never had
+    enough independent evidence for a score to mean anything, tie-inclusive or
+    not). Every variant re-clusters from scratch, and a variant can hit a sybil
+    pair budget the base run did not (`window_72h` widens the window, which
+    multiplies candidate pairs), so each run reports whether its clustering was
+    budget-limited -- a ranking change that is really a budget artefact must
+    not read as a parameter effect.
+    """
+    clusters, stats = cluster_raters_with_stats(profiles_from_records(records, meta), cfg)
     s = score(records, cfg, clusters=clusters).dropna(subset=["robust_score"])
-    return s.set_index("ratee")["robust_score"]
+    return s.set_index("ratee")["robust_score"], stats.budget_limited
 
 
 def _tie_inclusive_top(scores: pd.Series, top_n: int) -> set:
@@ -130,13 +138,15 @@ def sensitivity_table(records: pd.DataFrame, cfg: Config, meta: Optional[pd.Data
 
     Columns: `variant`, `spearman_union` (see `tie_aware_sensitivity`),
     `spearman_top` (an alias of `spearman_union`, kept for `fig_sensitivity`
-    and older callers), `top_set_jaccard`, `top_set_size`.
+    and older callers), `top_set_jaccard`, `top_set_size`, and
+    `budget_limited` -- True when THAT variant's clustering hit a sybil pair
+    budget, so its row may be measuring the budget rather than the parameter.
     """
     cfg = replace(cfg, bootstrap_n=0)
-    base_scores = _scored_series(records, cfg, meta)
+    base_scores, _ = _scored_series(records, cfg, meta)
     rows = []
     for name, kw in VARIANTS.items():
-        variant_scores = _scored_series(records, replace(cfg, **kw), meta)
+        variant_scores, budget_limited = _scored_series(records, replace(cfg, **kw), meta)
         result = tie_aware_sensitivity(base_scores, variant_scores, top_n)
         rows.append(dict(
             variant=name,
@@ -144,6 +154,7 @@ def sensitivity_table(records: pd.DataFrame, cfg: Config, meta: Optional[pd.Data
             spearman_top=result["spearman_union"],
             top_set_jaccard=result["top_set_jaccard"],
             top_set_size=result["top_set_size"],
+            budget_limited=budget_limited,
         ))
     return pd.DataFrame(rows)
 

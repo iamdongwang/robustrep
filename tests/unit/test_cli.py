@@ -1301,3 +1301,60 @@ def test_report_sensitivity_value_error_exits_1_not_traceback(tmp_path, monkeypa
     assert r.exit_code == 1, r.output
     assert "ERROR: sensitivity blew up" in r.output
     assert r.exception is None or isinstance(r.exception, SystemExit)
+
+
+# --- cluster stats in provenance / scores.json, and the score summary note ----
+
+
+def test_report_scores_json_carries_cluster_stats(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+    data = json.loads((out_dir / "latest" / "scores.json").read_text())
+    stats = data["cluster_stats"]
+    assert set(stats) == {"pairs_tested", "ratees_skipped_size", "ratees_skipped_budget", "truncated"}
+    assert stats["truncated"] is False
+
+
+def test_provenance_cluster_stats_empty_without_a_scored_frame(tmp_path):
+    from robustrep import Config
+
+    db = tmp_path / "t.db"
+    _seed(db)
+    with Store(db) as store:
+        records = store.load_records()
+    assert cli._provenance("onchain", Config(), records)["cluster_stats"] == {}
+
+
+def test_score_summary_notes_budget_limited_clustering(tmp_path):
+    db, out = tmp_path / "t.db", tmp_path / "scores.csv"
+    _seed(db)
+    r = runner.invoke(app, ["score", "--db", str(db), "--out", str(out), "--bootstrap-n", "5",
+                            "--sybil-max-pairs", "1"])
+    assert r.exit_code == 0, r.output
+    assert "clustering budget-limited" in r.output
+
+
+def test_score_summary_has_no_budget_note_on_a_healthy_run(tmp_path):
+    db, out = tmp_path / "t.db", tmp_path / "scores.csv"
+    _seed(db)
+    r = runner.invoke(app, ["score", "--db", str(db), "--out", str(out), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+    assert "budget-limited" not in r.output
+
+
+def test_report_min_clusters_reaches_config(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db)
+    seen = _capture_cfg(monkeypatch)
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(tmp_path / "reports"),
+                            "--bootstrap-n", "5", "--min-clusters", "2"])
+    assert r.exit_code == 0, r.output
+    assert seen["cfg"].min_clusters == 2
+
+
+def test_report_rejects_non_positive_min_clusters(tmp_path):
+    r = runner.invoke(app, ["report", "--db", str(tmp_path / "t.db"), "--min-clusters", "0"])
+    assert r.exit_code == 2

@@ -363,8 +363,16 @@ _SYBIL_MAX_PAIRS_OPT = typer.Option(
          "(raters may be under-merged); it never fails the run.")
 _SYBIL_MAX_PAIRS_PER_RATEE_OPT = typer.Option(
     Config().sybil_max_pairs_per_ratee, "--sybil-max-pairs-per-ratee", min=1,
-    help="Per-ratee-block budget of candidate sybil pairs. A block over it is abandoned "
-         "part-way (its raters may be under-merged); it never fails the run.")
+    help="Per-ratee-block budget of candidate sybil pairs examined. A block over it is "
+         "abandoned part-way (its raters may be under-merged); it never fails the run. Each "
+         "abandoned block logs a WARNING, so a very small value can emit up to "
+         "sybil_max_pairs/sybil_max_pairs_per_ratee of them per clustering pass.")
+
+# Shared by `score` and `report` for the same no-drift reason as the sybil
+# options above: both commands score, so both must expose the same threshold.
+_MIN_CLUSTERS_OPT = typer.Option(
+    Config().min_clusters, "--min-clusters", min=1,
+    help="Minimum distinct rater clusters required to score a ratee.")
 
 
 @app.command()
@@ -373,8 +381,7 @@ def score(
     out: Path = typer.Option(Path("scores.csv"), help="CSV path to write results to."),
     bootstrap_n: int = typer.Option(
         Config().bootstrap_n, min=0, help="Bootstrap resamples for the confidence interval."),
-    min_clusters: int = typer.Option(
-        Config().min_clusters, min=1, help="Minimum distinct rater clusters required to score a ratee."),
+    min_clusters: int = _MIN_CLUSTERS_OPT,
     sybil_max_group: int = _SYBIL_MAX_GROUP_OPT,
     sybil_max_pairs: int = _SYBIL_MAX_PAIRS_OPT,
     sybil_max_pairs_per_ratee: int = _SYBIL_MAX_PAIRS_PER_RATEE_OPT,
@@ -416,9 +423,12 @@ def score(
     n_scored = int((result["insufficient"] == 0).sum())
     n_insufficient = int((result["insufficient"] == 1).sum())
     n_sybil = int(result["sybil_flag"].sum())
+    # Say it on the summary line too: `score` writes no report, so this is the
+    # only place a budget-limited (under-merged) run is visible to its user.
+    budget_note = ", clustering budget-limited" if stats.budget_limited else ""
     typer.echo(
         f"scored {n_scored} ratee(s), {n_insufficient} insufficient, {n_sybil} sybil-flagged "
-        f"-> {out} (rater profile mode: {mode})")
+        f"-> {out} (rater profile mode: {mode}){budget_note}")
 
 
 # Figure titles (heading text) -> file names, in report order. Titles are what
@@ -459,6 +469,19 @@ def _norm_rule_counts_for_provenance(result: Optional[pandas.DataFrame]) -> dict
     return {str(rule): int(n) for rule, n in result.attrs.get("norm_rule_counts", {}).items()}
 
 
+def _cluster_stats_for_provenance(result: Optional[pandas.DataFrame]) -> dict:
+    """The run's `ClusterStats` as a plain dict, read off the scored frame's
+    ``attrs`` (stamped by `score`/`report`).
+
+    Published next to `config` so a consumer diffing two exports can tell a
+    real change from one caused by a budget-limited clustering pass. ``{}``
+    when no scored frame is supplied.
+    """
+    if result is None:
+        return {}
+    return dict(result.attrs.get("cluster_stats", {}))
+
+
 def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
                 result: Optional[pandas.DataFrame] = None) -> dict:
     config = dict(
@@ -480,6 +503,7 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         rater_profile_mode=mode,
         confirmations=cfg.confirmations,
         config=config,
+        cluster_stats=_cluster_stats_for_provenance(result),
         versions={"robustrep": __version__, "numpy": numpy.__version__, "pandas": pandas.__version__},
     )
 
@@ -496,7 +520,8 @@ def _write_report(target: Path, result, records, clusters, sens, adv, block: int
     md = render_markdown(result, records, block=block, figures=_FIGURES, sensitivity=sens,
                          adversarial=adv, provenance=provenance)
     (target / "report.md").write_text(md)
-    export_json(result, block=block, out=target / "scores.json", config=provenance.get("config"))
+    export_json(result, block=block, out=target / "scores.json", config=provenance.get("config"),
+                cluster_stats=provenance.get("cluster_stats"))
 
 
 def _publish_latest(out_dir: Path, block_dir: Path) -> None:
@@ -532,6 +557,7 @@ def report(
     top_n: int = typer.Option(
         100, min=1, help="Top-N ratees (by naive mean / robust score) considered for the "
                          "rank-shift and sensitivity figures."),
+    min_clusters: int = _MIN_CLUSTERS_OPT,
     sybil_max_group: int = _SYBIL_MAX_GROUP_OPT,
     sybil_max_pairs: int = _SYBIL_MAX_PAIRS_OPT,
     sybil_max_pairs_per_ratee: int = _SYBIL_MAX_PAIRS_PER_RATEE_OPT,
@@ -548,8 +574,8 @@ def report(
     NOT such a rejection: clustering degrades (see `robustrep.sybil`) and the
     report states what was skipped under "Limitations".
     """
-    cfg = _scoring_config(bootstrap_n=bootstrap_n, sybil_max_group=sybil_max_group,
-                          sybil_max_pairs=sybil_max_pairs,
+    cfg = _scoring_config(bootstrap_n=bootstrap_n, min_clusters=min_clusters,
+                          sybil_max_group=sybil_max_group, sybil_max_pairs=sybil_max_pairs,
                           sybil_max_pairs_per_ratee=sybil_max_pairs_per_ratee)
 
     try:

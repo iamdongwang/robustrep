@@ -500,6 +500,17 @@ def test_render_markdown_budget_bullet_says_no_when_global_budget_untouched(reco
             "pair budget, global pair budget reached: no (7 pairs tested).") in md
 
 
+def test_render_markdown_budget_bullet_on_truncation_alone(records_factory):
+    """`truncated` on its own -- no ratee block skipped either way -- is still a
+    budget-limited run and still has to be stated."""
+    rec, sc = _data(records_factory)
+    sc = _with_cluster_stats(sc, pairs_tested=9, truncated=True)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
+    assert ("Sybil clustering was budget-limited: 0 ratee block(s) skipped for size "
+            "(> sybil_max_group), 0 for the per-ratee pair budget, global pair budget "
+            "reached: yes (9 pairs tested).") in md
+
+
 def test_render_markdown_no_budget_bullet_when_every_counter_is_zero(records_factory):
     rec, sc = _data(records_factory)
     sc = _with_cluster_stats(sc, pairs_tested=12)
@@ -512,3 +523,52 @@ def test_render_markdown_without_cluster_stats_has_no_budget_bullet(records_fact
     assert "cluster_stats" not in sc.attrs
     md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
     assert "budget-limited" not in md
+
+
+# --- sensitivity budget flag and scores.json cluster_stats (I5) ---------------
+
+
+def test_sensitivity_table_flags_budget_limited_variants(records_factory):
+    """Every variant re-clusters, so each one can hit a pair budget on its own
+    (window_72h widens the window and triples the candidate pairs). The table
+    has to say which ones did."""
+    records, meta = _sensitivity_data(records_factory)
+    healthy = sensitivity_table(records, Config(bootstrap_n=0), meta=meta, top_n=5)
+    assert "budget_limited" in healthy.columns
+    assert not healthy["budget_limited"].any()
+
+    starved = sensitivity_table(records, Config(bootstrap_n=0, sybil_max_pairs=1), meta=meta, top_n=5)
+    assert starved["budget_limited"].all()
+
+
+def test_render_markdown_explains_budget_limited_sensitivity_column(records_factory):
+    rec, sc = _data(records_factory)
+    sens = pd.DataFrame([dict(variant="base", spearman_top=1.0, budget_limited=False),
+                         dict(variant="window_72h", spearman_top=0.9, budget_limited=True)])
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=sens)
+    section = md.split("## Sensitivity")[1].split("## Adversarial")[0]
+    assert "budget_limited" in section
+    assert "rather than the parameter" in section
+
+
+def test_render_markdown_omits_budget_column_prose_without_the_column(records_factory):
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
+    section = md.split("## Sensitivity")[1].split("## Adversarial")[0]
+    assert "budget_limited" not in section
+
+
+def test_export_json_carries_cluster_stats(tmp_path, records_factory):
+    rec, sc = _data(records_factory)
+    stats = {"pairs_tested": 7, "ratees_skipped_size": 1, "ratees_skipped_budget": 0, "truncated": False}
+    p = export_json(sc, block=1, out=tmp_path / "scores.json", config={"bootstrap_n": 5},
+                    cluster_stats=stats)
+    data = json.loads(p.read_text())
+    assert data["cluster_stats"] == stats
+    assert data["schema_version"] == 1  # additive key: consumers reading v1 keep working
+
+
+def test_export_json_cluster_stats_defaults_to_empty(tmp_path, records_factory):
+    rec, sc = _data(records_factory)
+    p = export_json(sc, block=1, out=tmp_path / "scores.json")
+    assert json.loads(p.read_text())["cluster_stats"] == {}
