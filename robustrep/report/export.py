@@ -13,7 +13,11 @@ rather than assumed of every caller upstream:
   into counts -- but "today's columns" is not a property anyone re-checks when
   adding an explain-style field (a "top raters" list, a cluster membership
   dump). The finished JSON text is scanned once and the export fails loudly
-  instead of publishing a de-anonymising row.
+  instead of publishing a de-anonymising row. It is a backstop against an
+  accidental leak, not a sanitizer, and deliberately does not catch: an
+  uppercase `0X` prefix, an address ABI-padded to 32 bytes
+  (`0x` + 24 zeros + 40 hex, which the trailing-hex lookahead rejects), or
+  two addresses concatenated into one 80-hex run.
 - **`versions` names every dependency that can change the numbers**, not just
   the three the scorer imports directly: matplotlib draws the figures the
   report reads from, and requests/urllib3/eth_abi decide which evidence a
@@ -66,10 +70,15 @@ def _module_version(name: str) -> str:
     return str(version) if version else importlib.metadata.version(name)
 
 
-def _versions() -> dict:
+def versions() -> dict:
     """`{name: version}` for robustrep, the interpreter, and every dependency
     in `_VERSIONED_MODULES` -- see the module docstring for why the list is
-    wider than the scorer's own imports."""
+    wider than the scorer's own imports.
+
+    Public because `cli._provenance` renders the same mapping into report.md:
+    two artifacts published from one run must not disagree about the stack
+    that produced them, which they did while each built its own dict.
+    """
     versions = {"robustrep": __version__, "python": platform.python_version()}
     for name in _VERSIONED_MODULES:
         versions[name] = _module_version(name)
@@ -109,7 +118,7 @@ def export_json(scores: pd.DataFrame, block: int, out: Path, config: Optional[di
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "config": config or {},
         "cluster_stats": cluster_stats or {},
-        "versions": _versions(),
+        "versions": versions(),
         "scores": rows,
     }
     text = json.dumps(payload, indent=None)

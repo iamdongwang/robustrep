@@ -639,3 +639,30 @@ def test_render_markdown_ssrf_bullet_states_the_oracle_not_a_blind_request(recor
                    "rebuilt", "robustrep.sources.evidence_fetch"):
         assert phrase in bullet, phrase
     assert "No response content is ever exposed" not in md
+
+
+def test_versions_is_public_and_is_what_export_writes(tmp_path, records_factory):
+    # cli._provenance renders the same mapping into report.md, so the two
+    # published artifacts can never disagree about the stack that made them.
+    from robustrep.report.export import versions
+
+    rec, sc = _data(records_factory)
+    p = export_json(sc, block=1, out=tmp_path / "scores.json")
+    assert json.loads(p.read_text())["versions"] == versions()
+
+
+def test_address_guard_scope_is_exactly_the_documented_one(tmp_path, records_factory):
+    # The guard is a backstop against an accidental future leak, not a
+    # sanitizer: these three shapes are documented as NOT caught, and the
+    # docstring stays honest only if the behaviour is pinned.
+    rec, sc = _data(records_factory)
+    for uncaught in ("0X" + "AB" * 20,                  # uppercase 0X prefix
+                     "0x" + "00" * 12 + "ab" * 20,      # ABI-padded to 32 bytes
+                     "0x" + "ab" * 40):                 # two addresses concatenated
+        frame = sc.copy()
+        frame.loc[0, "ratee"] = uncaught
+        export_json(frame, block=1, out=tmp_path / "scores.json")  # does not raise
+    caught = sc.copy()
+    caught.loc[0, "ratee"] = "0x" + "ab" * 20
+    with pytest.raises(ValueError):
+        export_json(caught, block=1, out=tmp_path / "scores.json")

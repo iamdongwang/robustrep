@@ -25,16 +25,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
 
-import numpy
 import pandas
 import typer
 
-from . import __version__
 from .config import Config
 from .evidence import MAX_TX_LOOKUPS_PER_URI
 from .pipeline import score as score_fn
 from .report.adversarial import scenario_table
-from .report.export import export_json
+from .report.export import export_json, versions
 from .report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
 from .report.render import evidence_level_shares, render_markdown
 from .report.sensitivity import fig_sensitivity, sensitivity_table
@@ -57,18 +55,20 @@ OWNER_LOG_EVERY = 500
 OWNER_BATCH_DEFAULT = 100
 
 # L1 (security review): with `PUBLISHED_FIGURE_GLOB`, everything
-# `_publish_latest` copies out of a block directory into the published
-# `latest/`. That directory is committed and served by GitHub Pages, so
-# publishing is an allowlist, never "everything in the directory": anything
-# else that ever lands next to the report (a debug dump, a scratch CSV, an
-# operator's notes) stays local instead of riding along onto a public CDN.
+# `_publish_latest` copies out of a block directory into `latest/`, which is
+# committed and served by GitHub Pages. An allowlist, never "everything in the
+# directory": anything else that ever lands next to the report (a debug dump,
+# a scratch CSV, an operator's notes) stays local, not on a public CDN.
 PUBLISHED_FILES = ("report.md", "scores.json")
 PUBLISHED_FIGURE_GLOB = "fig*.png"
 
 # sync_state keys recording the two H3 evidence lookup caps a `fetch` run
-# actually used, written by `_step_evidence` and read back by `_provenance`
-# (see `_evidence_caps_for_provenance`).
-EVIDENCE_CAP_KEYS = ("evidence_max_lookups_per_uri", "evidence_max_total_lookups")
+# actually used: written by `_step_evidence`, read by
+# `_evidence_caps_for_provenance`. Named once because a writer and a reader
+# that spell a key differently fail silently (the reader just falls back).
+EVIDENCE_CAP_PER_URI_KEY = "evidence_max_lookups_per_uri"
+EVIDENCE_CAP_TOTAL_KEY = "evidence_max_total_lookups"
+EVIDENCE_CAP_KEYS = (EVIDENCE_CAP_PER_URI_KEY, EVIDENCE_CAP_TOTAL_KEY)
 
 
 class ProfileSource(str, enum.Enum):
@@ -241,28 +241,21 @@ def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
     ``workers`` URIs concurrently.
 
     The two H3 lookup caps are read into local variables once and then used
-    three ways -- both *passed to ``classify_all`` explicitly* (neither is
-    left to a default the callee would re-read), recorded in ``sync_state``
-    under ``EVIDENCE_CAP_KEYS``, and echoed in the returned summary line --
-    so a single source drives what the run did, what it reports and what a
-    later ``report`` publishes. Reading the constants twice (once implicitly
-    via a callee default, once again for the line) could silently drift if
-    the two were ever no longer the same value.
-
-    Recording them is what makes provenance describe *this run* rather than
-    whatever the constants happen to be whenever ``report`` is run: the caps
-    shaped every level this run persisted, and those levels outlive the
-    constants. They are echoed in the summary line too, not just persisted,
-    so a human watching ``fetch`` run sees them without digging up a later
-    ``report``.
+    three ways -- both *passed to ``classify_all`` explicitly* (neither left
+    to a callee default that could silently drift), recorded in ``sync_state``
+    under ``EVIDENCE_CAP_KEYS``, and echoed in the summary line. Recording
+    them is what lets provenance describe *this run* rather than whatever the
+    constants are whenever ``report`` runs: the caps shaped every level this
+    run persisted, and those levels outlive the constants. Echoing them too
+    means a human watching ``fetch`` sees them without digging up a report.
     """
     max_lookups_per_uri = MAX_TX_LOOKUPS_PER_URI
     max_total_lookups = DEFAULT_MAX_TOTAL_LOOKUPS
     n = classify_all(store, tx_parties=lambda h: base.tx_parties(rpc, h), workers=workers,
                       max_total_lookups=max_total_lookups,
                       max_lookups_per_uri=max_lookups_per_uri)
-    store.set_sync("evidence_max_lookups_per_uri", str(max_lookups_per_uri))
-    store.set_sync("evidence_max_total_lookups", str(max_total_lookups))
+    store.set_sync(EVIDENCE_CAP_PER_URI_KEY, str(max_lookups_per_uri))
+    store.set_sync(EVIDENCE_CAP_TOTAL_KEY, str(max_total_lookups))
     return (f"evidence URIs classified: {n} "
             f"(max_lookups_per_uri={max_lookups_per_uri}, max_total_lookups={max_total_lookups})")
 
@@ -565,11 +558,15 @@ def _evidence_caps_for_provenance(store: Optional[Store]) -> dict:
     outlive the constants, so a store fetched under an older cap must keep
     reporting that cap. The fallback covers a store that predates this
     recording, one whose evidence step was skipped, and a hand-edited value
-    that will not parse -- a bad sync_state row degrades one provenance field
-    rather than failing the whole report.
+    that is not a usable cap -- a bad sync_state row degrades one provenance
+    field rather than failing the whole report.
+
+    "Usable" means a positive integer: a recorded ``0`` or negative is a
+    corrupted row (``_step_evidence`` only writes module constants), and
+    publishing it would claim the run did no lookups at all.
     """
-    caps = {"evidence_max_lookups_per_uri": MAX_TX_LOOKUPS_PER_URI,
-            "evidence_max_total_lookups": DEFAULT_MAX_TOTAL_LOOKUPS}
+    caps = {EVIDENCE_CAP_PER_URI_KEY: MAX_TX_LOOKUPS_PER_URI,
+            EVIDENCE_CAP_TOTAL_KEY: DEFAULT_MAX_TOTAL_LOOKUPS}
     if store is None:
         return caps
     for key in EVIDENCE_CAP_KEYS:
@@ -577,9 +574,13 @@ def _evidence_caps_for_provenance(store: Optional[Store]) -> dict:
         if raw is None:
             continue
         try:
-            caps[key] = int(raw)
+            value = int(raw)
         except ValueError:
-            logger.warning("provenance: ignoring unparseable %s=%r in sync_state", key, raw)
+            value = 0
+        if value > 0:
+            caps[key] = value
+        else:
+            logger.warning("provenance: ignoring unusable %s=%r in sync_state", key, raw)
     return caps
 
 
@@ -606,8 +607,7 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         # not user-tunable per this task's scope) but they directly shaped
         # which cached evidence levels are false negatives, so they belong
         # next to evidence_level_shares for a report to be auditable. The
-        # values are the ones the *fetch run* used, read back out of the
-        # store; `None` (no store to read) falls back to the constants.
+        # values are the ones the *fetch run* used, read back out of the store.
         **caps,
         # How many evidence_cache rows are still "lookup-budget:N" as of this
         # report's store snapshot -- see Store.n_lookup_budget_starved.
@@ -621,14 +621,25 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         confirmations=cfg.confirmations,
         config=config,
         cluster_stats=_cluster_stats_for_provenance(result),
-        versions={"robustrep": __version__, "numpy": numpy.__version__, "pandas": pandas.__version__},
+        versions=versions(),
     )
 
 
 def _write_report(target: Path, result, records, clusters, sens, adv, block: int, provenance: dict,
                   top_n: int) -> None:
-    """Draw all 5 figures and write report.md + scores.json into `target`."""
+    """Write scores.json, then draw all 5 figures and write report.md, into
+    `target`.
+
+    scores.json goes FIRST because `export_json` is the only step here that
+    can refuse its input (the L1 address guard raises `ValueError`, which
+    `report` turns into an ERROR line) and it writes nothing when it does.
+    Exporting first means a refusal leaves the block directory empty rather
+    than holding five figures and a report.md with no scores.json beside them
+    -- a shape an operator could mistake for a finished run.
+    """
     target.mkdir(parents=True, exist_ok=True)
+    export_json(result, block=block, out=target / "scores.json", config=provenance.get("config"),
+                cluster_stats=provenance.get("cluster_stats"))
     fig_mean_vs_robust(result, out=target / _FIGURES["Fig 1. Mean vs robust score"])
     fig_rank_shift(result, out=target / _FIGURES["Fig 2. Biggest rank drops"], top_n=top_n)
     fig_evidence(records, out=target / _FIGURES["Fig 3. Evidence levels"])
@@ -637,8 +648,6 @@ def _write_report(target: Path, result, records, clusters, sens, adv, block: int
     md = render_markdown(result, records, block=block, figures=_FIGURES, sensitivity=sens,
                          adversarial=adv, provenance=provenance)
     (target / "report.md").write_text(md)
-    export_json(result, block=block, out=target / "scores.json", config=provenance.get("config"),
-                cluster_stats=provenance.get("cluster_stats"))
 
 
 def _published_files(block_dir: Path) -> List[Path]:
@@ -648,13 +657,17 @@ def _published_files(block_dir: Path) -> List[Path]:
 
     An allowlist rather than a denylist, and names rather than a tree walk:
     `latest/` goes to a public CDN, so the decision has to be "these three
-    kinds of artifact", not "whatever the last run happened to leave lying
-    around". Directories are never published (`is_file`), so a subdirectory
-    that ever matches the glob cannot smuggle its contents through either.
+    kinds of artifact", not "whatever the last run left lying around".
+    Directories are never published (`is_file`), so a subdirectory matching
+    the glob cannot smuggle its contents through either.
+
+    Symlinks are excluded too (`not is_symlink()`): `is_file()` follows them,
+    so an allowlisted *name* pointing anywhere on disk would otherwise publish
+    that target's bytes -- the allowlist is about bytes, not names.
     """
     named = [block_dir / name for name in PUBLISHED_FILES]
     figures = sorted(block_dir.glob(PUBLISHED_FIGURE_GLOB))
-    return [p for p in named + figures if p.is_file()]
+    return [p for p in named + figures if p.is_file() and not p.is_symlink()]
 
 
 def _publish_latest(out_dir: Path, block_dir: Path) -> None:
@@ -662,20 +675,27 @@ def _publish_latest(out_dir: Path, block_dir: Path) -> None:
     as `out_dir/latest/`.
 
     Near-atomic: the old `latest/` is removed then the staged copy is moved in
-    -- a reader may briefly see no `latest/` at all, in the gap between the
-    removal and the move. Builds the new contents in a temp directory first, so
-    that gap is as short as a single `os.replace` (moving the fully-staged
-    directory into place, no partial writes ever visible) rather than however
-    long the figures/report.md/scores.json themselves take to generate; stale
-    files from an earlier run never linger alongside the new ones.
+    -- a reader may briefly see no `latest/` at all, in that gap. Contents are
+    built in a temp directory first, so the gap is one `os.replace` (no partial
+    writes ever visible) rather than however long the figures/report.md/
+    scores.json take to generate; stale files never linger beside the new ones.
 
     L9: an existing `latest` that is a *symlink* is unlinked, not `rmtree`d
-    (`shutil.rmtree` refuses a symlink with `OSError` and would wedge every
-    later run), and only the link goes -- never whatever it pointed at. The
-    symlink check comes first because `Path.exists()` follows symlinks, and
-    is `is_symlink()` so a dangling one (which `exists()` reports as False) is
-    cleared too.
+    (which refuses a symlink with `OSError` and would wedge every later run);
+    only the link goes, never its target. The check is `is_symlink()` and
+    comes first, since `exists()` follows symlinks and reports a dangling one
+    as False.
+
+    Raises `ValueError` (which `report` turns into an ERROR line) if
+    `block_dir` is missing either of `PUBLISHED_FILES`: publishing is
+    destructive, so a block directory with no report in it must not replace a
+    good `latest/` with a figures-only or empty one and take the live report
+    offline. Missing *figures* are not an error -- refusing on the recoverable
+    half of the report would only be a new way to break publishing.
     """
+    missing = [name for name in PUBLISHED_FILES if not (block_dir / name).is_file()]
+    if missing:
+        raise ValueError(f"cannot publish {block_dir}: missing {', '.join(missing)}")
     out_dir.mkdir(parents=True, exist_ok=True)
     latest = out_dir / "latest"
     sources = _published_files(block_dir)
@@ -685,13 +705,14 @@ def _publish_latest(out_dir: Path, block_dir: Path) -> None:
         staged.mkdir()
         for src in sources:
             shutil.copy2(src, staged / src.name)
-        logger.debug("publishing %d file(s) to %s: %s", len(sources), latest,
-                     [p.name for p in sources])
         if latest.is_symlink():
             latest.unlink()
         elif latest.exists():
             shutil.rmtree(latest)
         os.replace(staged, latest)
+        # After the move: the line reports what is published, not what staged.
+        logger.debug("published %d file(s) to %s: %s", len(sources), latest,
+                     [p.name for p in sources])
     finally:
         shutil.rmtree(tmp_parent, ignore_errors=True)
 
@@ -742,9 +763,8 @@ def report(
             # the count classify_all actually left behind in *this* store,
             # not a stale default from a caller with no store at all.
             n_lookup_budget_starved = store.n_lookup_budget_starved()
-            # Same reason: the caps published in provenance are the ones the
-            # fetch run recorded in *this* store (see _step_evidence), not
-            # this build's constants.
+            # Same reason: provenance publishes the caps the fetch run
+            # recorded in *this* store, not this build's constants.
             evidence_caps = _evidence_caps_for_provenance(store)
         block = int(last_block) if last_block is not None else 0
         # Inside the guard: sensitivity_table re-scores the whole dataset once
@@ -760,8 +780,16 @@ def report(
                               evidence_caps=evidence_caps)
 
     block_dir = out_dir / str(block)
-    _write_report(block_dir, result, records, clusters, sens, adv, block, provenance, top_n)
-    _publish_latest(out_dir, block_dir)
+    # Guarded like the scoring above: `export_json` refuses an address-bearing
+    # frame (L1) and `_publish_latest` refuses a block directory with no report
+    # in it -- neither ValueError may surface as a traceback when every other
+    # rejection is an ERROR line.
+    try:
+        _write_report(block_dir, result, records, clusters, sens, adv, block, provenance, top_n)
+        _publish_latest(out_dir, block_dir)
+    except ValueError as e:
+        typer.echo(f"ERROR: {e}")
+        raise typer.Exit(1)
 
     typer.echo(f"report written to {block_dir} and {out_dir / 'latest'} "
               f"(rater profile mode: {mode})")
