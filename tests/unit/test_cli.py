@@ -847,7 +847,7 @@ def test_score_cluster_raters_value_error_exits_1(tmp_path, monkeypatch):
     def _raise(*a, **k):
         raise ValueError("too many candidate pairs")
 
-    monkeypatch.setattr(cli, "cluster_raters", _raise)
+    monkeypatch.setattr(cli, "cluster_raters_with_stats", _raise)
     r = runner.invoke(app, ["score", "--db", str(db)])
     assert r.exit_code == 1, r.output
     assert "ERROR: too many candidate pairs" in r.output
@@ -1091,7 +1091,7 @@ def test_report_cluster_raters_value_error_exits_1(tmp_path, monkeypatch):
     def _raise(*a, **k):
         raise ValueError("too many candidate pairs")
 
-    monkeypatch.setattr(cli, "cluster_raters", _raise)
+    monkeypatch.setattr(cli, "cluster_raters_with_stats", _raise)
     r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(tmp_path / "reports")])
     assert r.exit_code == 1, r.output
     assert "ERROR: too many candidate pairs" in r.output
@@ -1118,8 +1118,8 @@ def test_report_provenance_includes_config_in_markdown_and_json(tmp_path):
 
     md = (out_dir / "latest" / "report.md").read_text()
     for phrase in ("bootstrap_n", "bootstrap_seed", "min_clusters", "evidence_weights",
-                  "sybil_jaccard", "sybil_window_s", "sybil_max_group", "norm_fit_share",
-                  "norm_rule_counts"):
+                  "sybil_jaccard", "sybil_window_s", "sybil_max_group", "sybil_max_pairs",
+                  "sybil_max_pairs_per_ratee", "norm_fit_share", "norm_rule_counts"):
         assert phrase in md, phrase
 
     data = json.loads((out_dir / "latest" / "scores.json").read_text())
@@ -1132,9 +1132,10 @@ def test_report_provenance_includes_config_in_markdown_and_json(tmp_path):
     counts = config["norm_rule_counts"]
     assert isinstance(counts, dict) and counts and sum(counts.values()) > 0
     for key in ("bootstrap_seed", "min_clusters", "evidence_weights", "sybil_jaccard",
-                "sybil_window_s", "sybil_max_group", "sybil_flag_share", "norm_fit_share",
-                "norm_rule_counts"):
+                "sybil_window_s", "sybil_max_group", "sybil_max_pairs", "sybil_max_pairs_per_ratee",
+                "sybil_flag_share", "norm_fit_share", "norm_rule_counts"):
         assert key in config
+    assert config["sybil_max_pairs_per_ratee"] == cli.Config().sybil_max_pairs_per_ratee
 
 
 def test_report_provenance_includes_evidence_level_shares(tmp_path):
@@ -1214,3 +1215,89 @@ def test_provenance_norm_rule_counts_follow_the_run_config():
         prov = cli._provenance("onchain", cfg, records, score(records, cfg))
         assert prov["config"]["norm_fit_share"] == fit_share
         assert prov["config"]["norm_rule_counts"] == {rule: 10}
+
+
+# --- sybil pair-budget options and cluster stats (H2) --------------------------
+
+
+_SYBIL_OPTS = ["--sybil-max-group", "--sybil-max-pairs", "--sybil-max-pairs-per-ratee"]
+
+
+@pytest.mark.parametrize("command", ["score", "report"])
+def test_help_lists_sybil_budget_options(command):
+    # COLUMNS: typer's rich help truncates the option-name column at the default
+    # 80 chars, which would elide `--sybil-max-pairs-per-ratee` mid-name.
+    r = runner.invoke(app, [command, "--help"], env={"COLUMNS": "200"})
+    assert r.exit_code == 0, r.output
+    flat = " ".join(r.output.split())
+    for opt in _SYBIL_OPTS:
+        assert opt in flat, opt
+    assert str(cli.Config().sybil_max_pairs_per_ratee) in flat
+
+
+def _capture_cfg(monkeypatch):
+    """Wrap ``cli.score_fn`` so a test can read the Config and the scored frame
+    the command actually used."""
+    seen = {}
+    orig = cli.score_fn
+
+    def _capture(records, cfg, clusters=None):
+        result = orig(records, cfg, clusters=clusters)
+        seen["cfg"], seen["result"] = cfg, result
+        return result
+
+    monkeypatch.setattr(cli, "score_fn", _capture)
+    return seen
+
+
+def test_score_sybil_budget_options_reach_config(tmp_path, monkeypatch):
+    db, out = tmp_path / "t.db", tmp_path / "scores.csv"
+    _seed(db)
+    seen = _capture_cfg(monkeypatch)
+    r = runner.invoke(app, ["score", "--db", str(db), "--out", str(out), "--bootstrap-n", "5",
+                            "--sybil-max-group", "5", "--sybil-max-pairs", "10",
+                            "--sybil-max-pairs-per-ratee", "5"])
+    assert r.exit_code == 0, r.output
+    cfg = seen["cfg"]
+    assert (cfg.sybil_max_group, cfg.sybil_max_pairs, cfg.sybil_max_pairs_per_ratee) == (5, 10, 5)
+
+
+def test_score_attaches_cluster_stats_to_scores_frame(tmp_path, monkeypatch):
+    db, out = tmp_path / "t.db", tmp_path / "scores.csv"
+    _seed(db)
+    seen = _capture_cfg(monkeypatch)
+    r = runner.invoke(app, ["score", "--db", str(db), "--out", str(out), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+    stats = seen["result"].attrs["cluster_stats"]
+    assert set(stats) == {"pairs_tested", "ratees_skipped_size", "ratees_skipped_budget", "truncated"}
+    assert stats["truncated"] is False
+
+
+def test_report_sybil_budget_options_reach_config_and_stats(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db)
+    seen = _capture_cfg(monkeypatch)
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(tmp_path / "reports"),
+                            "--bootstrap-n", "5", "--sybil-max-group", "3",
+                            "--sybil-max-pairs", "7", "--sybil-max-pairs-per-ratee", "2"])
+    assert r.exit_code == 0, r.output
+    cfg = seen["cfg"]
+    assert (cfg.sybil_max_group, cfg.sybil_max_pairs, cfg.sybil_max_pairs_per_ratee) == (3, 7, 2)
+    assert "cluster_stats" in seen["result"].attrs
+
+
+def test_report_sensitivity_value_error_exits_1_not_traceback(tmp_path, monkeypatch):
+    """L2: a ValueError out of `sensitivity_table` must exit 1 with the same
+    ERROR line as any other scoring rejection, never a raw traceback."""
+    db = tmp_path / "t.db"
+    _seed(db)
+
+    def _raise(*a, **k):
+        raise ValueError("sensitivity blew up")
+
+    monkeypatch.setattr(cli, "sensitivity_table", _raise)
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(tmp_path / "reports"),
+                            "--bootstrap-n", "5"])
+    assert r.exit_code == 1, r.output
+    assert "ERROR: sensitivity blew up" in r.output
+    assert r.exception is None or isinstance(r.exception, SystemExit)

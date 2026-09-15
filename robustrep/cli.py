@@ -14,6 +14,7 @@ the whole command end-to-end without any network access.
 """
 from __future__ import annotations
 
+import dataclasses
 import enum
 import logging
 import os
@@ -41,7 +42,7 @@ from .sources.evidence_fetch import classify_all
 from .sources.rater_profile import DEFAULT_RPS, EtherscanClient, default_client, enrich_raters, estimate_seconds
 from .sources.rpc import RpcClient, RpcError
 from .store import Store
-from .sybil import cluster_raters, profiles_from_records
+from .sybil import cluster_raters_with_stats, profiles_from_records
 
 app = typer.Typer(add_completion=False, help="Robust, transport-agnostic reputation scoring for AI agents.")
 
@@ -336,6 +337,36 @@ def fetch(
         raise typer.Exit(2)
 
 
+def _scoring_config(**kwargs) -> Config:
+    """Build a `Config` from `score`/`report` options, turning a value `Config`
+    itself rejects into a clean ERROR line + exit 1 rather than a traceback."""
+    try:
+        return Config(**kwargs)
+    except ValueError as e:
+        typer.echo(f"ERROR: {e}")
+        raise typer.Exit(1)
+
+
+# Sybil blocking/budget options, declared once and shared verbatim by `score`
+# and `report` so the two commands can never drift apart (one OptionInfo per
+# option; typer builds a separate click parameter per command from it).
+# Budgets bound the work candidate-pair generation may do on adversarial
+# input: exceeding one degrades the clustering (raters under-merged, reported
+# as a limitation) and never fails the run -- see `robustrep.sybil`.
+_SYBIL_MAX_GROUP_OPT = typer.Option(
+    Config().sybil_max_group, "--sybil-max-group", min=1,
+    help="Max raters per ratee used for ratee-blocking; a ratee with more is skipped for it "
+         "(those raters may be under-merged).")
+_SYBIL_MAX_PAIRS_OPT = typer.Option(
+    Config().sybil_max_pairs, "--sybil-max-pairs", min=1,
+    help="Global budget of candidate sybil pairs. Reaching it stops candidate generation "
+         "(raters may be under-merged); it never fails the run.")
+_SYBIL_MAX_PAIRS_PER_RATEE_OPT = typer.Option(
+    Config().sybil_max_pairs_per_ratee, "--sybil-max-pairs-per-ratee", min=1,
+    help="Per-ratee-block budget of candidate sybil pairs. A block over it is abandoned "
+         "part-way (its raters may be under-merged); it never fails the run.")
+
+
 @app.command()
 def score(
     db: Path = typer.Option(..., help="SQLite store path."),
@@ -344,20 +375,23 @@ def score(
         Config().bootstrap_n, min=0, help="Bootstrap resamples for the confidence interval."),
     min_clusters: int = typer.Option(
         Config().min_clusters, min=1, help="Minimum distinct rater clusters required to score a ratee."),
+    sybil_max_group: int = _SYBIL_MAX_GROUP_OPT,
+    sybil_max_pairs: int = _SYBIL_MAX_PAIRS_OPT,
+    sybil_max_pairs_per_ratee: int = _SYBIL_MAX_PAIRS_PER_RATEE_OPT,
 ) -> None:
     """Compute robust reputation scores for every ratee in the store and
     write them to --out as a CSV with RESULT_COLUMNS columns.
 
     Exits 1 with "no records" if the store has no feedback rows yet (run
     fetch first), or with an ERROR line if the given options or the data
-    itself is rejected (e.g. too many candidate sybil pairs, or malformed
-    records).
+    itself is rejected (e.g. malformed records). Hitting a sybil pair budget
+    is NOT such a rejection: clustering degrades and the run continues (see
+    `robustrep.sybil`), with what was skipped recorded on the scored frame's
+    `attrs["cluster_stats"]` -- `report` prints it as a limitation.
     """
-    try:
-        cfg = Config(bootstrap_n=bootstrap_n, min_clusters=min_clusters)
-    except ValueError as e:
-        typer.echo(f"ERROR: {e}")
-        raise typer.Exit(1)
+    cfg = _scoring_config(bootstrap_n=bootstrap_n, min_clusters=min_clusters,
+                          sybil_max_group=sybil_max_group, sybil_max_pairs=sybil_max_pairs,
+                          sybil_max_pairs_per_ratee=sybil_max_pairs_per_ratee)
 
     with Store(db) as store:
         records = store.load_records()
@@ -366,8 +400,10 @@ def score(
             raise typer.Exit(1)
 
         try:
-            clusters = cluster_raters(profiles_from_records(records, store.load_rater_meta()), cfg)
+            clusters, stats = cluster_raters_with_stats(
+                profiles_from_records(records, store.load_rater_meta()), cfg)
             result = score_fn(records, cfg, clusters=clusters)
+            result.attrs["cluster_stats"] = dataclasses.asdict(stats)
         except ValueError as e:
             typer.echo(f"ERROR: {e}")
             raise typer.Exit(1)
@@ -433,6 +469,8 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         sybil_jaccard=cfg.sybil_jaccard,
         sybil_window_s=cfg.sybil_window_s,
         sybil_max_group=cfg.sybil_max_group,
+        sybil_max_pairs=cfg.sybil_max_pairs,
+        sybil_max_pairs_per_ratee=cfg.sybil_max_pairs_per_ratee,
         sybil_flag_share=cfg.sybil_flag_share,
         norm_fit_share=cfg.norm_fit_share,
         norm_rule_counts=_norm_rule_counts_for_provenance(result),
@@ -494,6 +532,9 @@ def report(
     top_n: int = typer.Option(
         100, min=1, help="Top-N ratees (by naive mean / robust score) considered for the "
                          "rank-shift and sensitivity figures."),
+    sybil_max_group: int = _SYBIL_MAX_GROUP_OPT,
+    sybil_max_pairs: int = _SYBIL_MAX_PAIRS_OPT,
+    sybil_max_pairs_per_ratee: int = _SYBIL_MAX_PAIRS_PER_RATEE_OPT,
 ) -> None:
     """Generate figures 1-5, report.md and scores.json under out_dir/<block>/,
     then atomically publish a copy to out_dir/latest/ (a fixed link always has
@@ -501,14 +542,15 @@ def report(
 
     Exits 1 with "no records" if the store has no feedback rows yet (run
     fetch first), or with an ERROR line if the given options or the data
-    itself is rejected (e.g. too many candidate sybil pairs, or malformed
-    records).
+    itself is rejected (e.g. malformed records) -- including one raised by the
+    sensitivity re-scoring, which runs 9 more scoring passes and must fail the
+    same clean way rather than as a traceback. Hitting a sybil pair budget is
+    NOT such a rejection: clustering degrades (see `robustrep.sybil`) and the
+    report states what was skipped under "Limitations".
     """
-    try:
-        cfg = Config(bootstrap_n=bootstrap_n)
-    except ValueError as e:
-        typer.echo(f"ERROR: {e}")
-        raise typer.Exit(1)
+    cfg = _scoring_config(bootstrap_n=bootstrap_n, sybil_max_group=sybil_max_group,
+                          sybil_max_pairs=sybil_max_pairs,
+                          sybil_max_pairs_per_ratee=sybil_max_pairs_per_ratee)
 
     try:
         with Store(db) as store:
@@ -517,16 +559,19 @@ def report(
                 typer.echo("no records")
                 raise typer.Exit(1)
             meta = store.load_rater_meta()
-            clusters = cluster_raters(profiles_from_records(records, meta), cfg)
+            clusters, stats = cluster_raters_with_stats(profiles_from_records(records, meta), cfg)
             result = score_fn(records, cfg, clusters=clusters)
+            result.attrs["cluster_stats"] = dataclasses.asdict(stats)
             mode = store.get_sync("rater_profile_mode") or "unknown"
             last_block = store.get_sync("last_block")
+        block = int(last_block) if last_block is not None else 0
+        # Inside the guard: sensitivity_table re-scores the whole dataset once
+        # per variant, so any ValueError scoring can raise, it can raise too.
+        sens = sensitivity_table(records, cfg, meta=meta, top_n=top_n)
     except ValueError as e:
         typer.echo(f"ERROR: {e}")
         raise typer.Exit(1)
-    block = int(last_block) if last_block is not None else 0
 
-    sens = sensitivity_table(records, cfg, meta=meta, top_n=top_n)
     adv = scenario_table()
     provenance = _provenance(mode, cfg, records, result)
 

@@ -1,3 +1,4 @@
+import logging
 import time
 
 import pandas as pd
@@ -5,7 +6,8 @@ import pytest
 
 from robustrep.config import Config
 from robustrep.sybil import (
-    RaterProfile, _candidate_pairs, _jaccard, _ratee_group_pairs, cluster_raters, profiles_from_records,
+    ClusterStats, RaterProfile, _candidate_pairs, _jaccard, _ratee_group_pairs, cluster_raters,
+    cluster_raters_with_stats, profiles_from_records,
 )
 from robustrep.schema import validate_records
 
@@ -167,10 +169,14 @@ def test_ratee_group_out_of_window_pairs_skipped():
     assert len({c["a"], c["b"], c["c"]}) == 3
 
 
-def test_pair_budget_exceeded_raises():
+def test_cluster_raters_no_longer_raises_on_budget_but_still_on_duplicates():
+    # H2: a budget overrun must degrade (under-merge), never abort -- otherwise
+    # ~6,000 cheap on-chain transactions permanently break scoring for everyone.
     profiles = [P(f"r{i}", 0, None, {"1"}) for i in range(4)]  # C(4, 2) = 6 candidate pairs
-    with pytest.raises(ValueError, match="sybil_max_pairs"):
-        cluster_raters(profiles, Config(sybil_max_pairs=3))
+    c = cluster_raters(profiles, Config(sybil_max_pairs=3))
+    assert set(c) == {"r0", "r1", "r2", "r3"}
+    with pytest.raises(ValueError, match="duplicate"):
+        cluster_raters([P("a", 0, None, {"1"}), P("a", 1, None, {"2"})], Config(sybil_max_pairs=3))
 
 
 def test_jaccard_both_empty_is_zero():
@@ -250,3 +256,83 @@ def test_same_funder_subbucket_mixed_window_skips_in_window_pair():
     ]
     pairs = list(_ratee_group_pairs("1", profiles, Config(), {"1"}))
     assert pairs == [("a", "c")]
+
+
+# --- pair budgets degrade instead of aborting (H2) ----------------------------
+
+
+def _farm(n, ratees, funder=None, base_ts=1000):
+    """`n` raters, all in-window of each other, all rating every one of `ratees`."""
+    return [P(f"r{i:05d}", base_ts + i, funder, set(ratees)) for i in range(n)]
+
+
+def test_global_budget_truncates_instead_of_raising():
+    cfg = Config(sybil_max_pairs=100, sybil_max_pairs_per_ratee=10 ** 9)
+    clusters, stats = cluster_raters_with_stats(_farm(60, ["a", "b", "c"]), cfg)
+    assert len(clusters) == 60
+    assert stats.truncated is True
+    assert stats.pairs_tested == 100
+
+
+def test_per_ratee_budget_skips_block_and_counts_it():
+    cfg = Config(sybil_max_pairs_per_ratee=50, sybil_max_pairs=10 ** 9)
+    clusters, stats = cluster_raters_with_stats(_farm(40, ["a"]), cfg)
+    assert len(clusters) == 40
+    assert stats.ratees_skipped_budget == 1
+    assert stats.truncated is False
+    assert stats.pairs_tested >= 50
+
+
+def test_size_skip_is_counted():
+    _, stats = cluster_raters_with_stats(_farm(11, ["a"]), Config(sybil_max_group=10))
+    assert stats.ratees_skipped_size == 1
+    assert stats.ratees_skipped_budget == 0 and stats.truncated is False
+
+
+def test_stats_are_all_zero_within_budget():
+    _, stats = cluster_raters_with_stats(_farm(5, ["a"]), Config())
+    assert stats == ClusterStats(pairs_tested=10, ratees_skipped_size=0,
+                                 ratees_skipped_budget=0, truncated=False)
+
+
+def test_global_budget_can_truncate_during_funder_blocking():
+    # The funder path runs first and can exhaust the budget on its own, before
+    # any ratee block is generated at all.
+    cfg = Config(sybil_max_pairs=3, sybil_max_pairs_per_ratee=10 ** 9)
+    clusters, stats = cluster_raters_with_stats(_farm(10, ["x"], funder="F"), cfg)
+    assert len(clusters) == 10
+    assert stats.truncated is True and stats.pairs_tested == 3
+    assert stats.ratees_skipped_size == 0 and stats.ratees_skipped_budget == 0
+
+
+def test_clusters_found_before_truncation_are_kept():
+    # The funder path is generated first, so its pair is emitted (and tested)
+    # before the ratee farm below exhausts the global budget.
+    pair = [P("aaa", 1000, "F", {"x"}), P("aab", 1001, "F", {"y"})]
+    cfg = Config(sybil_max_pairs=5, sybil_max_pairs_per_ratee=10 ** 9)
+    clusters, stats = cluster_raters_with_stats(pair + _farm(60, ["a", "b", "c"]), cfg)
+    assert stats.truncated is True
+    assert clusters["aaa"] == clusters["aab"]
+
+
+def test_per_ratee_budget_logs_one_warning_with_repr(caplog):
+    cfg = Config(sybil_max_pairs_per_ratee=5, sybil_max_pairs=10 ** 9)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sybil"):
+        cluster_raters_with_stats(_farm(20, ["evil ratee"]), cfg)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "'evil ratee'" in caplog.text  # attacker-controlled string logged with %r
+
+
+def test_global_budget_logs_one_warning_with_counts(caplog):
+    cfg = Config(sybil_max_pairs=10, sybil_max_pairs_per_ratee=10 ** 9)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sybil"):
+        cluster_raters_with_stats(_farm(60, ["a", "b", "c"]), cfg)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "sybil_max_pairs" in warnings[0].getMessage()
+
+
+def test_cluster_raters_returns_only_the_mapping():
+    c = cluster_raters(_farm(4, ["a"]), Config())
+    assert isinstance(c, dict) and len(c) == 4
