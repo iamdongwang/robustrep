@@ -23,18 +23,38 @@ the fetcher here is a security boundary, not just an HTTP client:
   under the other, so non-ASCII hosts are refused rather than trusted to a
   resolver check that might be answering about a different host than the one
   ``requests`` will actually connect to.
-- **One parser, one URL** (``_parsers_agree`` / ``_canonical_url``): the guard
-  vets what ``urlsplit`` sees, but ``requests`` hands the *raw string* to
-  ``urllib3``, whose ``parse_url`` treats a backslash as an authority
-  terminator. ``http://127.0.0.1:6379\\@example.com/`` therefore vets as host
-  ``example.com`` port 80 and connects to ``127.0.0.1:6379`` -- a complete
-  bypass of every check above. Three layers close that differential: a URL
-  containing whitespace/C0/C1 control characters anywhere, or an authority
-  containing ``\\``, ``@``, whitespace or a control character, is refused
-  outright (``_AUTHORITY_FORBIDDEN``/``_URL_FORBIDDEN``); the scheme/host/port
-  ``urllib3.util.parse_url`` reads must match the ones ``urlsplit`` produced;
-  and the request is then issued against a URL *rebuilt* from the vetted
-  components (``_canonical_url``), never the attacker's raw string.
+- **The vetted host must be the connected host** (``_vetted_host`` /
+  ``_parsers_agree`` / ``_canonical_url``): the guard vets what ``urlsplit``
+  sees, but two further transforms sit between it and the socket, and each has
+  been a full bypass of every check above:
+
+  * ``urllib3.util.parse_url`` treats a backslash as an authority terminator,
+    so ``http://127.0.0.1:6379\\@example.com/`` vets as ``example.com`` port 80
+    and connects to ``127.0.0.1:6379``;
+  * ``requests.PreparedRequest.prepare_url`` runs ``requote_uri()`` *after*
+    this guard has run: it percent-DECODES unreserved characters in the
+    authority, so ``http://169.254.169.25%34/`` vets as the (unresolvable-
+    looking) host ``169.254.169.25%34`` and connects to ``169.254.169.254``;
+    and it percent-ENCODES others (``" ` ^ < > { | }`` and friends), again
+    connecting somewhere other than what was vetted.
+
+  Four layers close this, most load-bearing first: the vetted hostname must
+  match ``_HOST_ALLOWED`` -- LDH labels and dots only, no ``%``, no underscore,
+  nothing ``requote_uri`` would rewrite -- which is what guarantees the rebuilt
+  host survives requests' requoting *byte for byte*; a URL containing
+  whitespace/C0/C1 controls anywhere, or an authority containing ``\\``, ``@``,
+  whitespace or a control character, is refused outright
+  (``_URL_FORBIDDEN``/``_AUTHORITY_FORBIDDEN``); the scheme/host/port urllib3
+  reads must match ``urlsplit``'s (defense in depth against the *next* parser
+  differential); and the request is issued against a URL *rebuilt* from the
+  vetted components (``_canonical_url``), never the attacker's raw string.
+  ``test_vetted_host_is_the_host_requests_would_connect_to`` pins the
+  end-to-end invariant through a real ``requests`` ``PreparedRequest``.
+  ``_URL_FORBIDDEN`` also refuses a literal space anywhere in a URL or a
+  ``Location`` -- including in a path or query, where a browser would just
+  encode it. That costs some legitimate traffic (the URI is recorded
+  unfetchable, level 1) and is deliberate: what is vetted and what is sent
+  stay byte-identical.
 - **Bounded manual redirects**: automatic redirects are disabled
   (``allow_redirects=False``); up to ``MAX_REDIRECTS`` 3xx hops are followed by
   hand, re-running the SSRF guard against each ``Location`` before following it.
@@ -123,6 +143,13 @@ _AUTHORITY_FORBIDDEN = re.compile(r"[\\@\s\x00-\x1f\x7f-\x9f]")
 # The same character classes anywhere in the URL: `urlsplit` silently strips
 # tab/CR/LF *before* parsing, so an authority-only check never sees them.
 _URL_FORBIDDEN = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
+# What a vetted hostname may contain: LDH labels (letters/digits/hyphen) joined
+# by dots, no leading/trailing dot or hyphen. This is an allowlist on purpose --
+# `requests` requotes the URL *after* this guard runs, and every character it
+# would rewrite (`%`, quotes, backticks, `^`, braces, ...) is simply not in the
+# set, so the vetted host and the connected host cannot diverge. Underscores are
+# refused as collateral: they are not LDH, and are not worth an exception.
+_HOST_ALLOWED = re.compile(r"\A[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\Z")
 
 # 6to4 (RFC 3056): embeds an IPv4 address in bits 16-47 of the IPv6 address.
 # Python's ipaddress module does not treat 2002::/16 itself as non-global, so
@@ -197,9 +224,13 @@ def _canonical_url(url: str) -> str:
 def _vetted_host(parts) -> Optional[str]:
     """The hostname of an already-split URL, or ``None`` (logged at DEBUG,
     host only) when it is one this fetcher must never touch: missing,
-    ``localhost`` (any trailing FQDN root dot stripped first), non-ASCII, or a
-    bare IP literal. See the module docstring for why the last two are refused
-    outright rather than checked more cleverly.
+    non-ASCII, outside the ``_HOST_ALLOWED`` LDH allowlist, ``localhost`` (any
+    trailing FQDN root dot stripped first), or a bare IP literal.
+
+    The allowlist is the load-bearing one: it is what makes the vetted host
+    byte-identical to the host ``requests`` will connect to after its own
+    ``requote_uri`` pass (see the module docstring). The non-ASCII check runs
+    first only to give that common case its own reason in the log.
     """
     host = parts.hostname
     if host:
@@ -209,6 +240,9 @@ def _vetted_host(parts) -> Optional[str]:
         return None
     if not host.isascii():
         _log.debug("evidence fetch refused: non-ASCII host")
+        return None
+    if not _HOST_ALLOWED.match(host):
+        _log.debug("evidence fetch refused: host outside the LDH allowlist %r", host)
         return None
     if host.lower() == "localhost":
         _log.debug("evidence fetch refused: localhost host")
@@ -226,10 +260,13 @@ def _parsers_agree(url: str, scheme: str, host: str, port: int) -> bool:
     ``urlsplit`` did (``scheme``/``host``/``port``, already normalized by the
     caller, ``port`` with the scheme default applied).
 
-    ``requests`` passes the raw string to urllib3, so *urllib3's* reading --
-    not ``urlsplit``'s -- decides which host is actually connected to. Where
-    the two disagree (see the module docstring's backslash example) the URL is
-    refused rather than guessing which parser wins. A URL urllib3 cannot parse
+    Defense in depth, not the primary control: the *last* transform before the
+    socket is ``requests.PreparedRequest.prepare_url`` -> ``requote_uri``, not
+    either of these parsers, and what keeps its output identical to the vetted
+    host is ``_HOST_ALLOWED`` in ``_vetted_host``. What this check adds is
+    cheap insurance against the *next* parser differential (the backslash case
+    in the module docstring was one): where two parsers read one string
+    differently, refuse rather than pick a winner. A URL urllib3 cannot parse
     at all is refused for the same reason.
     """
     try:
@@ -292,15 +329,34 @@ def _is_safe_url(url: str, resolver: Resolver = _default_resolver) -> bool:
     return True
 
 
+def _ipfs_tail(uri: str) -> Optional[str]:
+    """The content path of an ``ipfs://`` URI, or ``None`` if it must not be
+    pasted onto a gateway prefix.
+
+    A gateway URL is built by concatenation, so the tail decides what path on
+    the gateway *host* is fetched: ``ipfs://../api/v0/id`` would escape
+    ``/ipfs/`` and hit the gateway's own API, and a leading ``/`` would address
+    its root. Empty, absolute, and any ``..`` anywhere (bluntly -- a CID never
+    contains one) are refused; nothing legitimate is lost.
+    """
+    tail = uri[len("ipfs://"):]
+    if not tail or tail.startswith("/") or ".." in tail:
+        _log.debug("evidence fetch refused: unsafe ipfs path %r", tail)
+        return None
+    return tail
+
+
 def resolve_uri(uri: str) -> Optional[str]:
     """Best-effort resolution of an evidence URI to one fetchable http(s) URL.
 
-    ``ipfs://<path>`` resolves through the first configured gateway;
-    ``http(s)://`` URLs pass through unchanged; anything else (notably
-    ``data:`` URIs, which are not fetched over HTTP) returns ``None``.
+    ``ipfs://<path>`` resolves through the first configured gateway (for a
+    path ``_ipfs_tail`` accepts); ``http(s)://`` URLs pass through unchanged;
+    anything else (notably ``data:`` URIs, which are not fetched over HTTP)
+    returns ``None``.
     """
     if uri.startswith("ipfs://"):
-        return IPFS_GATEWAYS[0] + uri[len("ipfs://"):]
+        tail = _ipfs_tail(uri)
+        return None if tail is None else IPFS_GATEWAYS[0] + tail
     if uri.startswith("http://") or uri.startswith("https://"):
         return uri
     return None
@@ -357,14 +413,38 @@ def _fetch_url(url: str, session, resolver: Resolver, timeout, redirects_left: i
     belt-and-braces only: the bound on decompressed bytes comes from urllib3
     2.x capping the decoded output of ``raw.read(amt, decode_content=True)``.
 
-    The response is always closed (in a ``finally``) before this call returns
-    or recurses into the next hop, on every path (success, redirect, HTTP error
-    or body-read failure).
+    A ``session`` of ``None`` means "make your own": that session is then this
+    function's to close (in a ``finally``, and after any redirect hops have
+    reused it), since a leaked ``requests.Session`` leaks its connection pool.
+    A caller-supplied session is never closed here -- ``classify_all`` reuses
+    one per worker thread across many URIs and closes them itself.
     """
     if not _is_safe_url(url, resolver):
         return None
     url = _canonical_url(url)
-    sess = session or requests.Session()
+    if session is not None:
+        return _fetch_vetted(url, session, resolver, timeout, redirects_left)
+    sess = requests.Session()
+    try:
+        return _fetch_vetted(url, sess, resolver, timeout, redirects_left)
+    finally:
+        sess.close()
+
+
+def _fetch_vetted(url: str, sess, resolver: Resolver, timeout, redirects_left: int
+                   ) -> Optional[str]:
+    """Issue the request for an ``url`` that ``_fetch_url`` has already guarded
+    and canonicalized, with ``sess`` as the (caller- or self-owned) transport.
+
+    Split out of ``_fetch_url`` purely so that function can own a session's
+    lifetime in a ``finally`` without nesting this whole body one level deeper.
+    Redirect hops re-enter through ``_fetch_url`` (guard, then canonicalize)
+    carrying the same session.
+
+    The response is always closed (in a ``finally``) before this returns or
+    recurses into the next hop, on every path (success, redirect, HTTP error or
+    body-read failure).
+    """
     try:
         r = sess.get(url, timeout=timeout, stream=True, allow_redirects=False,
                       headers={"user-agent": USER_AGENT, "accept-encoding": "identity"})
@@ -391,7 +471,7 @@ def _fetch_url(url: str, session, resolver: Resolver, timeout, redirects_left: i
     finally:
         r.close()
     if next_url is not None:
-        return _fetch_url(next_url, session, resolver, timeout, redirects_left - 1)
+        return _fetch_url(next_url, sess, resolver, timeout, redirects_left - 1)
     return text
 
 
@@ -412,7 +492,9 @@ def http_fetch_text(uri: str, session=None, resolver: Resolver = _default_resolv
     if uri.startswith("data:"):
         return _decode_data_uri(uri)
     if uri.startswith("ipfs://"):
-        tail = uri[len("ipfs://"):]
+        tail = _ipfs_tail(uri)
+        if tail is None:
+            return None
         for gateway in IPFS_GATEWAYS:
             text = _fetch_url(gateway + tail, session, resolver, timeout)
             if text is not None:
