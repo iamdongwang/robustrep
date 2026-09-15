@@ -6,7 +6,8 @@ import pandas as pd
 import pytest
 
 from robustrep import Config, score
-from robustrep.pipeline import prepare
+from robustrep import pipeline
+from robustrep.pipeline import _ci, prepare
 from robustrep.schema import RECORD_COLUMNS, RESULT_COLUMNS
 
 
@@ -245,3 +246,63 @@ def test_score_exposes_norm_rule_counts(records_factory):
                          + [dict(rater="b0", ratee="B", value=1, tag="bin")])
     assert score(df, _cfg()).attrs["norm_rule_counts"] == {"percent": 3, "binary": 1}
     assert score(pd.DataFrame(columns=RECORD_COLUMNS), _cfg()).attrs["norm_rule_counts"] == {}
+
+
+class _SpyRng:
+    """A `numpy.random.Generator` stand-in that records every `integers` size.
+
+    Delegates to a real seeded generator, so results are identical to using
+    that generator directly; `sizes` is the list of `size` arguments the code
+    under test asked for, which is what the chunking assertions inspect.
+    """
+
+    def __init__(self, seed: int = 0) -> None:
+        self._rng = np.random.default_rng(seed)
+        self.sizes: list = []
+
+    def integers(self, low, high=None, size=None, **kwargs):
+        self.sizes.append(size)
+        return self._rng.integers(low, high, size=size, **kwargs)
+
+
+def test_multi_tag_bootstrap_is_chunked(monkeypatch):
+    # M3: the multi-tag bootstrap must draw its resample indices in chunks so
+    # peak memory is bounded by MAX_BOOT_CHUNK_CELLS cells, never
+    # bootstrap_n x n at once (an attacker inflating one agent to 100k votes
+    # across two tags would otherwise force a ~800 MB transient allocation).
+    n, n_boot = 20, 30
+    scores = np.linspace(0.0, 1.0, n)
+    weights = np.full(n, 0.5)
+    tag_codes = np.array([0] * (n // 2) + [1] * (n // 2))
+    cfg = _cfg(bootstrap_n=n_boot)
+
+    unchunked = _ci(scores, weights, tag_codes, cfg, _SpyRng(0))
+
+    monkeypatch.setattr(pipeline, "MAX_BOOT_CHUNK_CELLS", 50)
+    spy = _SpyRng(0)
+    chunked = _ci(scores, weights, tag_codes, cfg, spy)
+
+    rows_per_chunk = 50 // n  # == 2
+    assert spy.sizes, "expected the multi-tag path to draw resample indices"
+    assert all(size[0] <= rows_per_chunk for size in spy.sizes)
+    assert sum(size[0] for size in spy.sizes) == n_boot
+    assert len(spy.sizes) == n_boot // rows_per_chunk
+    # Chunking must not change the numbers: same seed -> same CI.
+    assert chunked == unchunked
+
+
+def test_multi_tag_bootstrap_matches_unchunked_draws():
+    # Pins the numpy property the chunked design relies on: a Generator is
+    # consumed row-major, so k rows drawn chunk by chunk are byte-identical to
+    # the same rows drawn in one call from a generator with the same seed.
+    n, n_boot, chunk = 7, 30, 4
+    one_shot = np.random.default_rng(1234).integers(0, n, size=(n_boot, n))
+
+    rng = np.random.default_rng(1234)
+    chunks, drawn = [], 0
+    while drawn < n_boot:
+        take = min(chunk, n_boot - drawn)
+        chunks.append(rng.integers(0, n, size=(take, n)))
+        drawn += take
+
+    assert np.array_equal(np.concatenate(chunks), one_shot)

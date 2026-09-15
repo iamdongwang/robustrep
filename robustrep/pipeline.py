@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .aggregate import Aggregator, bootstrap_ci, weighted_median
+from .aggregate import MAX_BOOT_CHUNK_CELLS, Aggregator, bootstrap_ci, weighted_median
 from .config import Config
 from .evidence import weights_for
 from .normalize import normalize
@@ -100,6 +100,18 @@ def _ci(scores: np.ndarray, weights: np.ndarray, tag_codes: np.ndarray, cfg: Con
     on every resample -- a resample can change which tags are even present
     in it -- so that path loops `_total` once per resample. Both paths take
     the caller-supplied `rng`.
+
+    M3: the multi-tag path draws its resample indices in chunks of
+    `MAX_BOOT_CHUNK_CELLS // n` resamples rather than one
+    `(bootstrap_n, n)` block, bounding peak memory the same way
+    `bootstrap_ci` bounds the single-tag path. Votes per ratee are
+    attacker-influenced -- real data already has an agent with ~11k votes
+    across 132 tags (~88 MB transient at bootstrap_n=1000), and inflating
+    one agent to 100k votes across two tags would demand ~800 MB in a
+    single allocation. Chunking is numerically free: a Generator is
+    consumed row-major, so the chunked draws are the same rows in the same
+    order as one big draw from the same `rng` (pinned by
+    `test_multi_tag_bootstrap_matches_unchunked_draws`).
     """
     n = len(scores)
     if n == 1 or cfg.bootstrap_n == 0:
@@ -107,8 +119,14 @@ def _ci(scores: np.ndarray, weights: np.ndarray, tag_codes: np.ndarray, cfg: Con
         return s, s
     if len(np.unique(tag_codes)) == 1:
         return bootstrap_ci(scores, weights, cfg.bootstrap_n, rng, cfg.ci_level)
-    idx = rng.integers(0, n, size=(cfg.bootstrap_n, n))
-    boots = np.array([_total(scores[i], weights[i], tag_codes[i]) for i in idx])
+    rows_per_chunk = max(1, MAX_BOOT_CHUNK_CELLS // n)
+    boots = np.empty(cfg.bootstrap_n)
+    done = 0
+    while done < cfg.bootstrap_n:
+        take = min(rows_per_chunk, cfg.bootstrap_n - done)
+        for i in rng.integers(0, n, size=(take, n)):
+            boots[done] = _total(scores[i], weights[i], tag_codes[i])
+            done += 1
     a = (1 - cfg.ci_level) / 2
     lo, hi = np.quantile(boots, [a, 1 - a])
     return float(lo), float(hi)
