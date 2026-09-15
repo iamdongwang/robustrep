@@ -38,15 +38,22 @@ the fetcher here is a security boundary, not just an HTTP client:
 - **Bounded manual redirects**: automatic redirects are disabled
   (``allow_redirects=False``); up to ``MAX_REDIRECTS`` 3xx hops are followed by
   hand, re-running the SSRF guard against each ``Location`` before following it.
+  The *raw* header value is screened for whitespace/control characters first:
+  ``urljoin`` (via ``urlsplit``) strips TAB/CR/LF before the guard would ever
+  see them, quietly turning ``http://ot\\rher.example/x`` into an allowed URL
+  rather than refusing it.
   Every response (200, 3xx, 4xx/5xx, or one that fails mid-read) is closed
   before the function returns or recurses into the next hop.
 - **Bounded size/time**: at most ``MAX_BYTES`` bytes are read per response
   (regardless of any ``Content-Length`` claim -- we just want the beginning),
   clamped a second time after the read as a belt-and-suspenders check against a
   non-conforming stream, and every request uses a ``(connect, read)`` timeout.
-  Requests also ask for ``accept-encoding: identity``: a bounded read of
-  *uncompressed* bytes makes a decompression bomb moot regardless of which
-  urllib3 version is installed.
+  A decompression bomb is bounded by that read itself: urllib3 2.x caps the
+  *decoded* output of ``raw.read(amt, decode_content=True)`` at ``amt``, so no
+  more than ``MAX_BYTES`` decompressed bytes are ever materialized. Requests
+  additionally ask for ``accept-encoding: identity`` as belt-and-braces -- a
+  hostile server is free to ignore that header and gzip anyway, which is why it
+  is not the control the bound rests on.
 
 ``classify_all`` walks every URI referenced by ``feedback`` rows that is not yet
 in the evidence cache, classifies it, and persists the level -- one bad URI (an
@@ -320,21 +327,39 @@ def _decode_data_uri(uri: str) -> Optional[str]:
     return raw[:MAX_BYTES].decode("utf-8", errors="replace")
 
 
+def _next_hop(url: str, loc: str) -> Optional[str]:
+    """Absolute URL for a ``Location`` header value, or ``None`` if it must not
+    be followed at all.
+
+    The *raw* header value is screened before ``urljoin`` touches it:
+    ``urljoin`` (via ``urlsplit``) strips TAB/CR/LF, so a hostile ``Location``
+    would otherwise be silently normalized into a different, allowed URL --
+    ``http://ot\\rher.example/x`` becoming ``http://other.example/x`` -- instead
+    of being refused. The joined result is still re-run through
+    ``_is_safe_url`` by the hop that follows it.
+    """
+    if _URL_FORBIDDEN.search(loc):
+        _log.debug("evidence fetch refused: forbidden character in Location header")
+        return None
+    return urljoin(url, loc)
+
+
 def _fetch_url(url: str, session, resolver: Resolver, timeout, redirects_left: int = MAX_REDIRECTS
                 ) -> Optional[str]:
     """Fetch one http(s) URL through the SSRF guard, following up to
-    ``redirects_left`` 3xx hops manually (re-checking each ``Location``), and
-    reading at most ``MAX_BYTES`` bytes of the (final) response body.
+    ``redirects_left`` 3xx hops manually (each ``Location`` screened by
+    ``_next_hop``, then re-guarded by this function), and reading at most
+    ``MAX_BYTES`` bytes of the (final) response body.
 
-    The URL actually requested is the canonical one rebuilt from the vetted
-    components (``_canonical_url``), never the raw input string -- that holds
-    on every redirect hop too, since each ``urljoin``ed ``Location`` re-enters
-    this function through the same guard. ``accept-encoding: identity`` keeps
-    the ``MAX_BYTES`` cap a bound on uncompressed bytes.
+    The URL requested is always the canonical one rebuilt from the vetted
+    components (``_canonical_url``), never the raw input string -- on redirect
+    hops too, since each hop re-enters here. ``accept-encoding: identity`` is
+    belt-and-braces only: the bound on decompressed bytes comes from urllib3
+    2.x capping the decoded output of ``raw.read(amt, decode_content=True)``.
 
     The response is always closed (in a ``finally``) before this call returns
-    or recurses into the next redirect hop, regardless of which path (success,
-    redirect, HTTP error, or a body-read failure) was taken.
+    or recurses into the next hop, on every path (success, redirect, HTTP error
+    or body-read failure).
     """
     if not _is_safe_url(url, resolver):
         return None
@@ -351,9 +376,10 @@ def _fetch_url(url: str, session, resolver: Resolver, timeout, redirects_left: i
     try:
         if 300 <= r.status_code < 400:
             loc = r.headers.get("location") if r.headers else None
-            if not loc or redirects_left <= 0:
+            # No Location, no budget left, or a refused one: all mean "stop".
+            next_url = _next_hop(url, loc) if loc and redirects_left > 0 else None
+            if next_url is None:
                 return None
-            next_url = urljoin(url, loc)
         else:
             r.raise_for_status()
             raw = r.raw.read(MAX_BYTES, decode_content=True)
@@ -422,7 +448,7 @@ def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Call
     try:
         level = classify(uri, _fetch, tx_parties, parties)
     except Exception:
-        _log.error("classify_all: classify failed for %s", uri, exc_info=True)
+        _log.error("classify_all: classify failed for %r", uri, exc_info=True)
         return 1, "fetch-error"
     return level, ("unfetchable" if fetched_none else "")
 
