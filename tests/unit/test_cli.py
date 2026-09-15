@@ -193,14 +193,20 @@ def test_fetch_etherscan_key_overrides_env_and_is_not_echoed(tmp_path, monkeypat
     db = tmp_path / "t.db"
     _seed(db, n=1)
     monkeypatch.setenv("ETHERSCAN_API_KEY", "env-secret-key")
-    seen_keys = []
+    seen = []
 
     class _FakeEtherscanClient:
+        source = "etherscan"
+
         def __init__(self, api_key):
-            seen_keys.append(api_key)
+            pass
+
+    def _fake_default_client(source, key):
+        seen.append((source, key))
+        return _FakeEtherscanClient(key)
 
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
-    monkeypatch.setattr(cli, "EtherscanClient", _FakeEtherscanClient)
+    monkeypatch.setattr(cli, "default_client", _fake_default_client)
     monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
     monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
@@ -209,9 +215,110 @@ def test_fetch_etherscan_key_overrides_env_and_is_not_echoed(tmp_path, monkeypat
 
     r = runner.invoke(app, ["fetch", "--db", str(db), "--etherscan-key", "cli-override-key"])
     assert r.exit_code == 0, r.output
-    assert seen_keys == ["cli-override-key"]
+    assert seen == [("auto", "cli-override-key")]
     assert "cli-override-key" not in r.output
     assert "env-secret-key" not in r.output
+
+
+# --- --profile-source propagation -----------------------------------------------
+
+
+def _patch_fetch_steps_except_raters(monkeypatch, capture):
+    """Stub every fetch step except raters, and capture default_client's
+    (source, key) args -- shared setup for the --profile-source tests."""
+    class _FakeClient:
+        source = "etherscan"
+
+        def __init__(self, key):
+            pass
+
+    def _fake_default_client(source, key):
+        capture.append((source, key))
+        return _FakeClient(key) if source != "none" else None
+
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli, "default_client", _fake_default_client)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+
+def test_fetch_profile_source_defaults_to_auto(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    seen = []
+    _patch_fetch_steps_except_raters(monkeypatch, seen)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert seen == [("auto", None)]
+
+
+def test_fetch_profile_source_blockscout_flag_reaches_default_client(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.setenv("ETHERSCAN_API_KEY", "some-key")  # even with a key set...
+    seen = []
+    _patch_fetch_steps_except_raters(monkeypatch, seen)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-source", "blockscout"])
+    assert r.exit_code == 0, r.output
+    assert seen == [("blockscout", "some-key")]  # ...source is exactly what was requested
+
+
+def test_fetch_profile_source_none_reaches_default_client_and_skips_client(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    seen = []
+    _patch_fetch_steps_except_raters(monkeypatch, seen)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-source", "none"])
+    assert r.exit_code == 0, r.output
+    assert seen == [("none", None)]
+    assert "fallback" in r.output
+
+
+def test_fetch_profile_source_etherscan_without_key_exits_1_with_error(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-source", "etherscan"])
+    assert r.exit_code == 1, r.output
+    assert "ERROR" in r.output
+    assert "etherscan" in r.output.lower()
+
+
+def test_fetch_profile_source_rejects_invalid_choice(tmp_path):
+    r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--profile-source", "bogus", "--dry-run"])
+    assert r.exit_code != 0
+
+
+def test_step_raters_profile_source_blockscout_builds_real_client_without_network(tmp_path):
+    # No feedback rows -> distinct_clients() is empty -> enrich_raters short-
+    # circuits before any HTTP call, so this exercises the real
+    # default_client("blockscout", ...) -> EtherscanClient.blockscout() path
+    # (no monkeypatching) without ever touching the network.
+    db = tmp_path / "t.db"
+    with Store(db) as store:
+        summary = cli._step_raters(store, None, profile_source="blockscout")
+    assert "raters profiled: 0" in summary
+    assert "rater profile mode: unknown" in summary  # nothing to do -> mode never set
+
+
+def test_step_raters_profile_source_string_default_is_auto():
+    import inspect
+
+    sig = inspect.signature(cli._step_raters)
+    assert sig.parameters["profile_source"].default == cli.ProfileSource.auto
 
 
 def test_fetch_rpc_url_and_confirmations_reach_config(tmp_path, monkeypatch):
@@ -748,10 +855,12 @@ def test_fetch_eta_branch_prints_estimate(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
     class _FakeEtherscanClient:
+        source = "etherscan"
+
         def __init__(self, api_key):
             pass
 
-    monkeypatch.setattr(cli, "EtherscanClient", _FakeEtherscanClient)
+    monkeypatch.setattr(cli, "default_client", lambda source, key: _FakeEtherscanClient(key))
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
 
     r = runner.invoke(app, ["fetch", "--db", str(db), "--etherscan-key", "k"])
@@ -780,7 +889,8 @@ def test_step_raters_with_real_enrich_raters_queries_distinct_clients_once(tmp_p
             return orig()
 
         store.distinct_clients = _counting
-        summary = cli._step_raters(store, None)  # no key -> fallback mode
+        # profile_source="none" -> offline fallback, no HTTP client at all.
+        summary = cli._step_raters(store, None, profile_source="none")
     assert len(calls) == 1
     assert "raters profiled: 1" in summary
 

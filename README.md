@@ -28,5 +28,8 @@ result = score(records, Config())
     robustrep score  --db data/base.db --out scores.csv
     robustrep report --db data/base.db --out-dir reports
 
+Rater profiles: Blockscout (free, no key) by default; Etherscan V2 requires a paid plan for Base.
+Pick a source explicitly with `fetch --profile-source {auto,blockscout,etherscan,none}`.
+
 Latest scores: `reports/latest/scores.json`, also served at
 https://iamdongwang.github.io/robustrep/reports/latest/scores.json

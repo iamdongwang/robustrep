@@ -14,6 +14,7 @@ the whole command end-to-end without any network access.
 """
 from __future__ import annotations
 
+import enum
 import logging
 import os
 import shutil
@@ -37,7 +38,7 @@ from .report.render import evidence_level_shares, render_markdown
 from .report.sensitivity import fig_sensitivity, sensitivity_table
 from .sources import base_erc8004 as base
 from .sources.evidence_fetch import classify_all
-from .sources.rater_profile import DEFAULT_RPS, EtherscanClient, enrich_raters, estimate_seconds
+from .sources.rater_profile import DEFAULT_RPS, EtherscanClient, default_client, enrich_raters, estimate_seconds
 from .sources.rpc import RpcClient, RpcError
 from .store import Store
 from .sybil import cluster_raters, profiles_from_records
@@ -52,6 +53,17 @@ OWNER_LOG_EVERY = 500
 # Default number of agents resolved per JSON-RPC batch in _step_owners (see
 # --owner-batch).
 OWNER_BATCH_DEFAULT = 100
+
+
+class ProfileSource(str, enum.Enum):
+    """``--profile-source`` choices -- see ``rater_profile.default_client``
+    for what each one builds. ``str`` mixin so typer renders/parses plain
+    strings (and so a raw ``"auto"``/etc. from a test compares equal)."""
+
+    auto = "auto"
+    blockscout = "blockscout"
+    etherscan = "etherscan"
+    none = "none"
 
 
 @app.callback()
@@ -162,26 +174,39 @@ def _step_owners(store: Store, rpc: RpcClient, log_every: int = OWNER_LOG_EVERY,
     return f"agent owners resolved: {resolved}/{len(agents)}"
 
 
-def _step_raters(store: Store, etherscan_key: Optional[str]) -> str:
-    """Profile not-yet-profiled raters via Etherscan, or fall back offline.
+def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str = ProfileSource.auto) -> str:
+    """Profile not-yet-profiled raters via ``profile_source``, or fall back
+    offline (``profile_source="none"``).
 
     ``etherscan_key``, when given, overrides ``ETHERSCAN_API_KEY`` (the key
-    itself is never echoed). Raises ``RuntimeError`` (from ``enrich_raters``)
-    when some -- but not all -- addresses failed; the caller decides how to
-    handle a partial failure.
+    itself is never echoed). ``profile_source`` is one of ``auto`` (default:
+    Blockscout -- free, no key -- unless a key is available, in which case
+    Etherscan V2), ``blockscout``, ``etherscan`` (requires a key) or ``none``
+    (offline fallback). See ``rater_profile.default_client``. Raises
+    ``RuntimeError`` (from ``enrich_raters``) when some -- but not all --
+    addresses failed, or when the very first one hit a non-retryable
+    plan-configuration error; the caller decides how to handle it. Raises
+    ``ValueError`` when ``profile_source="etherscan"`` but no key is
+    available.
     """
     key = etherscan_key if etherscan_key is not None else os.environ.get("ETHERSCAN_API_KEY")
-    client = EtherscanClient(key) if key else None
+    # `profile_source` may be a ProfileSource (from the `fetch` CLI option) or
+    # a plain string (direct callers, tests) -- normalize via `.value` rather
+    # than `str(...)`, which on a `(str, Enum)` member yields "ProfileSource.
+    # auto" rather than "auto".
+    source = profile_source.value if isinstance(profile_source, ProfileSource) else profile_source
+    client = default_client(source, key)
     # store.distinct_clients() computed exactly once here and handed to
     # enrich_raters(addresses=...) below, instead of letting it re-query the
     # store itself.
     targets = store.distinct_clients()
     if client is not None and targets:
         eta_h = estimate_seconds(len(targets), DEFAULT_RPS) / 3600
-        typer.echo(f"profiling {len(targets)} rater(s) via Etherscan, ETA ~{eta_h:.1f}h")
+        source_label = getattr(client, "source", "etherscan").capitalize()
+        typer.echo(f"profiling {len(targets)} rater(s) via {source_label}, ETA ~{eta_h:.1f}h")
     n = enrich_raters(store, client, addresses=targets)
     mode = store.get_sync("rater_profile_mode") or "unknown"
-    fallback_note = "" if client is not None else " (fallback: no ETHERSCAN_API_KEY; rows not written)"
+    fallback_note = "" if client is not None else " (fallback: --profile-source none; rows not written)"
     return f"raters profiled: {n}{fallback_note}; rater profile mode: {mode}"
 
 
@@ -211,6 +236,12 @@ def fetch(
         OWNER_BATCH_DEFAULT, "--owner-batch", min=1,
         help="Agents resolved per JSON-RPC batch call for owner resolution (1 = one call per agent)."),
     skip_raters: bool = typer.Option(False, "--skip-raters", help="Skip rater profile enrichment."),
+    profile_source: ProfileSource = typer.Option(
+        ProfileSource.auto, "--profile-source",
+        help="Rater-profile HTTP source: 'auto' (default) uses Blockscout (free, no key) unless an "
+             "Etherscan key is available, in which case Etherscan V2; 'blockscout' always uses Base's "
+             "free Blockscout instance; 'etherscan' always uses Etherscan V2 (requires a key -- note "
+             "Etherscan's free plan does not cover Base); 'none' skips profiling (offline fallback)."),
     skip_evidence: bool = typer.Option(False, "--skip-evidence", help="Skip evidence URI classification."),
     evidence_workers: int = typer.Option(
         8, "--evidence-workers", min=1,
@@ -222,9 +253,10 @@ def fetch(
     profiles and evidence levels into the SQLite store at --db.
 
     Exits 0 on full success; 1 for a bad-input error (an invalid option
-    combination that Config itself rejects); 2 when rater profiling partially
-    failed (some addresses errored, the rest -- and every other step -- still
-    completed; see _step_raters); 3 when an RPC call failed on every retry.
+    combination that Config itself rejects, or --profile-source etherscan
+    with no key available); 2 when rater profiling partially failed (some
+    addresses errored, the rest -- and every other step -- still completed;
+    see _step_raters); 3 when an RPC call failed on every retry.
     --dry-run never opens or creates the store file when it does not already
     exist.
     """
@@ -268,7 +300,10 @@ def fetch(
             typer.echo(f"raters profiling skipped; rater profile mode: {mode}")
         else:
             try:
-                typer.echo(_step_raters(store, etherscan_key))
+                typer.echo(_step_raters(store, etherscan_key, profile_source=profile_source))
+            except ValueError as e:
+                typer.echo(f"ERROR: {e}")
+                raise typer.Exit(1)
             except RuntimeError as e:
                 typer.echo(f"WARNING: {e}")
                 partial_failure = True
