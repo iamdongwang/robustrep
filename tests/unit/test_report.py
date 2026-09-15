@@ -407,3 +407,58 @@ def test_export_json_nan_to_null_and_sorted(tmp_path, records_factory):
     assert robust_scores[-1] is None
     non_null = [v for v in robust_scores if v is not None]
     assert non_null == sorted(non_null, reverse=True)
+
+
+# --- sensitivity prose: top-score tie block, Jaccard primary -------------------
+
+
+def _sensitivity_with_base_size(size):
+    return pd.DataFrame([dict(variant="base", spearman_union=1.0, spearman_top=1.0,
+                              top_set_jaccard=1.0, top_set_size=size),
+                         dict(variant="window_72h", spearman_union=float("nan"),
+                              spearman_top=float("nan"), top_set_jaccard=0.99, top_set_size=size)])
+
+
+def test_sensitivity_prose_names_jaccard_primary_and_explains_blank_rho(records_factory):
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_sensitivity_with_base_size(3))
+    section = md.split("## Sensitivity")[1].split("## Adversarial")[0]
+    assert "`top_set_jaccard` is the primary stability measure" in section
+    assert "zero variance" in section
+    assert "too few ratees overlapped" not in section
+
+
+def test_sensitivity_prose_reports_top_tie_block_when_it_dominates_base_top_set(records_factory):
+    rec, sc = _data(records_factory)
+    scored_mask = sc["insufficient"] == 0
+    n_scored = int(scored_mask.sum())
+    assert n_scored >= 2
+    sc = sc.copy()
+    sc.loc[scored_mask, "robust_score"] = 1.0  # every scored agent ties at the top
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_sensitivity_with_base_size(n_scored))
+    section = md.split("## Sensitivity")[1].split("## Adversarial")[0]
+    assert f"{n_scored} of the {n_scored} scored agents tie at the top score (1.000)" in section
+    assert f"base top set of {n_scored}" in section
+    assert "Spearman's rho is therefore uninformative on this data" in section
+
+
+def test_sensitivity_prose_omits_tie_warning_when_top_set_not_dominated(records_factory):
+    rec, sc = _data(records_factory)
+    scored_mask = sc["insufficient"] == 0
+    n_scored = int(scored_mask.sum())
+    sc = sc.copy()
+    # strictly distinct scores -> the top tie block is a single agent
+    sc.loc[scored_mask, "robust_score"] = np.linspace(0.5, 1.0, n_scored)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_sensitivity_with_base_size(n_scored))
+    section = md.split("## Sensitivity")[1].split("## Adversarial")[0]
+    assert f"1 of the {n_scored} scored agents tie at the top score" in section
+    assert "uninformative" not in section
+
+
+def test_sensitivity_prose_skips_tie_diagnostic_without_top_set_size(records_factory):
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={},
+                         sensitivity=pd.DataFrame([dict(variant="base", spearman_top=1.0)]))
+    section = md.split("## Sensitivity")[1].split("## Adversarial")[0]
+    assert "tie at the top score" not in section
+    assert "`top_set_jaccard` is the primary stability measure" in section

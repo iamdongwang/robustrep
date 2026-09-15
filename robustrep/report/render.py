@@ -106,6 +106,32 @@ def _measured_boundaries_paragraph(adversarial: pd.DataFrame) -> Optional[str]:
     )
 
 
+# Share of the base top set sitting in the top-score tie block above which
+# Spearman's rho is dominated by tie order rather than any ranking change.
+_TIE_DOMINANCE_SHARE = 0.5
+
+
+def _top_tie_block_lines(scored: pd.DataFrame, sensitivity: pd.DataFrame) -> list:
+    """Diagnostic sentence(s) on the top-score tie block, or [] when the
+    sensitivity table carries no base `top_set_size` (older callers)."""
+    if scored.empty or "top_set_size" not in sensitivity.columns or "variant" not in sensitivity.columns:
+        return []
+    base = sensitivity[sensitivity["variant"] == "base"]
+    if base.empty or pd.isna(base["top_set_size"].iloc[0]):
+        return []
+    base_size = int(base["top_set_size"].iloc[0])
+    top_val = float(scored["robust_score"].max())
+    n_tie = int((scored["robust_score"] == top_val).sum())
+    text = (f"{n_tie} of the {len(scored)} scored agents tie at the top score ({top_val:.3f}), "
+            f"against a base top set of {base_size}.")
+    if base_size > 0 and n_tie / base_size >= _TIE_DOMINANCE_SHARE:
+        text += (" The top set is essentially one tie block in which every member holds the "
+                 "same rank, so Spearman's rho is therefore uninformative on this data: any "
+                 "value is driven by the few agents outside the block, and a value near 0 "
+                 "reflects tie order, not a ranking change. Read `top_set_jaccard`.")
+    return [text]
+
+
 def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, figures: dict,
                     sensitivity: pd.DataFrame, adversarial: Optional[pd.DataFrame] = None,
                     provenance: Optional[dict] = None) -> str:
@@ -164,10 +190,14 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     lines += ["## Sensitivity",
               "Rank stability of the top-N robust-score ranking under reasonable parameter "
               "perturbations (evidence-weight shape, sybil Jaccard threshold, sybil time "
-              "window), each vs the base configuration -- Spearman's rho, computed as the "
-              "Pearson correlation of the two rank sequences (no scipy dependency). A blank "
-              "cell means too few ratees overlapped with the base top-N to define a "
-              "correlation at all.",
+              "window), each vs the base configuration. Top sets are tie-inclusive (every "
+              "agent scoring >= the N-th highest score). `top_set_jaccard` is the primary "
+              "stability measure: the overlap of the base and variant top sets. Spearman's "
+              "rho (Pearson correlation of average ranks over the union of the two top sets, "
+              "no scipy dependency) is reported for completeness; a blank cell means one run "
+              "ranked the whole union as a single tie while the other did not (zero variance "
+              "on one side, so no correlation is defined).",
+              *_top_tie_block_lines(scored, sensitivity),
               "", _markdown_table(sensitivity), ""]
 
     lines += ["## Adversarial evidence",
