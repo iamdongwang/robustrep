@@ -1,9 +1,12 @@
 import logging
+from datetime import datetime, timezone
 
 import requests
 
 from robustrep.sources.rater_profile import (
     BLOCKSCOUT_BASE,
+    BLOCKSCOUT_V2_BASE,
+    BlockscoutV2Client,
     EtherscanClient,
     EtherscanPlanError,
     client_from_env,
@@ -93,6 +96,101 @@ class FakeHttpBadJson:
                 raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
         return R()
+
+
+class FakeV2Http:
+    """Simulates a sequence of Blockscout v2 page responses. Each item in
+    ``responses`` is either a dict body (200 OK) or an int HTTP status code
+    (429/5xx/404) simulated via ``raise_for_status``."""
+
+    def __init__(self, responses):
+        self.responses, self.calls = list(responses), []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(dict(params or {}))
+        item = self.responses.pop(0)
+        if isinstance(item, int):
+            status = item
+
+            class R:
+                status_code = status
+
+                def raise_for_status(self_inner):
+                    err = requests.HTTPError(f"{status} error for url: {url}?apikey=SECRET")
+                    resp = requests.Response()
+                    resp.status_code = status
+                    err.response = resp
+                    raise err
+
+                def json(self_inner):
+                    raise AssertionError("json() must not be called when raise_for_status() raises")
+
+            return R()
+
+        body = item
+
+        class R2:
+            status_code = 200
+
+            def raise_for_status(self_inner):
+                pass
+
+            def json(self_inner):
+                return body
+
+        return R2()
+
+
+class FakeV2HttpConnErr:
+    """Simulates a transport-level failure (e.g. ConnectionError) raised by
+    ``get`` itself, then a successful page."""
+
+    def __init__(self, exc, then_body):
+        self.exc, self.then_body, self.calls = exc, then_body, []
+        self._raised = False
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(dict(params or {}))
+        if not self._raised:
+            self._raised = True
+            raise self.exc
+
+        class R:
+            status_code = 200
+
+            def raise_for_status(self_inner):
+                pass
+
+            def json(self_inner):
+                return self.then_body
+
+        return R()
+
+
+class FakeV2HttpBadJson:
+    """Simulates a 200 response whose body is not valid JSON."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(dict(params or {}))
+
+        class R:
+            status_code = 200
+
+            def raise_for_status(self_inner):
+                pass
+
+            def json(self_inner):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        return R()
+
+
+def bs_tx(hash_, block, ts, from_hash, to_hash="0x6974"):
+    return {"hash": hash_, "block_number": block, "timestamp": ts,
+            "from": {"hash": from_hash}, "to": {"hash": to_hash}}
 
 
 # --- EtherscanClient.first_tx: happy paths -----------------------------------------
@@ -668,7 +766,8 @@ def test_default_client_none_returns_no_client():
 
 def test_default_client_blockscout_ignores_any_key():
     c = default_client("blockscout", "KEY")
-    assert c.source == "blockscout" and c.key is None and c.chain_id is None
+    assert isinstance(c, BlockscoutV2Client)
+    assert c.source == "blockscout"
 
 
 def test_default_client_etherscan_uses_given_key():
@@ -691,6 +790,7 @@ def test_default_client_auto_with_key_uses_etherscan():
 
 def test_default_client_auto_without_key_uses_blockscout():
     c = default_client("auto", None)
+    assert isinstance(c, BlockscoutV2Client)
     assert c.source == "blockscout"
 
 
@@ -700,3 +800,199 @@ def test_default_client_unknown_source_raises_value_error():
         assert False, "expected ValueError"
     except ValueError as e:
         assert "bogus" in str(e)
+
+
+# --- BlockscoutV2Client: happy paths -------------------------------------------------
+
+
+def test_blockscout_v2_single_page_returns_oldest_and_lowercases_funder():
+    body = {
+        "items": [
+            bs_tx("0x2", 42502820, "2026-02-22T21:20:19.000000Z", "0x6463AAA"),
+            bs_tx("0x1", 42502816, "2026-02-22T21:16:19.000000Z", "0x6463BBB"),
+        ],
+        "next_page_params": None,
+    }
+    http = FakeV2Http([body])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    block, ts, funder = c.first_tx("0xA")
+    assert block == 42502816
+    assert funder == "0x6463bbb"
+    assert ts == int(datetime(2026, 2, 22, 21, 16, 19, tzinfo=timezone.utc).timestamp())
+    assert http.calls[0]["filter"] == "to"
+
+
+def test_blockscout_v2_hits_v2_addresses_transactions_url():
+    body = {"items": [bs_tx("0x1", 1, "2026-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    http = FakeV2Http([body])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    c.first_tx("0xABCDEF")
+    assert c.base_url == BLOCKSCOUT_V2_BASE
+
+
+def test_blockscout_v2_two_pages_passes_next_page_params_through_and_returns_oldest():
+    page1 = {
+        "items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+        "next_page_params": {"block_number": 100, "index": 5},
+    }
+    page2 = {
+        "items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+        "next_page_params": None,
+    }
+    http = FakeV2Http([page1, page2])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    block, ts, funder = c.first_tx("0xA")
+    assert block == 100 and funder == "0xoldest"
+    assert len(http.calls) == 2
+    assert http.calls[1]["block_number"] == 100
+    assert http.calls[1]["index"] == 5
+    assert http.calls[1]["filter"] == "to"
+
+
+def test_blockscout_v2_default_max_pages_and_rps():
+    c = BlockscoutV2Client(sleep=lambda _: None)
+    assert c.max_pages == 5
+    assert c.source == "blockscout"
+    assert abs(c.gap - 0.5) < 1e-9  # rps=2.0 default -> 0.5s gap
+
+
+def test_blockscout_v2_exceeds_max_pages_returns_none():
+    pages = [{"items": [bs_tx(f"0x{i}", i, "2026-01-01T00:00:00Z", "0xf")],
+               "next_page_params": {"block_number": i}} for i in range(3)]
+    http = FakeV2Http(pages)
+    c = BlockscoutV2Client(session=http, max_pages=3, sleep=lambda _: None)
+    assert c.first_tx("0xA") is None
+    assert len(http.calls) == 3  # stopped at max_pages, never asked for a 4th page
+
+
+def test_blockscout_v2_no_items_and_no_next_page_returns_none():
+    http = FakeV2Http([{"items": [], "next_page_params": None}])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    assert c.first_tx("0xA") is None
+
+
+# --- BlockscoutV2Client: unknown address (404) ---------------------------------------
+
+
+def test_blockscout_v2_404_returns_none_without_retry():
+    http = FakeV2Http([404])
+    c = BlockscoutV2Client(session=http, retries=3, sleep=lambda _: None)
+    assert c.first_tx("0xA") is None
+    assert len(http.calls) == 1
+
+
+# --- BlockscoutV2Client: transient errors retried -------------------------------------
+
+
+def test_blockscout_v2_429_then_200_succeeds_after_retry():
+    body = {"items": [bs_tx("0x1", 5, "2026-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    http = FakeV2Http([429, body])
+    sleeps = []
+    c = BlockscoutV2Client(session=http, sleep=sleeps.append)
+    block, ts, funder = c.first_tx("0xA")
+    assert block == 5 and funder == "0xf"
+    assert len(http.calls) == 2
+    assert len(sleeps) >= 2  # throttle sleep(s) plus >=1 backoff sleep
+
+
+def test_blockscout_v2_exhausts_retries_then_raises_scrubbed_runtime_error(caplog):
+    http = FakeV2Http([503, 503, 503])
+    c = BlockscoutV2Client(session=http, retries=3, sleep=lambda _: None)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            c.first_tx("0xA")
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            msg = str(e)
+    assert "503" in msg and "0xa" in msg.lower()
+    assert "SECRET" not in msg
+    assert "SECRET" not in caplog.text
+    assert "http" not in msg.lower() or "https://" not in msg  # no URL leaked
+    assert len(http.calls) == 3
+
+
+def test_blockscout_v2_scrubs_connection_error_and_retries(caplog):
+    exc = requests.ConnectionError("HTTPSConnectionPool: Max retries exceeded ... apikey=SECRET ...")
+    http = FakeV2HttpConnErr(exc, then_body={"items": [], "next_page_params": None})
+    sleeps = []
+    c = BlockscoutV2Client(session=http, retries=2, sleep=sleeps.append)
+    with caplog.at_level(logging.DEBUG):
+        result = c.first_tx("0xA")
+    assert result is None  # recovered on retry, page had no items
+    assert "SECRET" not in caplog.text
+    assert len(http.calls) == 2
+
+
+def test_blockscout_v2_non_json_body_retries_then_raises_value_error():
+    http = FakeV2HttpBadJson()
+    c = BlockscoutV2Client(session=http, retries=2, sleep=lambda _: None)
+    try:
+        c.first_tx("0xA")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        msg = str(e)
+        assert "0xa" in msg.lower()
+        assert "Expecting value" not in msg
+    assert len(http.calls) == 2
+
+
+def test_blockscout_v2_missing_items_key_raises_value_error():
+    http = FakeV2Http([{"next_page_params": None}])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    try:
+        c.first_tx("0xA")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "0xa" in str(e).lower()
+
+
+def test_blockscout_v2_malformed_tx_entry_raises_value_error():
+    http = FakeV2Http([{"items": [{"hash": "0x1", "block_number": 1}], "next_page_params": None}])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    try:
+        c.first_tx("0xA")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "0xa" in str(e).lower()
+
+
+# --- BlockscoutV2Client: timestamp parsing --------------------------------------------
+
+
+def test_blockscout_v2_parses_timestamp_with_fractional_seconds():
+    body = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19.123456Z", "0xf")], "next_page_params": None}
+    c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
+    _, ts, _ = c.first_tx("0xA")
+    assert ts == int(datetime(2026, 2, 22, 21, 16, 19, tzinfo=timezone.utc).timestamp())
+
+
+def test_blockscout_v2_parses_timestamp_without_fractional_seconds():
+    body = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19Z", "0xf")], "next_page_params": None}
+    c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
+    _, ts, _ = c.first_tx("0xA")
+    assert ts == int(datetime(2026, 2, 22, 21, 16, 19, tzinfo=timezone.utc).timestamp())
+
+
+# --- default_client: BlockscoutV2Client wiring ----------------------------------------
+
+
+def test_default_client_blockscout_returns_blockscout_v2_client():
+    c = default_client("blockscout", None)
+    assert isinstance(c, BlockscoutV2Client)
+    assert c.source == "blockscout"
+
+
+# --- enrich_raters: BlockscoutV2Client end-to-end -------------------------------------
+
+
+def test_enrich_with_blockscout_v2_client_records_blockscout_mode(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa")])
+    body = {"items": [bs_tx("0x1", 3, "2026-01-01T00:00:00Z", "0xF")], "next_page_params": None}
+    http = FakeV2Http([body])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    assert enrich_raters(s, c) == 1
+    m = s.load_rater_meta().iloc[0]
+    assert m["funder"] == "0xf"
+    assert m["first_seen_ts"] == int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+    assert s.get_sync("rater_profile_mode") == "blockscout"
