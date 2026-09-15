@@ -740,6 +740,31 @@ def test_classify_all_budget_not_exhausted_logs_no_warning(tmp_path, caplog):
     assert warnings == []
 
 
+@pytest.mark.parametrize("max_total_lookups", [0, -5])
+def test_classify_all_zero_or_negative_budget_logs_exactly_one_warning(tmp_path, caplog, max_total_lookups):
+    # Regression: the first cut only warned from the branch that *decrements*
+    # `_remaining` across zero, so a budget that starts at (or below) zero --
+    # nothing to spend from the very first lookup -- never took that branch
+    # and silently warned never. It must still warn exactly once, from
+    # whichever thread's first refused lookup discovers the budget is empty.
+    s = Store(tmp_path / f"tzero{max_total_lookups}.db")
+    rows = [{**_fb(f"https://z{i}"), "feedback_index": i} for i in range(3)]
+    s.upsert_feedback(rows)
+
+    def fetch(uri, session=None):
+        return f"tx {TX}"
+
+    def tx_parties(h):
+        return None
+
+    with caplog.at_level(logging.WARNING):
+        n = classify_all(s, fetch_text=fetch, tx_parties=tx_parties,
+                          max_total_lookups=max_total_lookups, workers=3)
+    assert n == 3
+    warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert len(warnings) == 1
+
+
 def test_classify_all_per_uri_cap_still_applies_within_ample_total_budget(tmp_path):
     # 2 URIs x 50 distinct hashes each, but MAX_TX_LOOKUPS_PER_URI (8) bounds
     # each URI's own lookups regardless of how large max_total_lookups is --
@@ -790,9 +815,9 @@ def test_classify_all_starved_uri_is_retryable_and_upgrades_on_retry(tmp_path):
     assert n1 == 1
     level1, note1 = s.conn.execute(
         "SELECT level, note FROM evidence_cache WHERE uri='https://retry1'").fetchone()
-    assert (level1, note1) == (2, "lookup-budget")
+    assert (level1, note1) == (2, "lookup-budget:1")
 
-    # Second run: the "lookup-budget" note makes it pending again, and this
+    # Second run: the "lookup-budget:1" note makes it pending again, and this
     # run's fresh (ample, default) budget reaches the verifying hash.
     n2 = classify_all(s, fetch_text=fetch, tx_parties=tx_parties, workers=1)
     assert n2 == 1
@@ -800,10 +825,43 @@ def test_classify_all_starved_uri_is_retryable_and_upgrades_on_retry(tmp_path):
         "SELECT level, note FROM evidence_cache WHERE uri='https://retry1'").fetchone()
     assert (level2, note2) == (3, "")
 
-    # Third run: the upgraded, non-"lookup-budget" result is final -- nothing
-    # left pending.
+    # Third run: the upgraded, non-"lookup-budget:N" result is final --
+    # nothing left pending.
     n3 = classify_all(s, fetch_text=fetch, tx_parties=tx_parties, workers=1)
     assert n3 == 0
+
+
+def test_classify_all_lookup_budget_retries_are_bounded(tmp_path):
+    # A URI that is starved on every attempt must stop being retried once it
+    # has been starved MAX_LOOKUP_RETRIES times -- otherwise a persistently
+    # starved backlog would re-fetch its (expensive) text forever for no
+    # further progress.
+    s = Store(tmp_path / "tretrycap.db")
+    text = " ".join("0x" + f"{i:064x}" for i in range(20))  # always starved: budget=1 < 20 hashes
+
+    def fetch(uri, session=None):
+        return text
+
+    def tx_parties(h):
+        return None  # never verifies, regardless of budget
+
+    s.upsert_feedback([_fb("https://always-starved")])
+
+    notes = []
+    for _ in range(ef.MAX_LOOKUP_RETRIES + 2):
+        n = classify_all(s, fetch_text=fetch, tx_parties=tx_parties,
+                          max_total_lookups=1, workers=1)
+        if n == 0:
+            break
+        note = s.conn.execute(
+            "SELECT note FROM evidence_cache WHERE uri='https://always-starved'").fetchone()[0]
+        notes.append(note)
+
+    # It was retried MAX_LOOKUP_RETRIES - 1 times (attempt counts 1 through
+    # MAX_LOOKUP_RETRIES), then stopped being pending -- classify_all found
+    # nothing left to do on the attempt right after hitting the cap.
+    assert notes == [f"lookup-budget:{n}" for n in range(1, ef.MAX_LOOKUP_RETRIES + 1)]
+    assert classify_all(s, fetch_text=fetch, tx_parties=tx_parties, max_total_lookups=1, workers=1) == 0
 
 
 def test_classify_all_each_worker_thread_gets_its_own_session(tmp_path):

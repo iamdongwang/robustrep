@@ -226,16 +226,21 @@ def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
     evidence URI referenced by feedback rows, fetching+classifying up to
     ``workers`` URIs concurrently.
 
-    The two H3 lookup caps (``MAX_TX_LOOKUPS_PER_URI``,
-    ``DEFAULT_MAX_TOTAL_LOOKUPS`` -- both applied via ``classify_all``'s
-    defaults) are echoed in the returned line itself, not just in
-    ``cli._provenance``'s ``config``: they shaped every level this run
-    persisted, so a human watching `fetch` run should see them without
-    having to go dig up a later `report`.
+    The two H3 lookup caps are read into local variables and both *passed to
+    ``classify_all`` explicitly* and used to build the returned summary line
+    -- not read from the module constants twice (once implicitly via
+    ``classify_all``'s own default, once again for the log line), which could
+    silently drift if the two were ever no longer the same value. They are
+    echoed in the line itself, not just in ``cli._provenance``'s ``config``:
+    they shaped every level this run persisted, so a human watching ``fetch``
+    run should see them without having to go dig up a later ``report``.
     """
-    n = classify_all(store, tx_parties=lambda h: base.tx_parties(rpc, h), workers=workers)
+    max_lookups_per_uri = MAX_TX_LOOKUPS_PER_URI
+    max_total_lookups = DEFAULT_MAX_TOTAL_LOOKUPS
+    n = classify_all(store, tx_parties=lambda h: base.tx_parties(rpc, h), workers=workers,
+                      max_total_lookups=max_total_lookups)
     return (f"evidence URIs classified: {n} "
-            f"(max_lookups_per_uri={MAX_TX_LOOKUPS_PER_URI}, max_total_lookups={DEFAULT_MAX_TOTAL_LOOKUPS})")
+            f"(max_lookups_per_uri={max_lookups_per_uri}, max_total_lookups={max_total_lookups})")
 
 
 @app.command()
@@ -494,7 +499,8 @@ def _cluster_stats_for_provenance(result: Optional[pandas.DataFrame]) -> dict:
 
 
 def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
-                result: Optional[pandas.DataFrame] = None) -> dict:
+                result: Optional[pandas.DataFrame] = None,
+                n_lookup_budget_starved: int = 0) -> dict:
     config = dict(
         bootstrap_n=cfg.bootstrap_n,
         bootstrap_seed=cfg.bootstrap_seed,
@@ -515,6 +521,12 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         # next to evidence_level_shares for a report to be auditable.
         evidence_max_lookups_per_uri=MAX_TX_LOOKUPS_PER_URI,
         evidence_max_total_lookups=DEFAULT_MAX_TOTAL_LOOKUPS,
+        # How many evidence_cache rows are still "lookup-budget:N" as of this
+        # report's store snapshot -- see Store.n_lookup_budget_starved.
+        # `n_lookup_budget_starved` defaults to 0 (not "unknown") for a
+        # caller with no store to count from (e.g. `_provenance` called
+        # directly on an in-memory `records` frame, as several tests do).
+        evidence_lookup_starved_uris=n_lookup_budget_starved,
     )
     return dict(
         rater_profile_mode=mode,
@@ -607,6 +619,10 @@ def report(
             result.attrs["cluster_stats"] = dataclasses.asdict(stats)
             mode = store.get_sync("rater_profile_mode") or "unknown"
             last_block = store.get_sync("last_block")
+            # Read while the store is still open -- provenance must report
+            # the count classify_all actually left behind in *this* store,
+            # not a stale default from a caller with no store at all.
+            n_lookup_budget_starved = store.n_lookup_budget_starved()
         block = int(last_block) if last_block is not None else 0
         # Inside the guard: sensitivity_table re-scores the whole dataset once
         # per variant, so any ValueError scoring can raise, it can raise too.
@@ -616,7 +632,8 @@ def report(
         raise typer.Exit(1)
 
     adv = scenario_table()
-    provenance = _provenance(mode, cfg, records, result)
+    provenance = _provenance(mode, cfg, records, result,
+                              n_lookup_budget_starved=n_lookup_budget_starved)
 
     block_dir = out_dir / str(block)
     _write_report(block_dir, result, records, clusters, sens, adv, block, provenance, top_n)

@@ -134,9 +134,28 @@ def test_distinct_helpers(tmp_path):
     s.upsert_evidence("https://e", 1)
     s.upsert_rater("0xc", first_seen_ts=1, funder=None)
     s.upsert_agent_owner("7", "0xowner")
-    assert s.distinct_uris() == ["https://e2"]
     assert set(s.distinct_clients()) == {"0xd", "0xe"}
     assert set(s.distinct_agents()) == {"8", "9"}
+
+
+def test_n_lookup_budget_starved_counts_only_lookup_budget_notes(tmp_path):
+    s = Store(tmp_path / "tstarved.db")
+    s.upsert_evidence("https://a", 2, "lookup-budget:1")
+    s.upsert_evidence("https://b", 2, "lookup-budget:2")
+    s.upsert_evidence("https://c", 3, "")
+    s.upsert_evidence("https://d", 1, "unfetchable")
+    assert s.n_lookup_budget_starved() == 2
+
+
+def test_upsert_evidence_coerces_none_note_to_empty_string(tmp_path):
+    # A caller passing note=None explicitly (rather than relying on the ""
+    # default) must not be able to write a SQL NULL note -- pending_uris'
+    # retry filter treats NULL specially (see its NULL-safety test below),
+    # and a NULL note must never be reachable through the normal write path.
+    s = Store(tmp_path / "tnone.db")
+    s.upsert_evidence("https://n", 1, None)
+    row = s.conn.execute("SELECT note FROM evidence_cache WHERE uri='https://n'").fetchone()
+    assert row[0] == ""
 
 
 def test_pending_uris_default_excludes_anything_cached(tmp_path):
@@ -149,11 +168,11 @@ def test_pending_uris_default_excludes_anything_cached(tmp_path):
         {**FB, "feedback_index": 5, "feedback_uri": ""},
     ])
     s.upsert_evidence("https://e", 3)  # ordinary cached result -- note ""
-    s.upsert_evidence("https://budgeted", 2, "lookup-budget")
+    s.upsert_evidence("https://budgeted", 2, "lookup-budget:1")
     s.upsert_evidence("https://miss", 1, "unfetchable")
     # With no include_notes, only the never-cached URI is pending -- matches
-    # the original distinct_uris()/NOT EXISTS behavior exactly.
-    assert s.pending_uris() == [("https://never", "0xc", None)]
+    # the original "not yet cached at all" NOT EXISTS behavior exactly.
+    assert s.pending_uris() == [("https://never", "0xc", None, None)]
 
 
 def test_pending_uris_retries_only_the_given_notes(tmp_path):
@@ -165,12 +184,36 @@ def test_pending_uris_retries_only_the_given_notes(tmp_path):
         {**FB, "feedback_index": 4, "feedback_uri": "https://miss"},
     ])
     s.upsert_evidence("https://e", 3)
-    s.upsert_evidence("https://budgeted", 2, "lookup-budget")
+    s.upsert_evidence("https://budgeted", 2, "lookup-budget:1")
     s.upsert_evidence("https://miss", 1, "unfetchable")
-    pending = {row[0] for row in s.pending_uris(include_notes=("lookup-budget",))}
-    # The never-cached URI and the retryable "lookup-budget" one are pending;
-    # the ordinary result and the (not included) "unfetchable" one are not.
+    pending = {row[0] for row in s.pending_uris(include_notes=("lookup-budget:1",))}
+    # The never-cached URI and the retryable "lookup-budget:1" one are
+    # pending; the ordinary result and the (not included) "unfetchable" one
+    # are not.
     assert pending == {"https://never", "https://budgeted"}
+
+
+def test_pending_uris_returns_prior_note_for_a_retryable_uri(tmp_path):
+    s = Store(tmp_path / "tpending3.db")
+    s.upsert_feedback([{**FB, "feedback_uri": "https://retry"}])
+    s.upsert_evidence("https://retry", 2, "lookup-budget:1")
+    rows = s.pending_uris(include_notes=("lookup-budget:1",))
+    assert rows == [("https://retry", "0xc", None, "lookup-budget:1")]
+
+
+def test_pending_uris_null_note_is_not_pending_forever_on_retry_path(tmp_path):
+    # A row with a SQL NULL note (e.g. written before upsert_evidence started
+    # coercing None -> "", or by a direct INSERT bypassing it) must not
+    # compare unequal to every literal in the retry IN-clause forever: a bare
+    # `e.note NOT IN (...)` evaluates to SQL NULL (neither true nor false)
+    # against a NULL note, which would make NOT EXISTS see nothing blocking
+    # and keep the URI "pending" no matter what include_notes says.
+    s = Store(tmp_path / "tpendingnull.db")
+    s.upsert_feedback([{**FB, "feedback_uri": "https://nullnote"}])
+    with s.conn:
+        s.conn.execute("INSERT INTO evidence_cache VALUES(?,?,?)", ("https://nullnote", 1, None))
+    pending = {row[0] for row in s.pending_uris(include_notes=("lookup-budget:1",))}
+    assert "https://nullnote" not in pending
 
 
 def test_add_response_idempotent(tmp_path):

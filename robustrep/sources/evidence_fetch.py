@@ -91,13 +91,19 @@ the wrapped ``tx_parties`` stops calling the underlying function at all and
 returns ``None`` for every further hash, which ``classify`` treats as
 "unverified" (its documented, conservative degrade path) rather than raising.
 Exactly one WARNING is logged for the whole run, the moment the budget is
-exhausted. A URI classified while the budget was exhausted may therefore hold
-a false negative (level 2 instead of the 3 a later, unchecked hash would have
-verified) -- such a URI is persisted with note ``"lookup-budget"`` instead of
-an ordinary result, and ``Store.pending_uris(include_notes=("lookup-budget",))``
-(used by ``classify_all`` itself) treats it as still pending, so the next
-``fetch`` run -- with its own fresh budget -- reclassifies it rather than
-leaving a starved, possibly-wrong level cached forever.
+exhausted -- including a ``max_total_lookups <= 0`` run, which has nothing to
+spend from its very first lookup. A URI classified while the budget was
+exhausted may therefore hold a false negative (level 2 instead of the 3 a
+later, unchecked hash would have verified) -- such a URI is persisted with
+note ``"lookup-budget:N"`` (``N`` = how many times, including this one, it
+has been starved) instead of an ordinary result, and
+``Store.pending_uris(include_notes=_RETRYABLE_LOOKUP_BUDGET_NOTES)`` (used by
+``classify_all`` itself) treats it as still pending -- but only while
+``N < MAX_LOOKUP_RETRIES`` (default 3): a retry re-fetches the URI's whole
+text, so retrying forever would let a persistently-starved backlog amplify
+every future run's fetch volume without bound. After that many starved
+attempts, the last cached (possibly false-negative) level is accepted as
+final.
 
 **Known limitation -- DNS rebinding (the residual unmitigated gap in v0.1):**
 the guard above resolves the host and checks *those* addresses, but the actual
@@ -152,6 +158,19 @@ USER_AGENT = "robustrep/0.1"
 # run, shared by every URI and every worker thread -- see the module
 # docstring and `_LookupBudget`.
 DEFAULT_MAX_TOTAL_LOOKUPS = 20_000
+# H3: a budget-starved URI's classification may be a false negative (see
+# `_classify_uri`'s "lookup-budget:N" note), so it is retried -- but a retry
+# re-fetches the URI's whole text (the expensive part) to resolve at most a
+# few more lookups, so retrying forever would let one persistently-starved
+# backlog amplify every future run's fetch volume without bound. A URI is
+# retried at most `MAX_LOOKUP_RETRIES - 1` times (i.e. while its starved
+# attempt count is < this) before its last cached (possibly false-negative)
+# result is accepted as final.
+MAX_LOOKUP_RETRIES = 3
+# The exact "lookup-budget:N" note values `classify_all` treats as pending --
+# passed to `Store.pending_uris(include_notes=...)` as literal, parameterized
+# values (no SQL LIKE/prefix matching needed).
+_RETRYABLE_LOOKUP_BUDGET_NOTES = tuple(f"lookup-budget:{n}" for n in range(1, MAX_LOOKUP_RETRIES))
 
 _log = logging.getLogger(__name__)
 
@@ -534,8 +553,21 @@ def http_fetch_text(uri: str, session=None, resolver: Resolver = _default_resolv
     return _fetch_url(url, session, resolver, timeout)
 
 
+def _lookup_budget_attempts(prior_note: Optional[str]) -> int:
+    """The starved-attempt count ``N`` encoded in a ``"lookup-budget:N"``
+    note, or 0 for anything else (never cached, a normal result, or another
+    note entirely) -- the starting point for the next attempt's count."""
+    if prior_note and prior_note.startswith("lookup-budget:"):
+        try:
+            return int(prior_note.split(":", 1)[1])
+        except ValueError:
+            return 0
+    return 0
+
+
 def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Callable, session,
-                   was_starved: Optional[Callable[[], bool]] = None) -> tuple[int, str]:
+                   was_starved: Optional[Callable[[], bool]] = None,
+                   prior_note: Optional[str] = None) -> tuple[int, str]:
     """Classify one URI, returning ``(level, note)``.
 
     ``note`` is ``"unfetchable"`` when ``fetch_text`` returned ``None`` (the
@@ -543,19 +575,25 @@ def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Call
     specifically); ``"fetch-error"`` if ``classify`` itself raised (defensive:
     ``fetch_text``'s contract is to never raise, but a bug elsewhere in
     ``classify``, e.g. in ``tx_parties`` handling, should still degrade
-    gracefully rather than abort the batch); ``"lookup-budget"`` (H3) when the
-    URI *was* fetched and classified but ``was_starved()`` reports that the
-    shared per-run tx lookup budget ran out partway through its hash list --
-    the returned level may be a false negative (a verifying hash could have
-    sat past the point the budget cut off at), so it is persisted as
-    retryable rather than as an ordinary final result (see
-    ``Store.pending_uris``); ``""`` for a normal, fully-checked result.
+    gracefully rather than abort the batch); ``"lookup-budget:N"`` (H3) when
+    the URI *was* fetched and classified but ``was_starved()`` reports that
+    the shared per-run tx lookup budget ran out partway through its hash
+    list -- the returned level may be a false negative (a verifying hash
+    could have sat past the point the budget cut off at), so it is persisted
+    as retryable rather than as an ordinary final result (see
+    ``Store.pending_uris``, ``MAX_LOOKUP_RETRIES``). ``N`` is
+    ``_lookup_budget_attempts(prior_note) + 1`` -- how many times, including
+    this one, the URI has now been starved; ``""`` for a normal, fully-
+    checked result.
 
     ``was_starved``, when given, must be a callable that reports (and resets)
     whether the *this-thread* budget-wrapped ``tx_parties`` was refused for
     lack of budget since it was last checked -- see ``_LookupBudget.wrap``.
     It is called once before ``classify`` (discarding any stale flag left by
     a previous URI this same worker thread handled) and once after.
+
+    ``prior_note`` is this URI's note from its last cache entry, if any (as
+    returned by ``Store.pending_uris``), used only to compute ``N`` above.
     """
     fetched_none = False
 
@@ -579,7 +617,7 @@ def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Call
     if fetched_none:
         return level, "unfetchable"
     if was_starved is not None and was_starved():
-        return level, "lookup-budget"
+        return level, f"lookup-budget:{_lookup_budget_attempts(prior_note) + 1}"
     return level, ""
 
 
@@ -602,8 +640,15 @@ class _LookupBudget:
     same "unverified" signal a real RPC miss would give), and exactly one
     WARNING is logged for the whole run -- logged *outside* the lock (holding
     a lock across a logging call would serialize every other thread's
-    lookups behind a slow handler for no benefit), by whichever call is the
-    one that drove ``_remaining`` to zero.
+    lookups behind a slow handler for no benefit). This includes a
+    ``total <= 0`` budget (nothing to spend at all): the very first call to
+    ``spend()`` finds ``_remaining <= 0`` immediately and must still be the
+    one that flips ``_exhausted`` and logs -- a bug in an earlier version
+    only ever warned from the decrement branch, so a zero/negative budget
+    silently warned never. Both branches therefore guard the flip with the
+    same ``if not self._exhausted`` check under the lock, so exactly one
+    caller -- whichever branch and whichever thread first observes the
+    budget as spent -- logs, no matter which path exhausted it.
     """
 
     def __init__(self, total: int):
@@ -613,26 +658,37 @@ class _LookupBudget:
         self._exhausted = False
         self.spent = 0
 
+    @property
+    def total(self) -> int:
+        """The clamped (never-negative) budget this run started with."""
+        return self._total
+
     def spend(self) -> bool:
-        """Atomically consume one unit of budget; True if one was available,
-        False if the budget is (now, or already) exhausted."""
+        """Atomically consume one unit of budget; True if one was available
+        (and was just consumed), False if the budget is (now, or already)
+        exhausted -- including a ``total <= 0`` budget, which has nothing to
+        spend from the very first call."""
         if self._exhausted:
             return False
+        success = False
         just_exhausted = False
         with self._lock:
             if self._remaining <= 0:
-                self._exhausted = True
-                return False
-            self._remaining -= 1
-            self.spent += 1
-            if self._remaining <= 0:
-                self._exhausted = True
-                just_exhausted = True
+                if not self._exhausted:
+                    self._exhausted = True
+                    just_exhausted = True
+            else:
+                self._remaining -= 1
+                self.spent += 1
+                success = True
+                if self._remaining <= 0:
+                    self._exhausted = True
+                    just_exhausted = True
         if just_exhausted:
             _log.warning(
                 "evidence: tx lookup budget of %d exhausted; remaining hashes treated as unverified",
                 self._total)
-        return True
+        return success
 
     def wrap(self, tx_parties: Callable[[str], Optional[set]]
              ) -> tuple[Callable[[str], Optional[set]], Callable[[], bool]]:
@@ -706,19 +762,24 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
     spent (out of the clamped total, never negative even if a caller passes
     one) is logged at INFO once the run completes, in a ``finally`` so it is
     logged even if the run itself raised. A URI whose classification was cut
-    short by the budget is persisted with note ``"lookup-budget"`` rather
+    short by the budget is persisted with note ``"lookup-budget:N"`` rather
     than ``""``/an ordinary level (see ``_classify_uri``), and is picked back
-    up as pending on the *next* call via
-    ``store.pending_uris(include_notes=("lookup-budget",))`` below -- a fresh
-    run gets a fresh budget, so a URI that was starved once is not starved
-    forever.
+    up as pending on the *next* call via ``store.pending_uris(include_notes=
+    _RETRYABLE_LOOKUP_BUDGET_NOTES)`` below -- a fresh run gets a fresh
+    budget, so a URI that was starved is not starved forever. A retry is not
+    free, though: it re-fetches the URI's whole text (the actually expensive
+    part; the RPC lookups it unlocks are comparatively cheap), so a URI is
+    retried at most ``MAX_LOOKUP_RETRIES - 1`` times before its last cached
+    result -- a possible false negative -- is accepted as final, bounding how
+    much a persistently-starved backlog can inflate a run's fetch volume.
 
     Returns the number of URIs processed.
     """
-    # "lookup-budget"-noted URIs are retried (see Store.pending_uris); a
-    # URI cached with any other note (a normal result, "unfetchable",
-    # "fetch-error") is not retried by classify_all itself.
-    rows = store.pending_uris(include_notes=("lookup-budget",))
+    # A "lookup-budget:N" note with N < MAX_LOOKUP_RETRIES is retried (see
+    # Store.pending_uris, MAX_LOOKUP_RETRIES); a URI cached with any other
+    # note (a normal result, "unfetchable", "fetch-error", or a
+    # "lookup-budget:N" that has hit the retry cap) is not retried here.
+    rows = store.pending_uris(include_notes=_RETRYABLE_LOOKUP_BUDGET_NOTES)
 
     budget = _LookupBudget(max_total_lookups)
     budgeted_tx_parties, was_starved = budget.wrap(tx_parties)
@@ -736,17 +797,18 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
                 sessions.append(sess)
         return sess
 
-    def _classify_one(uri: str, parties: set):
+    def _classify_one(uri: str, parties: set, prior_note: Optional[str]):
         session = _thread_session()
-        return _classify_uri(uri, parties, fetch_text, budgeted_tx_parties, session, was_starved)
+        return _classify_uri(uri, parties, fetch_text, budgeted_tx_parties, session,
+                              was_starved, prior_note)
 
     processed = 0
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_uri = {}
-            for uri, clients, owners in rows:
+            for uri, clients, owners, prior_note in rows:
                 parties = {p for p in (clients or "").split(",") + (owners or "").split(",") if p}
-                future = executor.submit(_classify_one, uri, parties)
+                future = executor.submit(_classify_one, uri, parties, prior_note)
                 future_to_uri[future] = uri
             for future in as_completed(future_to_uri):
                 uri = future_to_uri[future]
@@ -758,5 +820,5 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
     finally:
         for sess in sessions:
             sess.close()
-        _log.info("classify_all: tx lookup budget spent %d/%d", budget.spent, budget._total)
+        _log.info("classify_all: tx lookup budget spent %d/%d", budget.spent, budget.total)
     return processed
