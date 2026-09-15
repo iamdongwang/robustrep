@@ -46,21 +46,20 @@ Both clients treat their remote as hostile, per the security review:
   bad value written to the raters table makes ``robustrep.sybil._validate_meta``
   raise on every later ``score``/``report`` run.
 - **L5** -- Blockscout's ``next_page_params`` are echoed back as query params
-  on the next request, so they are allowlisted (see ``_safe_next_page_params``)
-  rather than forwarded verbatim.
+  on the next request, so they are allowlisted (see
+  ``blockscout_util.safe_next_page_params``) rather than forwarded verbatim.
 """
 from __future__ import annotations
 
 import logging
 import os
-import re
 import time
-from datetime import datetime
 from typing import Callable, Optional
 
 import requests
 
 from ..store import Store
+from . import blockscout_util
 from .http_util import ResponseTooLarge, install_key_redaction, read_json_capped, short_for_log
 
 logger = logging.getLogger(__name__)
@@ -150,7 +149,9 @@ def _plausible_ts(value, address: str) -> Optional[int]:
     unparseable or implausible -- see ``_implausible`` (M4)."""
     try:
         ts = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: JSON's 1e400 is standards-conformant and decodes to
+        # float("inf"), which int() refuses (I2).
         ts = None
     if _implausible(ts):
         _warn_bad_ts(address, value)
@@ -426,7 +427,7 @@ class EtherscanClient:
             block = int(tx["blockNumber"])
             raw_ts = tx["timeStamp"]
             frm = str(tx["from"]).lower()
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, OverflowError) as e:
             raise ValueError(f"malformed Etherscan tx entry for {address}: {e}") from e
         ts = _plausible_ts(raw_ts, address)
         return None if ts is None else (block, ts, frm)
@@ -511,7 +512,7 @@ class BlockscoutV2Client:
                 if not last_items:
                     return None
                 return self._parse_tx(last_items[-1], address)
-            safe = _safe_next_page_params(next_params, address)
+            safe = blockscout_util.safe_next_page_params(next_params, address)
             if not safe:
                 # Every pagination key the server sent was rejected (L5).
                 # Re-requesting page 1 would loop, and guessing the next page
@@ -584,60 +585,19 @@ class BlockscoutV2Client:
             block = int(tx["block_number"])
             raw_ts = tx["timestamp"]
             frm = str(tx["from"]["hash"]).lower()
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, OverflowError) as e:
             raise ValueError(f"malformed Blockscout tx entry for {address}: {e}") from e
         ts = _parse_blockscout_timestamp(raw_ts, address)
         return None if ts is None else (block, ts, frm)
 
 
-# Blockscout pagination keys we are willing to echo back as query parameters.
-# Every real one is a short lowercase snake_case name (``block_number``,
-# ``index``, ``items_count``, ...).
-_NEXT_PAGE_KEY_RE = re.compile(r"^[a-z_]{1,32}$")
-
-
-def _safe_next_page_params(next_params, address: str) -> dict:
-    """The subset of Blockscout's ``next_page_params`` safe to send back (L5).
-
-    The next page request is built from a value the *server* chose, so it is
-    attacker-influenced input to our own outbound request: forwarding it
-    verbatim lets the remote inject arbitrary query parameters (overriding our
-    ``filter=to``, adding keys the endpoint treats specially) and, if the shape
-    is not a flat mapping, hand ``requests`` something it will encode in
-    surprising ways. Only ``^[a-z_]{1,32}$`` keys with scalar ``str``/``int``/
-    ``bool`` values survive; anything else is dropped with a WARNING naming the
-    rejected key (``%r`` -- it is remote text). A non-mapping ``next_params``
-    yields ``{}``, which ``first_tx`` treats as "stop paging"."""
-    if not isinstance(next_params, dict):
-        logger.warning("rater_profile: Blockscout next_page_params for %r is not an object (%s) - "
-                        "not paging further", address, type(next_params).__name__)
-        return {}
-    safe = {}
-    for key, value in next_params.items():
-        if (isinstance(key, str) and _NEXT_PAGE_KEY_RE.match(key)
-                and isinstance(value, (str, int, bool))):
-            safe[key] = value
-        else:
-            logger.warning("rater_profile: dropping unsafe Blockscout pagination key %r for %r",
-                            short_for_log(key), address)
-    return safe
-
-
 def _parse_blockscout_timestamp(ts, address: str) -> Optional[int]:
-    """Parse a Blockscout v2 ISO8601 timestamp (e.g.
-    ``"2026-02-22T21:16:19.000000Z"``) into epoch seconds, or ``None`` (with
-    one WARNING) if it is unparseable or implausible -- see ``_implausible``
-    (M4). ``datetime.fromisoformat`` doesn't accept a trailing ``Z`` (replaced
-    with ``+00:00``) and, on Python < 3.11, only accepts a 3- or 6-digit
-    fractional-second component -- so fractional seconds, if any, are stripped
-    rather than relied upon."""
-    try:
-        s = re.sub(r"\.\d+", "", str(ts).replace("Z", "+00:00"))
-        epoch = int(datetime.fromisoformat(s).timestamp())
-    except (ValueError, OverflowError, OSError):
-        _warn_bad_ts(address, ts)
-        return None
-    if _implausible(epoch):
+    """Epoch seconds for a Blockscout ISO8601 timestamp, or ``None`` (with one
+    WARNING) if it is unparseable or implausible -- see ``_implausible`` (M4).
+    The parsing itself lives in ``blockscout_util.parse_timestamp``; what is
+    decided here is whether the result is a value we are willing to cache."""
+    epoch = blockscout_util.parse_timestamp(ts)
+    if epoch is None or _implausible(epoch):
         _warn_bad_ts(address, ts)
         return None
     return epoch

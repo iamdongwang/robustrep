@@ -5,6 +5,7 @@ import logging
 
 import pytest
 
+from robustrep.sources import http_util
 from robustrep.sources.http_util import (
     ApiKeyRedactor,
     ResponseTooLarge,
@@ -173,3 +174,75 @@ def test_install_key_redaction_ignores_a_falsy_key():
     install_key_redaction("")
     install_key_redaction(None)
     assert logging.getLogger("urllib3").filters == before
+
+
+# --- the cap is exclusive: one byte past the limit is refused -----------------------
+
+
+def test_rejects_exactly_one_byte_past_the_limit():
+    payload = json.dumps({"k": "v"}).encode()
+    assert read_json_capped(FakeResponse(payload), len(payload)) == {"k": "v"}
+    with pytest.raises(ResponseTooLarge):
+        read_json_capped(FakeResponse(payload), len(payload) - 1)
+
+
+# --- I2: non-finite JSON numbers are refused at the choke point ---------------------
+
+
+def test_rejects_the_nan_constant():
+    with pytest.raises(ValueError) as exc:
+        read_json_capped(FakeResponse(b'{"ts": NaN}'), 1024)
+    assert not isinstance(exc.value, ResponseTooLarge)
+
+
+def test_rejects_the_infinity_constant():
+    with pytest.raises(ValueError):
+        read_json_capped(FakeResponse(b'{"ts": Infinity}'), 1024)
+
+
+def test_rejects_the_negative_infinity_constant():
+    with pytest.raises(ValueError):
+        read_json_capped(FakeResponse(b'{"ts": -Infinity}'), 1024)
+
+
+def test_still_parses_ordinary_numbers():
+    assert read_json_capped(FakeResponse(b'{"ts": 1.5, "n": 7}'), 1024) == {"ts": 1.5, "n": 7}
+
+
+# --- M1: a key too short to match safely is not redacted at all ---------------------
+
+
+def test_install_key_redaction_refuses_a_short_key(caplog):
+    logger_names = ("urllib3", "urllib3.connectionpool")
+    before = {n: list(logging.getLogger(n).filters) for n in logger_names}
+    try:
+        with caplog.at_level(logging.WARNING, logger="robustrep.sources.http_util"):
+            install_key_redaction("KEY")
+        for n in logger_names:
+            assert logging.getLogger(n).filters == before[n]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "KEY" not in warnings[0].getMessage()  # never echo the key itself
+        assert "3" in warnings[0].getMessage()  # its length is safe to state
+    finally:
+        for n, filters in before.items():
+            logging.getLogger(n).filters = filters
+        http_util._installed_redactors.clear()
+
+
+def test_install_key_redaction_warns_once_per_short_key(caplog):
+    before = {n: list(logging.getLogger(n).filters) for n in ("urllib3", "urllib3.connectionpool")}
+    try:
+        with caplog.at_level(logging.WARNING, logger="robustrep.sources.http_util"):
+            install_key_redaction("short")
+            install_key_redaction("short")
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+    finally:
+        for n, filters in before.items():
+            logging.getLogger(n).filters = filters
+        http_util._installed_redactors.clear()
+
+
+def test_redaction_covers_every_urllib3_logger_that_echoes_a_url():
+    assert set(http_util._URLLIB3_LOGGERS) >= {
+        "urllib3", "urllib3.connectionpool", "urllib3.util.retry", "urllib3.poolmanager"}

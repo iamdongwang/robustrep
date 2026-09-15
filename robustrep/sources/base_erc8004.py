@@ -131,6 +131,28 @@ def _valid_shape(name: str, topics: list, data_hex, tx_hash) -> bool:
     return True
 
 
+def _abi_decode(types: list, data: bytes, name: str, tx_hash):
+    """ABI-decode a log's ``data`` blob, or ``None`` (one WARNING) if it does
+    not decode (I1).
+
+    ``_valid_shape`` proves the blob is *hex*, not that it holds enough bytes
+    for the event's ABI: a well-formed ``NewFeedback`` log carrying ``0x`` (or
+    a single word) makes ``eth_abi`` raise ``InsufficientDataBytes``, which is
+    neither ``ValueError`` nor part of any contract ``decode_log`` documents.
+    It would escape to ``sync_feedback``'s "a decode failure is a bug" branch
+    and abort the entire fetch -- so anyone able to emit one cheap malformed
+    event could stop the pipeline. ``eth_abi``'s exception types are not a
+    stable public hierarchy, so every exception is caught; only the exception
+    *type name* is logged, never its text, which can echo the blob back.
+    """
+    try:
+        return decode(types, data)
+    except Exception as e:  # noqa: BLE001 - see docstring: eth_abi's hierarchy is not public
+        logger.warning("decode_log: skipping %s log in tx %r: data does not ABI-decode (%s)",
+                        name, _short(tx_hash), type(e).__name__)
+        return None
+
+
 def decode_log(log: dict) -> Optional[dict]:
     """Decode one ``eth_getLogs`` entry from the ReputationRegistry.
 
@@ -140,8 +162,9 @@ def decode_log(log: dict) -> Optional[dict]:
     does not match any known event.
 
     Also returns ``None`` -- logging one WARNING -- for a recognized event whose
-    *shape* is wrong: a topic that is not ``0x`` plus 64 hex characters, or a
-    ``data`` field that is not ``0x`` plus whole hex bytes (L4). These fields
+    *shape* is wrong: a topic that is not ``0x`` plus 64 hex characters, a
+    ``data`` field that is not ``0x`` plus whole hex bytes (L4), or a data blob
+    that does not ABI-decode for its event (I1, see ``_abi_decode``). These fields
     come from whoever emitted the event, so a malformed one must be skipped like
     any uninteresting log, not turned into an exception that aborts the caller's
     whole sync (see the module docstring).
@@ -170,15 +193,21 @@ def decode_log(log: dict) -> Optional[dict]:
     base = dict(chain=CHAIN, block=_hexint(log["blockNumber"]), tx_hash=log["transactionHash"],
                 log_index=_hexint(log["logIndex"]))
     data = bytes.fromhex(data_hex[2:]) if data_hex != "0x" else b""
+    if t0 == TOPIC_REVOKED:
+        # Every FeedbackRevoked field is an indexed topic, so there is no data
+        # blob to decode -- "0x" is this event's normal shape.
+        return {**base, "kind": "revoked", "agent_id": str(_uint(topics[1])), "client": _addr(topics[2]),
+                "feedback_index": _uint(topics[3])}
+    types = FEEDBACK_TYPES if t0 == TOPIC_NEW_FEEDBACK else RESPONSE_TYPES
+    fields = _abi_decode(types, data, name, log.get("transactionHash"))
+    if fields is None:
+        return None
     if t0 == TOPIC_NEW_FEEDBACK:
-        fi, val, dec, tag1, tag2, endpoint, uri, h = decode(FEEDBACK_TYPES, data)
+        fi, val, dec, tag1, tag2, endpoint, uri, h = fields
         return {**base, "kind": "feedback", "agent_id": str(_uint(topics[1])), "client": _addr(topics[2]),
                 "feedback_index": fi, "value": str(val), "value_decimals": dec, "tag1": tag1, "tag2": tag2,
                 "endpoint": endpoint, "feedback_uri": uri, "feedback_hash": "0x" + h.hex()}
-    if t0 == TOPIC_REVOKED:
-        return {**base, "kind": "revoked", "agent_id": str(_uint(topics[1])), "client": _addr(topics[2]),
-                "feedback_index": _uint(topics[3])}
-    fi, uri, h = decode(RESPONSE_TYPES, data)
+    fi, uri, h = fields
     return {**base, "kind": "response", "agent_id": str(_uint(topics[1])), "client": _addr(topics[2]),
             "responder": _addr(topics[3]), "feedback_index": fi, "response_uri": uri,
             "response_hash": "0x" + h.hex()}
@@ -351,26 +380,31 @@ def fill_block_timestamps(store: Store, rpc, batch_size: int = 100, state: Optio
     return len(missing)
 
 
-# uint256 upper bound: an agent id at or past this cannot be ABI-encoded.
+# uint256 upper bound: an agent id at or past this cannot be ABI-encoded, and
+# the widest decimal string that can stay under it (2**256-1 has 78 digits).
 _UINT256_LIMIT = 2 ** 256
+_AGENT_ID_RE = re.compile(r"^[0-9]{1,78}$")
 
 
 def _owner_call_data(agent_id: str) -> str:
     """``eth_call`` calldata for ``ownerOf(uint256 agent_id)`` on the
     IdentityRegistry -- the 4-byte selector plus the id left-padded to 32 bytes.
 
-    Raises ``ValueError`` if ``agent_id`` is not a decimal integer in
-    ``[0, 2**256)`` (L4). Agent ids reach here from the store, which is filled
-    from log topics, so a bad one is remote input: without this check
-    ``int(agent_id)`` raises ``ValueError`` on a non-decimal id and
-    ``.to_bytes(32, "big")`` raises ``OverflowError`` on an over-long one --
-    neither of which the callers below (which handle only ``RpcError``) expect.
-    """
-    try:
-        value = int(agent_id)
-    except (TypeError, ValueError):
-        raise ValueError(f"agent id is not a decimal integer: {_short(agent_id)!r}") from None
-    if not 0 <= value < _UINT256_LIMIT:
+    Raises ``ValueError`` unless ``agent_id`` renders as plain decimal digits
+    (``^[0-9]{1,78}$``) below ``2**256`` (L4). Agent ids reach here from the
+    store, which is filled from log topics, so a bad one is remote input:
+    without this check ``int(agent_id)`` raises ``ValueError`` on a non-decimal
+    id and ``.to_bytes(32, "big")`` raises ``OverflowError`` on an over-long
+    one -- neither of which the callers below (which handle only ``RpcError``)
+    expect. The regex is stricter than ``int()`` on purpose: ``int`` also
+    accepts ``" 12 "``, ``"1_0"`` and ``"+7"``, none of which is an id this
+    pipeline ever produced, and silently normalizing them would make the same
+    agent addressable under several spellings."""
+    text = agent_id if isinstance(agent_id, str) else str(agent_id)
+    if not _AGENT_ID_RE.match(text):
+        raise ValueError(f"agent id is not a plain decimal integer: {_short(agent_id)!r}")
+    value = int(text)
+    if value >= _UINT256_LIMIT:
         raise ValueError(f"agent id out of uint256 range: {_short(agent_id)!r}")
     return _OWNER_OF_SELECTOR + value.to_bytes(32, "big").hex()
 
@@ -398,12 +432,26 @@ def _owner_calls(agent_ids: list[str]) -> tuple[list[str], list, list[str]]:
 
 def _decode_owner_result(out) -> Optional[str]:
     """Decode one ``eth_call`` result for ``ownerOf`` into a lowercase
-    ``0x``-prefixed address, or ``None`` if it's empty or the zero address
-    (agent burned/never minted). Shared by ``owner_of`` and ``owners_of`` so
-    both apply exactly the same decoding rules."""
+    ``0x``-prefixed address, or ``None`` if it's empty, the zero address (agent
+    burned/never minted), or not an address at all. Shared by ``owner_of`` and
+    ``owners_of`` so both apply exactly the same decoding rules.
+
+    The result is whatever the node sent back, so it is validated rather than
+    sliced on faith (I3): ``"garbage-from-a-node"[-40:]`` would otherwise be
+    stored as an agent's owner, and a non-string result would raise
+    ``TypeError`` out of ``owners_of``, which handles only ``RpcError``. Either
+    way the agent is treated as having no resolvable owner, with one WARNING;
+    an empty result and a null one stay silent, since those are the ordinary
+    "no such token" answers."""
     if out in (None, "0x"):
         return None
+    if not isinstance(out, str):
+        logger.warning("owner_of: ignoring non-string eth_call result of type %s", type(out).__name__)
+        return None
     addr = "0x" + out[-40:].lower()
+    if not _ADDR_RE.match(addr):
+        logger.warning("owner_of: ignoring eth_call result that is not an address: %r", _short(out))
+        return None
     return None if addr == ZERO_ADDRESS else addr
 
 
