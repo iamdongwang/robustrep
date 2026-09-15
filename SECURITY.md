@@ -47,14 +47,18 @@ count) and hard caps on response size and time.
 **Residual limitation: DNS rebinding.** The guard resolves the hostname and
 checks those addresses, but `requests`/`urllib3` resolves it again to make the
 connection. An attacker who can answer differently between the two lookups can
-still cause a GET to a private address; the response body is never returned to
-the caller, but the recorded evidence level leaks a few bits about the target.
-This gap is documented in detail in `robustrep/sources/evidence_fetch.py` and
-pinned by a strict-xfail test; a pinned-IP transport adapter is scheduled for
-v0.2. Until then: **run `fetch` on a host that has no privileged reachability
-into an internal network** (a laptop on a plain internet connection, or a
-throwaway cloud box), not on a machine inside a private network or with access
-to a cloud metadata service.
+still cause a GET to a private address. The response body is never persisted
+or reported -- but what *is* persisted, the `(level, note)` pair recorded per
+evidence URI, makes the bypass a four-state oracle about the target: no
+response at all, a response with no markers in it, a response containing a
+transaction hash or a task-id key, or a hash involving the rater/owner
+addresses. A narrow leak rather than a blind request, which is why the gap is
+tracked instead of shrugged off. It is documented in full in
+`robustrep/sources/evidence_fetch.py` and pinned by a strict-xfail test; a
+pinned-IP transport adapter is scheduled for v0.2. Until then: **run `fetch`
+on a host that has no privileged reachability into an internal network** (a
+laptop on a plain internet connection, or a throwaway cloud box), not on a
+machine inside a private network or with access to a cloud metadata service.
 
 **Secrets.** API keys (e.g. an Etherscan key) are read from environment
 variables only. Do not put them on the command line, in a config file in the

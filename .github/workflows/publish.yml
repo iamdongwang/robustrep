@@ -5,14 +5,27 @@ on:
 permissions:
   contents: read
 jobs:
+  # A tag does not re-run ci.yml (it is scoped to branches), and a release is
+  # the one build nobody gets to re-do, so the full gate runs here before the
+  # artifacts that get uploaded are produced.
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with: { python-version: "3.12" }
-      - run: pip install build && python -m build
+      - run: python -m pip install -c constraints.txt --upgrade pip
+      - run: pip install -e ".[dev]" -c constraints.txt
+      - run: pip-audit --strict --progress-spinner off --no-deps -r constraints.txt
+      - run: pytest -q
+      # `pip install -c` does not reach into PEP 517 build environments: the
+      # isolated env `python -m build` creates resolves its own setuptools and
+      # wheel from PyPI, unconstrained and outside the audit above. Constraining
+      # `build` itself is as far as the pin reaches; closing the rest would mean
+      # `--no-isolation` with a pinned backend, which is a separate change.
+      - run: pip install -c constraints.txt build
+      - run: python -m build
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with: { name: dist, path: dist/ }
   publish:
