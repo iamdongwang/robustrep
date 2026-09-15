@@ -277,14 +277,18 @@ def test_sync_feedback_applies_feedback_revoked_and_response(tmp_path):
 
 # --- decode_log: _hexint and topic-count validation --------------------------------
 
-def test_decode_log_accepts_int_block_and_log_index():
+def test_decode_log_rejects_int_block_and_log_index(caplog):
+    # Previously tolerated as "some clients decode these for you". A node is
+    # untrusted input, so the wire form (0x-hex) is now the only accepted one:
+    # anything else is skipped rather than guessed at.
     data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
                   [1, 1, 0, "q", "", "", "", b"\x00" * 32])
     agent = "0x" + (2).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
     log = {"topics": [b.TOPIC_NEW_FEEDBACK, agent, client, "0x" + "00" * 32], "data": "0x" + data.hex(),
            "blockNumber": 555, "transactionHash": "0xt", "logIndex": 3}
-    out = b.decode_log(log)
-    assert out["block"] == 555 and out["log_index"] == 3
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(log) is None
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
 def test_decode_log_short_topics_raises_valueerror():
@@ -330,7 +334,7 @@ def test_fill_block_timestamps_falls_back_to_per_block_on_rpcerror(tmp_path):
     assert store.load_records()["ts"].iloc[0] == 1007
 
 
-def test_fill_block_timestamps_accepts_int_timestamp_via_batch(tmp_path):
+def test_fill_block_timestamps_skips_int_timestamp_via_batch(tmp_path):
     store = Store(tmp_path / "t_int_ts_batch.db")
     data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
                   [1, 1, 0, "q", "", "", "", b"\x00" * 32])
@@ -345,11 +349,12 @@ def test_fill_block_timestamps_accepts_int_timestamp_via_batch(tmp_path):
 
     rpc = IntTsRpc({})
     n = b.fill_block_timestamps(store, rpc)
-    assert n == 1
-    assert store.load_records()["ts"].iloc[0] == 1007
+    assert n == 0  # skipped: not the 0x-hex wire form
+    assert store.load_records()["ts"].iloc[0] == 0  # no timestamp cached
+    assert store.missing_block_ts() == [7]  # still retryable on the next run
 
 
-def test_fill_block_timestamps_accepts_int_timestamp_via_fallback(tmp_path):
+def test_fill_block_timestamps_skips_int_timestamp_via_fallback(tmp_path):
     store = Store(tmp_path / "t_int_ts_fallback.db")
     data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
                   [1, 1, 0, "q", "", "", "", b"\x00" * 32])
@@ -370,8 +375,8 @@ def test_fill_block_timestamps_accepts_int_timestamp_via_fallback(tmp_path):
 
     rpc = IntTsFallbackRpc({})
     n = b.fill_block_timestamps(store, rpc)
-    assert n == 1
-    assert store.load_records()["ts"].iloc[0] == 1009
+    assert n == 0  # skipped: not the 0x-hex wire form
+    assert store.missing_block_ts() == [9]
 
 
 def test_fill_block_timestamps_null_block_raises_rpcerror(tmp_path):
@@ -892,3 +897,140 @@ def test_owner_call_data_rejects_padded_or_separated_digits():
     for bad in (" 12 ", "1_0", "+7", "12.0", "0b11"):
         with pytest.raises(ValueError):
             b._owner_call_data(bad)
+
+
+# --- strict hex parsing of node-supplied quantities ---------------------------------
+
+
+def _feedback_log(agent=2, **overrides):
+    """A well-formed NewFeedback log; ``agent`` varies the (agent_id, client,
+    feedback_index) primary key so several can coexist in one store."""
+    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+    log = _log(b.TOPIC_NEW_FEEDBACK, [_agent_topic(agent), _CLIENT_TOPIC, _agent_topic(0)], data)
+    log.update(overrides)
+    return log
+
+
+@pytest.mark.parametrize("bad_block", [
+    float("inf"),  # what JSON's 1e400 decodes to: int(inf, 16) raises TypeError
+    float("nan"),
+    12,            # already-decoded int: not the wire form
+    "12",          # decimal string
+    "0xZZ",        # not hex
+    "0x",          # no digits
+    "1500",
+    None,
+    ["0x1"],
+    "0x" + "f" * 65,  # wider than a uint256
+])
+def test_decode_log_rejects_a_non_hex_block_number(bad_block, caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(_feedback_log(blockNumber=bad_block)) is None
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+@pytest.mark.parametrize("bad_index", [float("inf"), 3, "3", "0xZZ", None])
+def test_decode_log_rejects_a_non_hex_log_index(bad_index, caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(_feedback_log(logIndex=bad_index)) is None
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_decode_log_warning_does_not_echo_a_huge_block_number(caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(_feedback_log(blockNumber="0x" + "9" * 100_000)) is None
+    assert len(caplog.text) < 2000
+
+
+def test_decode_log_accepts_an_uppercase_hex_quantity():
+    assert b.decode_log(_feedback_log(blockNumber="0xABC"))["block"] == 0xABC
+
+
+def test_hexint_accepts_the_wire_form():
+    assert b._hexint("0x2dfccac") == 0x2dfccac
+    assert b._hexint("0x0") == 0
+
+
+@pytest.mark.parametrize("bad", [12, "12", "0xZZ", None, float("inf"), b"0x1", True])
+def test_hexint_rejects_everything_else(bad):
+    with pytest.raises(ValueError):
+        b._hexint(bad)
+
+
+def test_sync_feedback_continues_past_a_log_with_a_bad_block_number(tmp_path):
+    bad = _feedback_log(blockNumber=float("inf"))
+    good = _feedback_log(agent=3, logIndex="0x1")
+    rpc = FakeRpc({(1, 10): [bad, good]}, head=10)
+    s = Store(tmp_path / "t.db")
+    n = b.sync_feedback(s, rpc, chunk=10, start_block=1, end_block=10)
+    assert n == 1
+    assert s.get_sync("last_block") == "10"
+    assert s.pop_failed_ranges() == []
+
+
+def test_sync_feedback_rejects_a_malformed_chain_head(tmp_path):
+    class BadHeadRpc(FakeRpc):
+        def call(self, method, params):
+            if method == "eth_blockNumber":
+                return 12345  # int, not the "0x..." wire form
+            return super().call(method, params)
+
+    s = Store(tmp_path / "t.db")
+    with pytest.raises(RpcError):
+        b.sync_feedback(s, BadHeadRpc({}), chunk=10, start_block=1)
+
+
+def test_sync_feedback_rejects_a_non_hex_chain_head(tmp_path):
+    class BadHeadRpc(FakeRpc):
+        def call(self, method, params):
+            if method == "eth_blockNumber":
+                return "0xZZZZ"
+            return super().call(method, params)
+
+    s = Store(tmp_path / "t.db")
+    with pytest.raises(RpcError):
+        b.sync_feedback(s, BadHeadRpc({}), chunk=10, start_block=1)
+
+
+def test_fill_block_timestamps_skips_a_missing_timestamp_field(tmp_path):
+    store = Store(tmp_path / "t.db")
+    store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x5"))])
+
+    class NoTsRpc(FakeRpc):
+        def batch(self, calls):
+            self.batch_calls += 1
+            return [{"number": "0x5"} for _ in calls]
+
+    assert b.fill_block_timestamps(store, NoTsRpc({})) == 0
+    assert store.missing_block_ts() == [5]
+
+
+def test_fill_block_timestamps_skips_a_non_dict_block(tmp_path):
+    store = Store(tmp_path / "t.db")
+    store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x6"))])
+
+    class StringBlockRpc(FakeRpc):
+        def batch(self, calls):
+            self.batch_calls += 1
+            return ["not-a-block" for _ in calls]
+
+    assert b.fill_block_timestamps(store, StringBlockRpc({})) == 0
+    assert store.missing_block_ts() == [6]
+
+
+def test_fill_block_timestamps_caches_the_good_blocks_in_a_mixed_batch(tmp_path, caplog):
+    store = Store(tmp_path / "t.db")
+    store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x7")),
+                           b.decode_log(_feedback_log(agent=3, blockNumber="0x8", logIndex="0x1"))])
+
+    class MixedRpc(FakeRpc):
+        def batch(self, calls):
+            self.batch_calls += 1
+            return [{"timestamp": hex(1000 + int(p[0], 16))} if int(p[0], 16) == 7
+                    else {"timestamp": 1008} for _, p in calls]
+
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.fill_block_timestamps(store, MixedRpc({})) == 1
+    assert store.missing_block_ts() == [8]
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
