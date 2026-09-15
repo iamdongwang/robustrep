@@ -81,12 +81,13 @@ def scenario_c_rows() -> tuple[list, list]:
     never rate "A" -- under the old min-max fallback they flattened every honest
     score to exactly 0.5.
 
-    20 honest rows, not 10: two out-of-range records fall inside the group's
-    outlier tolerance only from n=20 up (see `robustrep.normalize._fits`). With
-    10 honest rows the group correctly drops to the group-relative `rank` rung
-    instead, which preserves order and spread but not the exact honest scores --
-    that is the documented limit of the tolerance, not the property this scenario
-    pins.
+    The honest group needs at least 18 rows for this to be the property under
+    test: two out-of-range records fall inside the outlier tolerance from 18
+    honest rows up, and below that the group correctly drops to the
+    group-relative `rank` rung instead, preserving order and spread but not the
+    exact honest scores (the documented limit of the tolerance -- see
+    `robustrep.normalize._fits`). 20 is used rather than the bare threshold of 18
+    because it gives a clean 0.05-step spread of honest percentages.
     """
     honest_rows = [dict(rater=f"c{i}", ratee="A", value=v, ts=i * 7 * DAY, evidence_level=2)
                    for i, v in enumerate(C_HONEST_VALUES)]

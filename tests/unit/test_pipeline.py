@@ -236,3 +236,12 @@ def test_prepare_passes_norm_fit_share_through(records_factory):
     df = records_factory(rows)
     assert set(prepare(df, Config(norm_fit_share=0.9))["norm_rule"]) == {"rank"}
     assert set(prepare(df, Config(norm_fit_share=0.75))["norm_rule"]) == {"percent"}
+
+
+def test_score_exposes_norm_rule_counts(records_factory):
+    # M-5: the scored frame carries the normalization rule counts from the frame
+    # `prepare` already built, so provenance never re-runs the pipeline for them.
+    df = records_factory([dict(rater=f"r{i}", ratee="A", value=80) for i in range(3)]
+                         + [dict(rater="b0", ratee="B", value=1, tag="bin")])
+    assert score(df, _cfg()).attrs["norm_rule_counts"] == {"percent": 3, "binary": 1}
+    assert score(pd.DataFrame(columns=RECORD_COLUMNS), _cfg()).attrs["norm_rule_counts"] == {}

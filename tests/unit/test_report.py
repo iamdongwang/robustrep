@@ -86,7 +86,9 @@ def test_sensitivity_table_reflects_real_perturbations(records_factory):
     move the top-N ranking away from the base configuration."""
     records, meta = _sensitivity_data(records_factory)
     t = sensitivity_table(records, Config(bootstrap_n=0), meta=meta, top_n=10)
-    assert len(t) == 7
+    assert len(t) == 9
+    # normalization fit share is a perturbation axis of its own (Rec 2)
+    assert {"fit_0.8", "fit_1.0"} <= set(t["variant"])
     by_variant = t.set_index("variant")["spearman_top"]
     assert by_variant["base"] == pytest.approx(1.0)
     assert (by_variant < 1.0).any()

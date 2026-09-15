@@ -1192,3 +1192,25 @@ def test_report_latest_is_atomically_replaced_and_stale_files_removed(tmp_path):
     assert (out_dir / "latest" / "report.md").exists()
     assert (out_dir / "latest" / "scores.json").exists()
     assert len(list((out_dir / "latest").glob("*.png"))) == 5
+
+
+def test_provenance_norm_rule_counts_follow_the_run_config():
+    """`norm_rule_counts` must describe the run that was actually scored, not a
+    default-config re-run: the same frame is `rank` at norm_fit_share 0.9 and
+    `percent` at 0.75."""
+    from robustrep import Config, score
+    from robustrep.schema import validate_records
+
+    honest = [10, 50, 90, 100, 0, 75, 25, 60]
+    rows = [dict(rater=f"r{i}", ratee="A", value=v, scale="d0", tag="q", ts=0,
+                 evidence_uri=None, source="test") for i, v in enumerate(honest)]
+    rows += [dict(rater="x1", ratee="Z", value=2**127 - 1, scale="d0", tag="q", ts=0,
+                  evidence_uri=None, source="test"),
+             dict(rater="x2", ratee="Z", value=-(2**127), scale="d0", tag="q", ts=0,
+                  evidence_uri=None, source="test")]
+    records = validate_records(pd.DataFrame(rows))
+    for fit_share, rule in ((0.9, "rank"), (0.75, "percent")):
+        cfg = Config(bootstrap_n=0, norm_fit_share=fit_share)
+        prov = cli._provenance("onchain", cfg, records, score(records, cfg))
+        assert prov["config"]["norm_fit_share"] == fit_share
+        assert prov["config"]["norm_rule_counts"] == {rule: 10}

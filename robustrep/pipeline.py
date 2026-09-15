@@ -51,6 +51,15 @@ def prepare(records: pd.DataFrame, cfg: Config, clusters: Optional[dict] = None)
     return df
 
 
+def _rule_counts(df: pd.DataFrame) -> dict:
+    """`{norm_rule: record count}` for a prepared frame, JSON-friendly.
+
+    Read off the frame `prepare` already built, so a caller wanting the counts
+    (the report's provenance block) never re-runs validate/normalize for them.
+    """
+    return {str(rule): int(n) for rule, n in df["norm_rule"].value_counts().items()}
+
+
 def collapse(df: pd.DataFrame) -> pd.DataFrame:
     """One vote per (ratee, tag, cluster): median score, mean weight."""
     return (df.groupby(["ratee", "tag", "cluster"], as_index=False)
@@ -147,13 +156,22 @@ def score(records: pd.DataFrame, cfg: Config = Config(), clusters: Optional[dict
 
     `aggregator`, when given (not None), raises `NotImplementedError`: v1
     always uses the weighted median; custom aggregators arrive in v2.
+
+    The returned frame carries `attrs["norm_rule_counts"]`: `{norm_rule: record
+    count}` over the prepared rows. Normalization picks a rule per (tag, scale)
+    group from that group's own contents, so which rules fired is part of how a
+    run was computed -- the report records it (see `robustrep.cli._provenance`),
+    and it costs nothing here because `prepare` already built the frame.
     """
     if aggregator is not None:
         raise NotImplementedError("custom aggregators arrive in v2")
     df = prepare(records, cfg, clusters)
+    rule_counts = _rule_counts(df)
     if df.empty:
         empty = pd.DataFrame({col: pd.Series(dtype=dt) for col, dt in _RESULT_DTYPES.items()})
-        return empty[RESULT_COLUMNS]
+        empty = empty[RESULT_COLUMNS]
+        empty.attrs["norm_rule_counts"] = rule_counts
+        return empty
     votes = collapse(df)
     # Group votes by ratee once, up front: an O(1) dict lookup per ratee below
     # instead of rescanning the whole `votes` frame per ratee (which would be
@@ -192,4 +210,5 @@ def score(records: pd.DataFrame, cfg: Config = Config(), clusters: Optional[dict
     out = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     for col in ("n_clusters", "n_raw", "sybil_flag", "insufficient"):
         out[col] = out[col].astype(int)
+    out.attrs["norm_rule_counts"] = rule_counts
     return out

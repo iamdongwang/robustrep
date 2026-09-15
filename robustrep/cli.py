@@ -30,7 +30,7 @@ import typer
 
 from . import __version__
 from .config import Config
-from .pipeline import prepare, score as score_fn
+from .pipeline import score as score_fn
 from .report.adversarial import scenario_table
 from .report.export import export_json
 from .report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
@@ -406,20 +406,25 @@ def _evidence_shares_for_provenance(records: pandas.DataFrame) -> dict:
     return {int(level): float(share) for level, share in shares.items()}
 
 
-def _norm_rule_counts_for_provenance(records: pandas.DataFrame, cfg: Config) -> dict:
-    """Records per normalization rule, as a JSON-friendly ``{rule: count}`` dict.
+def _norm_rule_counts_for_provenance(result: Optional[pandas.DataFrame]) -> dict:
+    """Records per normalization rule, read off the scored frame's ``attrs``.
 
-    Computed through ``prepare`` so it reflects exactly the rules the scored run
-    used (revoked rows dropped, ``cfg.norm_fit_share`` applied). Normalization
-    picks a rule per (tag, scale) group from the group's own contents, so a rung
-    flip is the visible symptom of a value-poisoning attempt -- publishing the
-    counts makes one show up as a plain diff between two runs' reports.
+    ``pipeline.score`` stamps these from the frame it already prepared, so they
+    describe exactly the run being reported (revoked rows dropped, that run's
+    ``norm_fit_share`` applied) and cost nothing -- recomputing them here would
+    re-run validate/normalize over the whole dataset. Normalization picks a rule
+    per (tag, scale) group from the group's own contents, so a rung flip is the
+    visible symptom of a value-poisoning attempt: publishing the counts makes one
+    show up as a plain diff between two runs' reports. ``{}`` when no scored
+    frame is supplied.
     """
-    rules = prepare(records, cfg)["norm_rule"]
-    return {str(rule): int(n) for rule, n in rules.value_counts().items()}
+    if result is None:
+        return {}
+    return {str(rule): int(n) for rule, n in result.attrs.get("norm_rule_counts", {}).items()}
 
 
-def _provenance(mode: str, cfg: Config, records: pandas.DataFrame) -> dict:
+def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
+                result: Optional[pandas.DataFrame] = None) -> dict:
     config = dict(
         bootstrap_n=cfg.bootstrap_n,
         bootstrap_seed=cfg.bootstrap_seed,
@@ -430,7 +435,7 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame) -> dict:
         sybil_max_group=cfg.sybil_max_group,
         sybil_flag_share=cfg.sybil_flag_share,
         norm_fit_share=cfg.norm_fit_share,
-        norm_rule_counts=_norm_rule_counts_for_provenance(records, cfg),
+        norm_rule_counts=_norm_rule_counts_for_provenance(result),
         evidence_level_shares=_evidence_shares_for_provenance(records),
     )
     return dict(
@@ -523,7 +528,7 @@ def report(
 
     sens = sensitivity_table(records, cfg, meta=meta, top_n=top_n)
     adv = scenario_table()
-    provenance = _provenance(mode, cfg, records)
+    provenance = _provenance(mode, cfg, records, result)
 
     block_dir = out_dir / str(block)
     _write_report(block_dir, result, records, clusters, sens, adv, block, provenance, top_n)
