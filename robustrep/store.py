@@ -290,6 +290,45 @@ class Store:
             "AND NOT EXISTS (SELECT 1 FROM evidence_cache e WHERE e.uri=f.feedback_uri)").fetchall()
         return [r[0] for r in rows]
 
+    def pending_uris(self, include_notes: tuple[str, ...] = ()) -> list[tuple[str, str, str]]:
+        """Feedback URIs (empty ones excluded) that still need evidence
+        classification, each with its rater/owner parties GROUP_CONCAT-joined
+        exactly as ``evidence_fetch.classify_all`` consumes them: ``(uri,
+        clients_csv, owners_csv)``.
+
+        A URI is pending when it has never been cached, OR when it *is*
+        cached but with a note in ``include_notes`` -- e.g.
+        ``("lookup-budget",)`` to retry URIs whose tx-hash verification was
+        cut short by ``classify_all``'s shared per-run lookup budget (H3):
+        such a cached level may be a false negative (a verifying hash sat
+        past the cap), and a fresh run gets a fresh budget. Retrying is cheap
+        relative to a first classification -- the URI's text has to be
+        re-fetched, but that cost (not the RPC lookups) was always the bulk
+        of it. ``include_notes=()`` (the default) reproduces the original,
+        simple "not yet cached at all" behavior -- an ``unfetchable`` or
+        ``fetch-error`` cache entry is *not* retried by default; only notes
+        explicitly listed are.
+
+        feedback.client and agents.owner are 0x-hex addresses, which never
+        contain a comma, so GROUP_CONCAT's default "," separator can't
+        collide with an address value and corrupt a caller's split-back-apart.
+
+        Read up front (not streamed): the correlated NOT EXISTS sub-select
+        re-reads evidence_cache on every row, which is only safe to interleave
+        with writes when nothing is written back until the whole pending set
+        has been captured -- a caller writing results back mid-scan (e.g.
+        concurrent workers completing out of order) could otherwise race the
+        cursor's own re-evaluation of NOT EXISTS.
+        """
+        retry_clause = f"AND e.note NOT IN ({','.join('?' * len(include_notes))})" if include_notes else ""
+        q = f"""SELECT f.feedback_uri, GROUP_CONCAT(DISTINCT f.client), GROUP_CONCAT(DISTINCT a.owner)
+                FROM feedback f LEFT JOIN agents a ON a.agent_id=f.agent_id
+                WHERE f.feedback_uri<>'' AND NOT EXISTS (
+                    SELECT 1 FROM evidence_cache e WHERE e.uri=f.feedback_uri {retry_clause}
+                )
+                GROUP BY f.feedback_uri"""
+        return self.conn.execute(q, include_notes).fetchall()
+
     def distinct_clients(self) -> list[str]:
         """Client (rater) addresses not yet profiled in the raters cache."""
         rows = self.conn.execute(

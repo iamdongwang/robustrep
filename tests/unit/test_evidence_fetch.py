@@ -740,6 +740,72 @@ def test_classify_all_budget_not_exhausted_logs_no_warning(tmp_path, caplog):
     assert warnings == []
 
 
+def test_classify_all_per_uri_cap_still_applies_within_ample_total_budget(tmp_path):
+    # 2 URIs x 50 distinct hashes each, but MAX_TX_LOOKUPS_PER_URI (8) bounds
+    # each URI's own lookups regardless of how large max_total_lookups is --
+    # the per-URI cap and the shared run budget are independent controls.
+    s = Store(tmp_path / "tpassthrough.db")
+    rows = [{**_fb(f"https://pu{i}"), "feedback_index": i} for i in range(2)]
+    s.upsert_feedback(rows)
+
+    def fetch(uri, session=None):
+        i = int(uri.rsplit("pu", 1)[-1])
+        return _many_hashes_text(50, i)
+
+    calls = []
+
+    def tx_parties(h):
+        calls.append(h)
+        return None
+
+    n = classify_all(s, fetch_text=fetch, tx_parties=tx_parties,
+                      max_total_lookups=10_000, workers=2)
+    assert n == 2
+    assert len(calls) == 16  # 2 URIs * MAX_TX_LOOKUPS_PER_URI (8)
+
+
+def test_classify_all_starved_uri_is_retryable_and_upgrades_on_retry(tmp_path):
+    # A URI whose verifying hash sits past the point the run's shared budget
+    # cut off at (H3) must be persisted as retryable, not as an ordinary
+    # (possibly wrong) level 2 -- and a later run, with its own fresh budget,
+    # must pick it back up and upgrade it once it can actually reach that hash.
+    s = Store(tmp_path / "tretry.db")
+    hashes = ["0x" + f"{i:064x}" for i in range(5)]
+    text = " ".join(hashes)
+    verifying_hash = hashes[4]  # the 5th (last) hash -- past a budget of 3
+
+    def fetch(uri, session=None):
+        return text
+
+    def tx_parties(h):
+        return {"0xowner"} if h == verifying_hash else None
+
+    s.upsert_feedback([_fb("https://retry1")])
+    s.upsert_agent_owner("7", "0xowner")
+
+    # First run: the shared budget (3) is spent on hashes 1-3 before the
+    # verifying 5th hash is ever reached.
+    n1 = classify_all(s, fetch_text=fetch, tx_parties=tx_parties,
+                       max_total_lookups=3, workers=1)
+    assert n1 == 1
+    level1, note1 = s.conn.execute(
+        "SELECT level, note FROM evidence_cache WHERE uri='https://retry1'").fetchone()
+    assert (level1, note1) == (2, "lookup-budget")
+
+    # Second run: the "lookup-budget" note makes it pending again, and this
+    # run's fresh (ample, default) budget reaches the verifying hash.
+    n2 = classify_all(s, fetch_text=fetch, tx_parties=tx_parties, workers=1)
+    assert n2 == 1
+    level2, note2 = s.conn.execute(
+        "SELECT level, note FROM evidence_cache WHERE uri='https://retry1'").fetchone()
+    assert (level2, note2) == (3, "")
+
+    # Third run: the upgraded, non-"lookup-budget" result is final -- nothing
+    # left pending.
+    n3 = classify_all(s, fetch_text=fetch, tx_parties=tx_parties, workers=1)
+    assert n3 == 0
+
+
 def test_classify_all_each_worker_thread_gets_its_own_session(tmp_path):
     s = Store(tmp_path / "tsess.db")
     _seed_many(s, 40, prefix="s")

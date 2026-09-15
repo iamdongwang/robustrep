@@ -155,6 +155,28 @@ def test_fetch_end_to_end_with_stubs(tmp_path, monkeypatch):
     assert "rater profile mode" in r.output
 
 
+def test_fetch_evidence_line_reports_lookup_caps(tmp_path, monkeypatch):
+    # H3 (security review): the caps that shaped every cached evidence level
+    # this run produced must be visible in the fetch step's own summary line,
+    # not just buried in a later report's provenance.
+    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
+    from robustrep.sources.evidence_fetch import DEFAULT_MAX_TOTAL_LOOKUPS
+
+    db = tmp_path / "t.db"
+    _seed_agents(db, ["1", "2"])
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 3)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 2)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: "0xowner" for a in agent_ids})
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 5)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert f"max_lookups_per_uri={MAX_TX_LOOKUPS_PER_URI}" in r.output
+    assert f"max_total_lookups={DEFAULT_MAX_TOTAL_LOOKUPS}" in r.output
+
+
 def test_fetch_skip_evidence_skips_classify_all(tmp_path, monkeypatch):
     db = tmp_path / "t.db"
     _seed(db, n=1)
@@ -1136,6 +1158,31 @@ def test_report_provenance_includes_config_in_markdown_and_json(tmp_path):
                 "sybil_flag_share", "norm_fit_share", "norm_rule_counts"):
         assert key in config
     assert config["sybil_max_pairs_per_ratee"] == cli.Config().sybil_max_pairs_per_ratee
+
+
+def test_report_provenance_includes_evidence_lookup_caps(tmp_path):
+    # H3 (security review): evidence_max_lookups_per_uri/evidence_max_total_lookups
+    # bound which cached evidence levels might be false negatives (see
+    # evidence_fetch's "lookup-budget" note) -- publish them next to
+    # evidence_level_shares so a report is auditable against the caps that
+    # actually produced it.
+    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
+    from robustrep.sources.evidence_fetch import DEFAULT_MAX_TOTAL_LOOKUPS
+
+    db = tmp_path / "t.db"
+    _seed(db)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+
+    md = (out_dir / "latest" / "report.md").read_text()
+    for phrase in ("evidence_max_lookups_per_uri", "evidence_max_total_lookups"):
+        assert phrase in md, phrase
+
+    data = json.loads((out_dir / "latest" / "scores.json").read_text())
+    config = data["config"]
+    assert config["evidence_max_lookups_per_uri"] == MAX_TX_LOOKUPS_PER_URI
+    assert config["evidence_max_total_lookups"] == DEFAULT_MAX_TOTAL_LOOKUPS
 
 
 def test_report_provenance_includes_evidence_level_shares(tmp_path):

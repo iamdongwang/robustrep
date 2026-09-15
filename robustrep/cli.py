@@ -31,6 +31,7 @@ import typer
 
 from . import __version__
 from .config import Config
+from .evidence import MAX_TX_LOOKUPS_PER_URI
 from .pipeline import score as score_fn
 from .report.adversarial import scenario_table
 from .report.export import export_json
@@ -38,7 +39,7 @@ from .report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fi
 from .report.render import evidence_level_shares, render_markdown
 from .report.sensitivity import fig_sensitivity, sensitivity_table
 from .sources import base_erc8004 as base
-from .sources.evidence_fetch import classify_all
+from .sources.evidence_fetch import DEFAULT_MAX_TOTAL_LOOKUPS, classify_all
 from .sources.rater_profile import DEFAULT_RPS, EtherscanClient, default_client, enrich_raters, estimate_seconds
 from .sources.rpc import RpcClient, RpcError
 from .store import Store
@@ -221,10 +222,20 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
 
 
 def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
-    """Classify every not-yet-cached evidence URI referenced by feedback rows,
-    fetching+classifying up to ``workers`` URIs concurrently."""
+    """Classify every not-yet-cached (or budget-starved, see ``classify_all``)
+    evidence URI referenced by feedback rows, fetching+classifying up to
+    ``workers`` URIs concurrently.
+
+    The two H3 lookup caps (``MAX_TX_LOOKUPS_PER_URI``,
+    ``DEFAULT_MAX_TOTAL_LOOKUPS`` -- both applied via ``classify_all``'s
+    defaults) are echoed in the returned line itself, not just in
+    ``cli._provenance``'s ``config``: they shaped every level this run
+    persisted, so a human watching `fetch` run should see them without
+    having to go dig up a later `report`.
+    """
     n = classify_all(store, tx_parties=lambda h: base.tx_parties(rpc, h), workers=workers)
-    return f"evidence URIs classified: {n}"
+    return (f"evidence URIs classified: {n} "
+            f"(max_lookups_per_uri={MAX_TX_LOOKUPS_PER_URI}, max_total_lookups={DEFAULT_MAX_TOTAL_LOOKUPS})")
 
 
 @app.command()
@@ -498,6 +509,12 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         norm_fit_share=cfg.norm_fit_share,
         norm_rule_counts=_norm_rule_counts_for_provenance(result),
         evidence_level_shares=_evidence_shares_for_provenance(records),
+        # H3 (security review): not Config fields (they're module constants,
+        # not user-tunable per this task's scope) but they directly shaped
+        # which cached evidence levels are false negatives, so they belong
+        # next to evidence_level_shares for a report to be auditable.
+        evidence_max_lookups_per_uri=MAX_TX_LOOKUPS_PER_URI,
+        evidence_max_total_lookups=DEFAULT_MAX_TOTAL_LOOKUPS,
     )
     return dict(
         rater_profile_mode=mode,
