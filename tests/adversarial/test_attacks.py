@@ -28,6 +28,7 @@ from robustrep.report.adversarial import (
     meta_distinct,
     meta_for,
     run,
+    scenario_c_rows,
     scenario_table,
     sybils,
 )
@@ -76,6 +77,22 @@ def test_scenario_c2_even_count_lower_median_convention():
     out = score(df, flat).set_index("ratee").loc["A"]
     assert np.median([0.8] * 4 + [0.2] * 4) == 0.5
     assert out["robust_score"] == 0.2
+
+
+def test_scenario_c_value_poisoning_does_not_move_an_honest_ratee():
+    # CONFIRMED finding C2. `value` is an attacker-chosen int128 and normalization
+    # groups by (tag, scale) across the WHOLE dataset, so records aimed at one ratee
+    # decide how every other ratee under that tag is scored. Two throwaway records of
+    # +/-2**127 on a throwaway ratee used to drag the honest group into a min-max
+    # fallback and flatten every honest score to exactly 0.5. They are now inside the
+    # group's outlier tolerance, so they are clipped into the percent range and the
+    # honest ratee's row is bit-identical to the clean run's.
+    clean_rows, poison_rows = scenario_c_rows()
+    clean = score(build(clean_rows), CFG).set_index("ratee").loc["A"]
+    poisoned_all = score(build(clean_rows + poison_rows), CFG).set_index("ratee")
+    pd.testing.assert_series_equal(clean, poisoned_all.loc["A"])
+    # the attacker's own throwaway ratee is not scorable (2 clusters < min_clusters)
+    assert poisoned_all.loc["Z", "insufficient"] == 1
 
 
 def test_scenario_d_evidence_free_flood_is_downweighted_even_without_clusters():
@@ -265,13 +282,16 @@ def test_report_numbers_table():
     cites for scenarios A, B, D, E, F, H(k=20), plus the measured break-even rows."""
     table = scenario_table().set_index("scenario")
     assert list(table.index) == [
-        "A_boosting", "B_smearing", "D_evidence_free_flood", "E_fresh_tag",
-        "F_split_funders", "H_evasive_k20",
+        "A_boosting", "B_smearing", "C_value_poisoning", "D_evidence_free_flood",
+        "E_fresh_tag", "F_split_funders", "H_evasive_k20",
         "G_smear_breakeven", "G2_boost_breakeven", "H_evasive_breakeven",
     ]
+    # C's 0.5 is the lower weighted median of the 20 honest percent scores
+    # (0.00 .. 1.00 in steps of 0.05), unmoved by the two +/-2**127 records.
     assert table.loc[
-        ["A_boosting", "B_smearing", "D_evidence_free_flood", "E_fresh_tag",
-         "F_split_funders", "H_evasive_k20"], "robust_score"].tolist() == [0.8, 0.8, 0.8, 0.9, 0.8, 0.8]
+        ["A_boosting", "B_smearing", "C_value_poisoning", "D_evidence_free_flood",
+         "E_fresh_tag", "F_split_funders", "H_evasive_k20"],
+        "robust_score"].tolist() == [0.8, 0.8, 0.5, 0.8, 0.9, 0.8, 0.8]
     assert math.isclose(table.loc["A_boosting", "naive_mean"], 54 / 55, rel_tol=1e-3)
     assert math.isclose(table.loc["B_smearing", "naive_mean"], 4 / 55, rel_tol=1e-3)
     assert math.isclose(table.loc["D_evidence_free_flood", "naive_mean"], 0.16, rel_tol=1e-3)
