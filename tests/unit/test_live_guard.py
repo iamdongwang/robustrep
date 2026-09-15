@@ -195,3 +195,29 @@ def test_guard_passes_through_when_nothing_raises():
     with live.rpc_available():
         value = 1
     assert value == 1
+
+
+# --- server-supplied text must not STEER the classifier (only our own prefixes count) ---
+
+
+@pytest.mark.parametrize("message", [
+    "gave up after 5 attempts: [-32000] bogus payload timeout",
+    "gave up after 5 attempts: [-32000] garbage rate limit",
+    "gave up after 5 attempts: [-32000] connectionerror in your face",
+])
+def test_server_text_after_a_json_rpc_code_cannot_force_a_skip(message):
+    assert live.rpc_unavailable_reason(RpcError(message)) is None
+
+
+def test_batch_structure_error_never_skips_even_with_transport_words():
+    assert live.rpc_unavailable_reason(RpcBatchStructureError("batch entry id=1: missing result (timeout)")) is None
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("gave up after 5 attempts: ReadTimeout contacting https://h", "transport failure: readtimeout"),
+    ("gave up after 5 attempts: HTTPError (HTTP 503) from https://h", "transport failure: http 503"),
+    ("gave up after 5 attempts: [-32016] over rate limit", "rate limited"),
+    ("gave up after 5 attempts: HTTPError (HTTP 429) from https://h", "rate limited"),
+])
+def test_our_own_redacted_prefixes_still_classify(message, expected):
+    assert live.rpc_unavailable_reason(RpcError(message)) == expected

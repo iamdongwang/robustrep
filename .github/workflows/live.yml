@@ -20,5 +20,6 @@ jobs:
           cache-dependency-path: |
             pyproject.toml
             constraints.txt
+      - run: python -m pip install -c constraints.txt --upgrade pip
       - run: pip install -e ".[dev]" -c constraints.txt
       - run: pytest -m live tests/e2e/test_live.py -v

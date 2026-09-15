@@ -19,7 +19,7 @@ import requests
 
 from robustrep.config import Config
 from robustrep.sources import base_erc8004 as base
-from robustrep.sources.rpc import RpcClient, RpcError
+from robustrep.sources.rpc import RpcBatchStructureError, RpcClient, RpcError
 from robustrep.store import Store
 
 FIX = json.loads((Path(__file__).parent / "fixtures/base_logs_2000.json").read_text())
@@ -36,8 +36,11 @@ FIX = json.loads((Path(__file__).parent / "fixtures/base_logs_2000.json").read_t
 # ``"http <code>"``, which is exactly how ``_redact`` renders them.
 RATE_LIMIT_MARKERS = (
     "http 429", "too many requests", "over rate limit", "rate limit",
-    "rate-limited", "-32016", "-32005",
+    "rate-limited",
 )
+# JSON-RPC error codes for rate limiting, as our own "[code] " formatting
+# renders them; matched anywhere in the message (see rpc_unavailable_reason).
+RATE_LIMIT_CODES = ("[-32016]", "[-32005]")
 
 # Transport-level failures and the server-side 5xx family: the endpoint is
 # broken or overloaded, which says nothing about the chain.
@@ -85,12 +88,25 @@ def rpc_unavailable_reason(exc: BaseException) -> Optional[str]:
         return "rate limited" if status == 429 else f"transport failure: HTTP {status}"
     if isinstance(exc, SKIPPABLE_REQUESTS_ERRORS):
         return f"transport failure: {type(exc).__name__}"
+    if isinstance(exc, RpcBatchStructureError):
+        # A structurally wrong batch answer is a data failure whatever words
+        # the server put in it.
+        return None
     if isinstance(exc, RpcError):
         low = str(exc).lower()
-        if any(marker in low for marker in RATE_LIMIT_MARKERS):
+        # Server-supplied text only ever appears AFTER a "[code] " prefix
+        # (``rpc._error_message``); our own redacted transport rendering never
+        # contains "[". Word markers are therefore matched only in the head,
+        # so a provider cannot steer the classifier by echoing "timeout" or
+        # "rate limit" in an error body. The numeric rate-limit codes are our
+        # own bracketed formatting and may be matched anywhere.
+        head = low.split("[", 1)[0]
+        if any(code in low for code in RATE_LIMIT_CODES):
+            return "rate limited"
+        if any(marker in head for marker in RATE_LIMIT_MARKERS):
             return "rate limited"
         for marker in TRANSPORT_MARKERS:
-            if marker in low:
+            if marker in head:
                 return f"transport failure: {marker}"
     return None
 
