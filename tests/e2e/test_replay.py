@@ -41,33 +41,33 @@ class ReplayRpc:
 
 def _sync_and_score(db_path, end_block=None):
     """Sync the fixture into a fresh store at `db_path`, fill timestamps,
-    cluster and score. Returns (store, records, result)."""
-    store = Store(db_path)
-    base.sync_feedback(store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"],
-                       end_block=end_block if end_block is not None else FIX["to_block"])
-    base.fill_block_timestamps(store, ReplayRpc())
-    records = store.load_records()
-    cfg = Config(bootstrap_n=20)
-    clusters = cluster_raters(profiles_from_records(records, store.load_rater_meta()), cfg)
-    result = score(records, cfg, clusters=clusters)
-    return store, records, result
+    cluster and score. Returns (records, result); the store is closed on the
+    way out, so nothing that outlives this call may hold on to it."""
+    with Store(db_path) as store:
+        base.sync_feedback(store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"],
+                           end_block=end_block if end_block is not None else FIX["to_block"])
+        base.fill_block_timestamps(store, ReplayRpc())
+        records = store.load_records()
+        cfg = Config(bootstrap_n=20)
+        clusters = cluster_raters(profiles_from_records(records, store.load_rater_meta()), cfg)
+        result = score(records, cfg, clusters=clusters)
+    return records, result
 
 
 def test_replay_full_pipeline(tmp_path):
-    store = Store(tmp_path / "replay.db")
-    n = base.sync_feedback(store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"], end_block=FIX["to_block"])
-    assert n == sum(1 for l in FIX["logs"] if l["topics"][0].lower() == base.TOPIC_NEW_FEEDBACK)
-    base.fill_block_timestamps(store, ReplayRpc())
-    records = store.load_records()
-    assert (records["ts"] > 0).all()
-    cfg = Config(bootstrap_n=20)
-    clusters = cluster_raters(profiles_from_records(records, store.load_rater_meta()), cfg)
-    result = score(records, cfg, clusters=clusters)
-    assert len(result) == records["ratee"].nunique()
-    assert result["naive_mean"].between(0, 1).all()
+    with Store(tmp_path / "replay.db") as store:
+        n = base.sync_feedback(store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"], end_block=FIX["to_block"])
+        assert n == sum(1 for l in FIX["logs"] if l["topics"][0].lower() == base.TOPIC_NEW_FEEDBACK)
+        base.fill_block_timestamps(store, ReplayRpc())
+        records = store.load_records()
+        assert (records["ts"] > 0).all()
+        cfg = Config(bootstrap_n=20)
+        clusters = cluster_raters(profiles_from_records(records, store.load_rater_meta()), cfg)
+        result = score(records, cfg, clusters=clusters)
+        assert len(result) == records["ratee"].nunique()
+        assert result["naive_mean"].between(0, 1).all()
 
-    assert store.get_sync("last_block") == str(FIX["to_block"])
-    store.close()
+        assert store.get_sync("last_block") == str(FIX["to_block"])
 
     # --- CLI report on the same replayed store -----------------------------
     out_dir = tmp_path / "reports"
@@ -99,23 +99,21 @@ def test_replay_full_pipeline(tmp_path):
 
 
 def test_replay_is_deterministic(tmp_path):
-    _, _, result_a = _sync_and_score(tmp_path / "a.db")
-    _, _, result_b = _sync_and_score(tmp_path / "b.db")
+    _, result_a = _sync_and_score(tmp_path / "a.db")
+    _, result_b = _sync_and_score(tmp_path / "b.db")
     assert_frame_equal(result_a, result_b)
 
 
 def test_replay_resume(tmp_path):
-    single_store = Store(tmp_path / "single.db")
-    n_single = base.sync_feedback(single_store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"],
-                                  end_block=FIX["to_block"])
-    single_store.close()
+    with Store(tmp_path / "single.db") as single_store:
+        n_single = base.sync_feedback(single_store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"],
+                                      end_block=FIX["to_block"])
 
-    resume_store = Store(tmp_path / "resume.db")
-    midpoint = FIX["from_block"] + 999
-    n1 = base.sync_feedback(resume_store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"],
-                            end_block=midpoint)
-    n2 = base.sync_feedback(resume_store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"],
-                            end_block=FIX["to_block"])
-    assert n1 + n2 == n_single
-    assert resume_store.get_sync("last_block") == str(FIX["to_block"])
-    resume_store.close()
+    with Store(tmp_path / "resume.db") as resume_store:
+        midpoint = FIX["from_block"] + 999
+        n1 = base.sync_feedback(resume_store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"],
+                                end_block=midpoint)
+        n2 = base.sync_feedback(resume_store, ReplayRpc(), chunk=2000, start_block=FIX["from_block"],
+                                end_block=FIX["to_block"])
+        assert n1 + n2 == n_single
+        assert resume_store.get_sync("last_block") == str(FIX["to_block"])

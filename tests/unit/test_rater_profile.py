@@ -522,123 +522,127 @@ def test_estimate_seconds_rejects_non_positive_rps():
 
 
 def test_enrich_with_client(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    c = EtherscanClient("K", session=FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}]),
-                        sleep=lambda _: None)
-    assert enrich_raters(s, c) == 1
-    m = s.load_rater_meta().iloc[0]
-    assert m["first_seen_ts"] == 99 and m["funder"] == "0xf"
-    assert s.get_sync("rater_profile_mode") == "etherscan"
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        c = EtherscanClient(
+            "K",
+            session=FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}]),
+            sleep=lambda _: None)
+        assert enrich_raters(s, c) == 1
+        m = s.load_rater_meta().iloc[0]
+        assert m["first_seen_ts"] == 99 and m["funder"] == "0xf"
+        assert s.get_sync("rater_profile_mode") == "etherscan"
 
 
 def test_enrich_with_client_no_tx_found_upserts_none(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    c = EtherscanClient("K", session=FakeHttp([{"status": "0", "result": []}]), sleep=lambda _: None)
-    assert enrich_raters(s, c) == 1
-    m = s.load_rater_meta().iloc[0]
-    assert m["first_seen_ts"] is None and m["funder"] is None
-    assert s.get_sync("rater_profile_mode") == "etherscan"
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        c = EtherscanClient("K", session=FakeHttp([{"status": "0", "result": []}]), sleep=lambda _: None)
+        assert enrich_raters(s, c) == 1
+        m = s.load_rater_meta().iloc[0]
+        assert m["first_seen_ts"] is None and m["funder"] is None
+        assert s.get_sync("rater_profile_mode") == "etherscan"
 
 
 def test_enrich_with_client_collects_failures_marks_partial_mode(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1), fb("0xc", log_index=2)])
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1), fb("0xc", log_index=2)])
 
-    class FlakyClient:
-        def first_tx(self, address):
-            if address == "0xb":
-                raise RuntimeError("boom")
-            return (1, 100, "0xf")
+        class FlakyClient:
+            def first_tx(self, address):
+                if address == "0xb":
+                    raise RuntimeError("boom")
+                return (1, 100, "0xf")
 
-    try:
-        enrich_raters(s, FlakyClient())
-        assert False, "expected RuntimeError"
-    except RuntimeError as e:
-        assert "0xb" in str(e)
-    meta = s.load_rater_meta()
-    assert set(meta["rater"]) == {"0xa", "0xc"}
-    assert len(meta) == 2
-    assert s.get_sync("rater_profile_mode") == "etherscan-partial"
+        try:
+            enrich_raters(s, FlakyClient())
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            assert "0xb" in str(e)
+        meta = s.load_rater_meta()
+        assert set(meta["rater"]) == {"0xa", "0xc"}
+        assert len(meta) == 2
+        assert s.get_sync("rater_profile_mode") == "etherscan-partial"
 
 
 def test_enrich_with_client_failure_message_lists_first_five_plus_more(tmp_path):
-    s = Store(tmp_path / "t.db")
-    addrs = [f"0xf{i}" for i in range(7)]
-    s.upsert_feedback([fb(a, log_index=i) for i, a in enumerate(addrs)])
+    with Store(tmp_path / "t.db") as s:
+        addrs = [f"0xf{i}" for i in range(7)]
+        s.upsert_feedback([fb(a, log_index=i) for i, a in enumerate(addrs)])
 
-    class AlwaysFailsClient:
-        def first_tx(self, address):
-            raise RuntimeError("boom")
+        class AlwaysFailsClient:
+            def first_tx(self, address):
+                raise RuntimeError("boom")
 
-    try:
-        enrich_raters(s, AlwaysFailsClient())
-        assert False, "expected RuntimeError"
-    except RuntimeError as e:
-        msg = str(e)
-    assert "7 address(es)" in msg
-    assert "(+2 more)" in msg
-    assert s.get_sync("rater_profile_mode") == "etherscan-partial"
-    assert len(s.load_rater_meta()) == 0
+        try:
+            enrich_raters(s, AlwaysFailsClient())
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            msg = str(e)
+        assert "7 address(es)" in msg
+        assert "(+2 more)" in msg
+        assert s.get_sync("rater_profile_mode") == "etherscan-partial"
+        assert len(s.load_rater_meta()) == 0
 
 
 def test_enrich_logs_scrubbed_failure_message(tmp_path, caplog):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    http = FakeHttpRaisingOnStatus(429, "429 ... apikey=SECRET ...")
-    c = EtherscanClient("SECRET", session=http, retries=1, sleep=lambda _: None)
-    with caplog.at_level(logging.ERROR, logger="robustrep.sources.rater_profile"):
-        try:
-            enrich_raters(s, c)
-            assert False, "expected RuntimeError"
-        except RuntimeError:
-            pass
-    assert "SECRET" not in caplog.text
-    assert any("failed to enrich" in r.message for r in caplog.records)
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        http = FakeHttpRaisingOnStatus(429, "429 ... apikey=SECRET ...")
+        c = EtherscanClient("SECRET", session=http, retries=1, sleep=lambda _: None)
+        with caplog.at_level(logging.ERROR, logger="robustrep.sources.rater_profile"):
+            try:
+                enrich_raters(s, c)
+                assert False, "expected RuntimeError"
+            except RuntimeError:
+                pass
+        assert "SECRET" not in caplog.text
+        assert any("failed to enrich" in r.message for r in caplog.records)
 
 
 def test_enrich_with_client_is_idempotent(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    c = EtherscanClient("K", session=FakeHttp([{"status": "1", "result": [{"blockNumber": "1", "timeStamp": "5", "from": "0xf"}]}]),
-                        sleep=lambda _: None)
-    assert enrich_raters(s, c) == 1
-    assert enrich_raters(s, c) == 0
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        c = EtherscanClient(
+            "K",
+            session=FakeHttp([{"status": "1", "result": [{"blockNumber": "1", "timeStamp": "5", "from": "0xf"}]}]),
+            sleep=lambda _: None)
+        assert enrich_raters(s, c) == 1
+        assert enrich_raters(s, c) == 0
 
 
 # --- enrich_raters: blockscout mode ---------------------------------------------------
 
 
 def test_enrich_with_blockscout_client_sets_blockscout_mode(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
-    c = EtherscanClient.blockscout(session=http, sleep=lambda _: None)
-    assert enrich_raters(s, c) == 1
-    m = s.load_rater_meta().iloc[0]
-    assert m["first_seen_ts"] == 99 and m["funder"] == "0xf"
-    assert s.get_sync("rater_profile_mode") == "blockscout"
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+        c = EtherscanClient.blockscout(session=http, sleep=lambda _: None)
+        assert enrich_raters(s, c) == 1
+        m = s.load_rater_meta().iloc[0]
+        assert m["first_seen_ts"] == 99 and m["funder"] == "0xf"
+        assert s.get_sync("rater_profile_mode") == "blockscout"
 
 
 def test_enrich_with_blockscout_client_partial_failure_sets_blockscout_partial_mode(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1)])
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1)])
 
-    class FlakyBlockscoutClient:
-        source = "blockscout"
+        class FlakyBlockscoutClient:
+            source = "blockscout"
 
-        def first_tx(self, address):
-            if address == "0xb":
-                raise RuntimeError("boom")
-            return (1, 100, "0xf")
+            def first_tx(self, address):
+                if address == "0xb":
+                    raise RuntimeError("boom")
+                return (1, 100, "0xf")
 
-    try:
-        enrich_raters(s, FlakyBlockscoutClient())
-        assert False, "expected RuntimeError"
-    except RuntimeError:
-        pass
-    assert s.get_sync("rater_profile_mode") == "blockscout-partial"
+        try:
+            enrich_raters(s, FlakyBlockscoutClient())
+            assert False, "expected RuntimeError"
+        except RuntimeError:
+            pass
+        assert s.get_sync("rater_profile_mode") == "blockscout-partial"
 
 
 # --- enrich_raters: EtherscanPlanError aborts on the first address -----------------
@@ -647,147 +651,147 @@ def test_enrich_with_blockscout_client_partial_failure_sets_blockscout_partial_m
 def test_enrich_aborts_immediately_when_first_address_hits_plan_error(tmp_path):
     from robustrep.sources.rater_profile import EtherscanPlanError
 
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1), fb("0xc", log_index=2)])
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1), fb("0xc", log_index=2)])
 
-    calls = []
+        calls = []
 
-    class PlanRejectedClient:
-        def first_tx(self, address):
-            calls.append(address)
-            raise EtherscanPlanError(f"Etherscan plan does not support this chain for {address}")
+        class PlanRejectedClient:
+            def first_tx(self, address):
+                calls.append(address)
+                raise EtherscanPlanError(f"Etherscan plan does not support this chain for {address}")
 
-    try:
-        enrich_raters(s, PlanRejectedClient())
-        assert False, "expected EtherscanPlanError"
-    except EtherscanPlanError as e:
-        assert "plan" in str(e).lower()
-    # Only the first address was attempted -- no burning through the rest.
-    assert len(calls) == 1
-    assert len(s.load_rater_meta()) == 0
-    # Aborted before any mode was recorded for this run.
-    assert s.get_sync("rater_profile_mode") is None
+        try:
+            enrich_raters(s, PlanRejectedClient())
+            assert False, "expected EtherscanPlanError"
+        except EtherscanPlanError as e:
+            assert "plan" in str(e).lower()
+        # Only the first address was attempted -- no burning through the rest.
+        assert len(calls) == 1
+        assert len(s.load_rater_meta()) == 0
+        # Aborted before any mode was recorded for this run.
+        assert s.get_sync("rater_profile_mode") is None
 
 
 def test_enrich_plan_error_on_later_address_is_a_regular_failure(tmp_path):
     from robustrep.sources.rater_profile import EtherscanPlanError
 
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1)])
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1)])
 
-    class PlanRejectedOnSecondClient:
-        source = "etherscan"
+        class PlanRejectedOnSecondClient:
+            source = "etherscan"
 
-        def first_tx(self, address):
-            if address == "0xb":
-                raise EtherscanPlanError(f"Etherscan plan does not support this chain for {address}")
-            return (1, 100, "0xf")
+            def first_tx(self, address):
+                if address == "0xb":
+                    raise EtherscanPlanError(f"Etherscan plan does not support this chain for {address}")
+                return (1, 100, "0xf")
 
-    try:
-        enrich_raters(s, PlanRejectedOnSecondClient())
-        assert False, "expected RuntimeError"
-    except RuntimeError as e:
-        assert "0xb" in str(e)
-    meta = s.load_rater_meta()
-    assert set(meta["rater"]) == {"0xa"}
-    assert s.get_sync("rater_profile_mode") == "etherscan-partial"
+        try:
+            enrich_raters(s, PlanRejectedOnSecondClient())
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            assert "0xb" in str(e)
+        meta = s.load_rater_meta()
+        assert set(meta["rater"]) == {"0xa"}
+        assert s.get_sync("rater_profile_mode") == "etherscan-partial"
 
 
 # --- enrich_raters: fallback mode (no client) -- no sticky rows ---------------------
 
 
 def test_enrich_fallback_writes_no_rows_but_returns_informational_count(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    s.upsert_block_ts([(1, 555)])
-    assert enrich_raters(s, None) == 1
-    assert len(s.load_rater_meta()) == 0
-    assert s.get_sync("rater_profile_mode") == "fallback"
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        s.upsert_block_ts([(1, 555)])
+        assert enrich_raters(s, None) == 1
+        assert len(s.load_rater_meta()) == 0
+        assert s.get_sync("rater_profile_mode") == "fallback"
 
 
 def test_enrich_fallback_warns_once_when_block_ts_missing(tmp_path, caplog):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa", block=1), fb("0xb", block=2, log_index=1)])
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
-        assert enrich_raters(s, None) == 2
-    assert len(s.load_rater_meta()) == 0
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert "fill_block_timestamps" in warnings[0].message
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa", block=1), fb("0xb", block=2, log_index=1)])
+        with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+            assert enrich_raters(s, None) == 2
+        assert len(s.load_rater_meta()) == 0
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "fill_block_timestamps" in warnings[0].message
 
 
 def test_enrich_fallback_no_warning_when_block_ts_cached(tmp_path, caplog):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    s.upsert_block_ts([(1, 555)])
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
-        enrich_raters(s, None)
-    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        s.upsert_block_ts([(1, 555)])
+        with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+            enrich_raters(s, None)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
 
 
 def test_enrich_fallback_returns_same_count_every_call_not_sticky(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    s.upsert_block_ts([(1, 555)])
-    assert enrich_raters(s, None) == 1
-    # No rows were written, so the address is still "unprofiled" -- a later
-    # run (fallback again, or with a real key) can still see and profile it.
-    assert enrich_raters(s, None) == 1
-    assert len(s.load_rater_meta()) == 0
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        s.upsert_block_ts([(1, 555)])
+        assert enrich_raters(s, None) == 1
+        # No rows were written, so the address is still "unprofiled" -- a later
+        # run (fallback again, or with a real key) can still see and profile it.
+        assert enrich_raters(s, None) == 1
+        assert len(s.load_rater_meta()) == 0
 
 
 def test_keyed_run_after_fallback_upgrades_rows(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    s.upsert_block_ts([(1, 555)])
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        s.upsert_block_ts([(1, 555)])
 
-    assert enrich_raters(s, None) == 1
-    assert len(s.load_rater_meta()) == 0
-    assert s.get_sync("rater_profile_mode") == "fallback"
+        assert enrich_raters(s, None) == 1
+        assert len(s.load_rater_meta()) == 0
+        assert s.get_sync("rater_profile_mode") == "fallback"
 
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
-    c = EtherscanClient("K", session=http, sleep=lambda _: None)
-    assert enrich_raters(s, c) == 1
-    assert len(http.calls) == 1
-    m = s.load_rater_meta().iloc[0]
-    assert m["rater"] == "0xa" and m["first_seen_ts"] == 99 and m["funder"] == "0xf"
-    assert s.get_sync("rater_profile_mode") == "etherscan"
+        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+        c = EtherscanClient("K", session=http, sleep=lambda _: None)
+        assert enrich_raters(s, c) == 1
+        assert len(http.calls) == 1
+        m = s.load_rater_meta().iloc[0]
+        assert m["rater"] == "0xa" and m["first_seen_ts"] == 99 and m["funder"] == "0xf"
+        assert s.get_sync("rater_profile_mode") == "etherscan"
 
 
 # --- enrich_raters: nothing to do ----------------------------------------------------
 
 
 def test_enrich_nothing_to_do(tmp_path):
-    s = Store(tmp_path / "t.db")
-    http = FakeHttp([])
-    c = EtherscanClient("K", session=http, sleep=lambda _: None)
-    assert enrich_raters(s, c) == 0
-    assert http.calls == []
+    with Store(tmp_path / "t.db") as s:
+        http = FakeHttp([])
+        c = EtherscanClient("K", session=http, sleep=lambda _: None)
+        assert enrich_raters(s, c) == 0
+        assert http.calls == []
 
 
 def test_enrich_nothing_to_do_fallback(tmp_path):
-    s = Store(tmp_path / "t.db")
-    assert enrich_raters(s, None) == 0
-    assert s.get_sync("rater_profile_mode") is None
+    with Store(tmp_path / "t.db") as s:
+        assert enrich_raters(s, None) == 0
+        assert s.get_sync("rater_profile_mode") is None
 
 
 # --- enrich_raters: explicit `addresses` bypasses distinct_clients() ----------------
 
 
 def test_enrich_uses_given_addresses_instead_of_distinct_clients(tmp_path, monkeypatch):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa"), fb("0xb")])
-    calls = []
-    monkeypatch.setattr(Store, "distinct_clients", lambda self: calls.append(1) or ["should-not-be-used"])
-    assert enrich_raters(s, None, addresses=["0xa"]) == 1
-    assert calls == []  # distinct_clients() never called when addresses is given
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa"), fb("0xb")])
+        calls = []
+        monkeypatch.setattr(Store, "distinct_clients", lambda self: calls.append(1) or ["should-not-be-used"])
+        assert enrich_raters(s, None, addresses=["0xa"]) == 1
+        assert calls == []  # distinct_clients() never called when addresses is given
 
 
 def test_enrich_addresses_none_falls_back_to_distinct_clients(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    s.upsert_block_ts([(1, 555)])
-    assert enrich_raters(s, None) == 1  # default addresses=None -> store.distinct_clients()
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        s.upsert_block_ts([(1, 555)])
+        assert enrich_raters(s, None) == 1  # default addresses=None -> store.distinct_clients()
 
 
 # --- client_from_env -----------------------------------------------------------------
@@ -1117,16 +1121,16 @@ def test_default_client_blockscout_returns_blockscout_v2_client():
 
 
 def test_enrich_with_blockscout_v2_client_records_blockscout_mode(tmp_path):
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    body = {"items": [bs_tx("0x1", 3, "2026-01-01T00:00:00Z", "0xF")], "next_page_params": None}
-    http = FakeV2Http([body])
-    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
-    assert enrich_raters(s, c) == 1
-    m = s.load_rater_meta().iloc[0]
-    assert m["funder"] == "0xf"
-    assert m["first_seen_ts"] == int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
-    assert s.get_sync("rater_profile_mode") == "blockscout"
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        body = {"items": [bs_tx("0x1", 3, "2026-01-01T00:00:00Z", "0xF")], "next_page_params": None}
+        http = FakeV2Http([body])
+        c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+        assert enrich_raters(s, c) == 1
+        m = s.load_rater_meta().iloc[0]
+        assert m["funder"] == "0xf"
+        assert m["first_seen_ts"] == int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+        assert s.get_sync("rater_profile_mode") == "blockscout"
 
 
 # --- M1: the Etherscan API key never reaches urllib3's DEBUG log line ----------------
@@ -1314,13 +1318,13 @@ def test_blockscout_garbage_timestamp_returns_none_with_one_warning(caplog):
 def test_implausible_timestamp_never_reaches_upsert_rater(tmp_path):
     # The whole point of M4: nothing implausible is cached, so a later
     # score/report run cannot be wedged by one hostile third-party row.
-    s = Store(tmp_path / "t.db")
-    s.upsert_feedback([fb("0xa")])
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-99", "from": "0xF"}]}])
-    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
-    assert enrich_raters(s, c) == 1
-    meta = s.load_rater_meta()
-    assert meta["first_seen_ts"].isna().all()
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-99", "from": "0xF"}]}])
+        c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+        assert enrich_raters(s, c) == 1
+        meta = s.load_rater_meta()
+        assert meta["first_seen_ts"].isna().all()
 
 
 # --- L5: Blockscout pagination params are allowlisted, not echoed verbatim -----------
