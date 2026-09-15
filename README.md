@@ -33,3 +33,16 @@ Pick a source explicitly with `fetch --profile-source {auto,blockscout,etherscan
 
 Latest scores: `reports/latest/scores.json`, also served at
 https://iamdongwang.github.io/robustrep/reports/latest/scores.json
+
+## Security considerations
+
+Everything robustrep reads is written by untrusted parties: on-chain values, tags, evidence URIs and
+addresses, plus whatever the RPC/Blockscout endpoints and evidence hosts return.
+
+`robustrep fetch` makes outbound HTTP from *your* machine to evidence URIs chosen by the rated party.
+Those go through an SSRF guard (scheme/host allowlist, parser cross-check, canonical rebuild, refusal
+of private/reserved addresses, manual redirects, size/time caps), whose one known gap is DNS
+rebinding — so run `fetch` on a host with no privileged reach into an internal network. API keys come
+from environment variables only, never the source tree.
+
+Full threat model and private reporting instructions: [SECURITY.md](SECURITY.md).

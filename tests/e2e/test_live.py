@@ -1,29 +1,97 @@
 """Live (network-touching) end-to-end checks. Marked ``live`` -- excluded from
 the default test run (``pyproject.toml``'s ``addopts = "-m 'not live'"``);
 run explicitly with ``pytest -m live tests/e2e``.
+
+These run against free public RPC endpoints on a weekly cron, so "the endpoint
+was down, slow, or throttling us" is a routine, uninteresting outcome that must
+not page anyone: every network call is wrapped in ``rpc_available()``, which
+turns exactly those failures into a skip. What stays a *failure* is the thing
+these tests exist to detect -- live data that does not match what we recorded.
+Assertions are therefore deliberately kept *outside* the guarded blocks.
 """
 import json
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional
 
 import pytest
+import requests
 
 from robustrep.config import Config
 from robustrep.sources import base_erc8004 as base
-from robustrep.sources.rpc import RpcClient
+from robustrep.sources.rpc import RpcClient, RpcError
 from robustrep.store import Store
 
 FIX = json.loads((Path(__file__).parent / "fixtures/base_logs_2000.json").read_text())
+
+# Substrings (case-insensitive) of an ``RpcError`` message meaning the endpoint
+# would not serve us -- not that the data it served is wrong. ``RpcClient``
+# swallows the underlying ``requests`` exception and re-raises a *redacted*
+# ``RpcError`` (see ``rpc._redact``: exception type, HTTP status, scheme+host
+# only), so the transport names below are what a connection failure or timeout
+# actually looks like by the time it reaches a test. The rate-limit entries
+# mirror ``rpc.BATCH_RATE_LIMIT`` plus the HTTP-level 429.
+RPC_UNAVAILABLE_MARKERS = (
+    "429", "too many requests", "over rate limit", "rate limit", "rate-limited",
+    "-32016", "-32005",
+    "connectionerror", "connecttimeout", "readtimeout", "timeout",
+)
+
+
+def rpc_unavailable_reason(exc: BaseException) -> Optional[str]:
+    """Return a short reason string when ``exc`` means *the RPC endpoint was
+    unusable*, or ``None`` when it is a genuine failure that must not be
+    papered over.
+
+    Skippable: a transport-level ``requests`` connection error or timeout, and
+    an ``RpcError`` whose message names a transport failure or a rate limit /
+    HTTP 429. Everything else -- above all an ``AssertionError`` from live data
+    disagreeing with the recorded fixture, but equally a malformed response or
+    a non-retryable protocol error -- returns ``None`` and is left to fail.
+
+    A raw ``requests`` exception is reported by type name only: its ``str()``
+    echoes the full request URL, which may embed a provider API key (the same
+    reason ``rpc._redact`` exists). ``RpcError`` messages are already redacted
+    upstream, so they are passed through in full.
+    """
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout, TimeoutError)):
+        return f"{type(exc).__name__} contacting the endpoint"
+    if isinstance(exc, RpcError):
+        message = str(exc)
+        low = message.lower()
+        if any(marker in low for marker in RPC_UNAVAILABLE_MARKERS):
+            return message
+    return None
+
+
+@contextmanager
+def rpc_available():
+    """Wrap live RPC calls: an unavailable/throttled endpoint becomes a skip,
+    anything else propagates unchanged.
+
+    Keep assertions *outside* this block -- a mismatch between live data and
+    the recorded fixture is precisely what these tests are for and must fail.
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 -- re-raised unless classified skippable
+        reason = rpc_unavailable_reason(exc)
+        if reason is None:
+            raise
+        pytest.skip(f"RPC unavailable: {reason}")
 
 
 @pytest.mark.live
 def test_live_recent_blocks(tmp_path):
     cfg = Config()
     rpc = RpcClient(cfg.rpc_urls, user_agent=cfg.user_agent)
-    head = int(rpc.call("eth_blockNumber", []), 16)
     store = Store(tmp_path / "live.db")
-    base.sync_feedback(store, rpc, chunk=2000, start_block=head - 3999, end_block=head)
+    with rpc_available():
+        head = int(rpc.call("eth_blockNumber", []), 16)
+        base.sync_feedback(store, rpc, chunk=2000, start_block=head - 3999, end_block=head)
     assert store.get_sync("last_block") == str(head)
-    base.fill_block_timestamps(store, rpc)
+    with rpc_available():
+        base.fill_block_timestamps(store, rpc)
     assert store.missing_block_ts() == []
 
 
@@ -42,14 +110,19 @@ def test_live_fixture_window_matches_recorded_fixture():
     since ERC-8004 responses/revocations for already-final feedback would
     themselves be evidence of exactly the kind of drift this test is meant to
     catch.
+
+    Only the ``eth_getLogs`` call is guarded by ``rpc_available()``: an
+    unreachable or throttling endpoint tells us nothing, but every comparison
+    below runs unguarded so drift fails loudly.
     """
     cfg = Config()
     rpc = RpcClient(cfg.rpc_urls, user_agent=cfg.user_agent)
-    logs = rpc.call("eth_getLogs", [{
-        "fromBlock": hex(FIX["from_block"]), "toBlock": hex(FIX["to_block"]),
-        "address": base.REPUTATION_REGISTRY,
-        "topics": [[base.TOPIC_NEW_FEEDBACK, base.TOPIC_REVOKED, base.TOPIC_RESPONSE]],
-    }])
+    with rpc_available():
+        logs = rpc.call("eth_getLogs", [{
+            "fromBlock": hex(FIX["from_block"]), "toBlock": hex(FIX["to_block"]),
+            "address": base.REPUTATION_REGISTRY,
+            "topics": [[base.TOPIC_NEW_FEEDBACK, base.TOPIC_REVOKED, base.TOPIC_RESPONSE]],
+        }])
 
     def feedback_keys(raw_logs):
         decoded = [base.decode_log(l) for l in raw_logs]
