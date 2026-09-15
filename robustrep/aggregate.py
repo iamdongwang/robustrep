@@ -171,9 +171,9 @@ def bootstrap_ci(
     and the cumulative sum of `counts * sorted_weights` along each row gives
     every resample's weighted median in one vectorized pass (see
     `_bootstrap_draws`). Processed in chunks of at most
-    `max(1, 2_000_000 // n)` resamples so peak memory stays bounded even for
-    a ratee with thousands of votes; this is what keeps the per-ratee
-    bootstrap affordable at ~28k ratees.
+    `max(1, MAX_BOOT_CHUNK_CELLS // n)` resamples so peak memory stays
+    bounded even for a ratee with thousands of votes; this is what keeps the
+    per-ratee bootstrap affordable at ~28k ratees.
 
     Inputs are validated exactly like `weighted_median` (see `_validate`).
     A resample whose weights sum to zero has an undefined weighted median
