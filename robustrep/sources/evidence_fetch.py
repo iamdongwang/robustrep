@@ -336,11 +336,16 @@ def _ipfs_tail(uri: str) -> Optional[str]:
     A gateway URL is built by concatenation, so the tail decides what path on
     the gateway *host* is fetched: ``ipfs://../api/v0/id`` would escape
     ``/ipfs/`` and hit the gateway's own API, and a leading ``/`` would address
-    its root. Empty, absolute, and any ``..`` anywhere (bluntly -- a CID never
-    contains one) are refused; nothing legitimate is lost.
+    its root. Refused, bluntly: empty, absolute, any ``..`` anywhere, and any
+    ``%`` at all. The last one matters because checking the raw tail is not
+    sufficient on its own -- ``requests``'s ``requote_uri`` decodes ``%2e``
+    back to ``.`` after this runs, so ``ipfs://%2e%2e/%2e%2e/api/v0/id`` would
+    reach the wire as ``/ipfs/../../api/v0/id``. CIDs are base58/base32 and
+    paths under them need no escaping (whitespace is refused anyway), so
+    nothing legitimate is lost.
     """
     tail = uri[len("ipfs://"):]
-    if not tail or tail.startswith("/") or ".." in tail:
+    if not tail or tail.startswith("/") or ".." in tail or "%" in tail:
         _log.debug("evidence fetch refused: unsafe ipfs path %r", tail)
         return None
     return tail
