@@ -1225,14 +1225,18 @@ _SYBIL_OPTS = ["--sybil-max-group", "--sybil-max-pairs", "--sybil-max-pairs-per-
 
 @pytest.mark.parametrize("command", ["score", "report"])
 def test_help_lists_sybil_budget_options(command):
-    # COLUMNS: typer's rich help truncates the option-name column at the default
-    # 80 chars, which would elide `--sybil-max-pairs-per-ratee` mid-name.
-    r = runner.invoke(app, [command, "--help"], env={"COLUMNS": "200"})
-    assert r.exit_code == 0, r.output
-    flat = " ".join(r.output.split())
+    # Inspect the click command's parameters rather than the rendered help:
+    # typer's rich help wraps/colours option names differently on a CI
+    # (non-TTY) console, splitting long names with escape codes.
+    import typer.main
+    cmd = typer.main.get_command(app).commands[command]
+    declared = {opt for p in cmd.params for opt in p.opts}
     for opt in _SYBIL_OPTS:
-        assert opt in flat, opt
-    assert str(cli.Config().sybil_max_pairs_per_ratee) in flat
+        assert opt in declared, opt
+    per_ratee = next(p for p in cmd.params if "--sybil-max-pairs-per-ratee" in p.opts)
+    assert per_ratee.default == cli.Config().sybil_max_pairs_per_ratee
+    r = runner.invoke(app, [command, "--help"])
+    assert r.exit_code == 0, r.output
 
 
 def _capture_cfg(monkeypatch):
