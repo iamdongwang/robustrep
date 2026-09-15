@@ -39,7 +39,7 @@ from .report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fi
 from .report.render import evidence_level_shares, render_markdown
 from .report.sensitivity import fig_sensitivity, sensitivity_table
 from .sources import base_erc8004 as base
-from .sources.evidence_fetch import DEFAULT_MAX_TOTAL_LOOKUPS, classify_all
+from .sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS, classify_all
 from .sources.rater_profile import DEFAULT_RPS, EtherscanClient, default_client, enrich_raters, estimate_seconds
 from .sources.rpc import RpcClient, RpcError
 from .store import Store
