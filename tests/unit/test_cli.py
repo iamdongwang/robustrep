@@ -1163,7 +1163,7 @@ def test_report_provenance_includes_config_in_markdown_and_json(tmp_path):
 def test_report_provenance_includes_evidence_lookup_caps(tmp_path):
     # H3 (security review): evidence_max_lookups_per_uri/evidence_max_total_lookups
     # bound which cached evidence levels might be false negatives (see
-    # evidence_fetch's "lookup-budget" note) -- publish them next to
+    # evidence_fetch's "lookup-budget:N" note) -- publish them next to
     # evidence_level_shares so a report is auditable against the caps that
     # actually produced it.
     from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
@@ -1183,6 +1183,44 @@ def test_report_provenance_includes_evidence_lookup_caps(tmp_path):
     config = data["config"]
     assert config["evidence_max_lookups_per_uri"] == MAX_TX_LOOKUPS_PER_URI
     assert config["evidence_max_total_lookups"] == DEFAULT_MAX_TOTAL_LOOKUPS
+
+
+def test_report_provenance_includes_evidence_lookup_starved_uris(tmp_path):
+    # evidence_lookup_starved_uris (Store.n_lookup_budget_starved) must
+    # reflect this run's own store snapshot, taken while the store is still
+    # open -- not a stale default -- so a report is auditable against how
+    # many cached evidence levels might still be under-checked (H3).
+    db = tmp_path / "t.db"
+    _seed(db, n=4)
+    s = Store(db)
+    s.upsert_evidence("https://starved1", 2, "lookup-budget:1")
+    s.upsert_evidence("https://starved2", 2, "lookup-budget:2")
+    s.upsert_evidence("https://done", 3, "")
+    s.close()
+
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+
+    md = (out_dir / "latest" / "report.md").read_text()
+    assert "evidence_lookup_starved_uris" in md
+
+    data = json.loads((out_dir / "latest" / "scores.json").read_text())
+    assert data["config"]["evidence_lookup_starved_uris"] == 2
+
+
+def test_provenance_n_lookup_budget_starved_defaults_to_zero_without_a_store():
+    # cli._provenance is also called directly (e.g. from tests) on an
+    # in-memory records frame with no store to count from -- it must not
+    # require one.
+    from robustrep import Config
+    from robustrep.schema import validate_records
+
+    records = validate_records(pd.DataFrame([dict(
+        rater="r", ratee="A", value=50, scale="d0", tag="q", ts=0,
+        evidence_uri=None, source="test", evidence_level=0)]))
+    prov = cli._provenance("onchain", Config(), records)
+    assert prov["config"]["evidence_lookup_starved_uris"] == 0
 
 
 def test_report_provenance_includes_evidence_level_shares(tmp_path):

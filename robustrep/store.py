@@ -187,12 +187,38 @@ class Store:
         return len(self.missing_block_ts())
 
     def upsert_evidence(self, uri: str, level: int, note: str = "") -> None:
-        """Cache an evidence level (and optional note) for a URI."""
+        """Cache an evidence level (and optional note) for a URI.
+
+        ``note=None`` is coerced to ``""`` rather than stored as SQL NULL: a
+        NULL note would make ``COALESCE(e.note, '')`` in
+        ``pending_uris``'s retry check compare equal to a real ``""`` note --
+        harmless there -- but would also compare unequal to every literal
+        note string in an ``IN (...)`` clause without that COALESCE, which is
+        exactly the bug a caller passing ``None`` (instead of the default)
+        must not be able to reintroduce.
+        """
+        note = "" if note is None else note
         try:
             with self.conn:
                 self.conn.execute("INSERT OR REPLACE INTO evidence_cache VALUES(?,?,?)", (uri, level, note))
         except sqlite3.IntegrityError as e:
             raise ValueError(f"evidence_cache: {e}") from e
+
+    def n_lookup_budget_starved(self) -> int:
+        """Count of ``evidence_cache`` rows still marked ``"lookup-budget:N"``
+        (H3, see ``evidence_fetch``) -- a URI whose tx-hash verification was
+        cut short by a shared per-run lookup budget, and so may hold a false
+        negative. Published in report provenance (``cli._provenance``'s
+        ``evidence_lookup_starved_uris``) so a report is auditable against
+        how many of its cached evidence levels are still, as of that run,
+        possibly under-checked -- whether because a later ``fetch`` run
+        hasn't retried them yet, or because they hit the retry cap
+        (``evidence_fetch.MAX_LOOKUP_RETRIES``) and are no longer retried at
+        all.
+        """
+        r = self.conn.execute(
+            "SELECT COUNT(*) FROM evidence_cache WHERE note LIKE 'lookup-budget:%'").fetchone()
+        return int(r[0])
 
     def evidence_level(self, uri: str) -> Optional[int]:
         """Cached evidence level for a URI, or ``None`` if not yet enriched."""
@@ -283,31 +309,40 @@ class Store:
         """Load cached rater metadata (rater address, first-seen ts, funder)."""
         return pd.read_sql_query("SELECT address AS rater, first_seen_ts, funder FROM raters", self.conn)
 
-    def distinct_uris(self) -> list[str]:
-        """Feedback URIs not yet present (empty ones excluded) in the evidence cache."""
-        rows = self.conn.execute(
-            "SELECT DISTINCT feedback_uri FROM feedback f WHERE feedback_uri<>'' "
-            "AND NOT EXISTS (SELECT 1 FROM evidence_cache e WHERE e.uri=f.feedback_uri)").fetchall()
-        return [r[0] for r in rows]
-
-    def pending_uris(self, include_notes: tuple[str, ...] = ()) -> list[tuple[str, str, str]]:
+    def pending_uris(self, include_notes: tuple[str, ...] = ()
+                      ) -> list[tuple[str, Optional[str], Optional[str], Optional[str]]]:
         """Feedback URIs (empty ones excluded) that still need evidence
         classification, each with its rater/owner parties GROUP_CONCAT-joined
-        exactly as ``evidence_fetch.classify_all`` consumes them: ``(uri,
-        clients_csv, owners_csv)``.
+        exactly as ``evidence_fetch.classify_all`` consumes them, plus its
+        existing cache note (if any): ``(uri, clients_csv, owners_csv,
+        prior_note)``. ``clients_csv``/``owners_csv`` are ``None`` when there
+        is nothing to join (e.g. no agent-owner row yet); ``prior_note`` is
+        ``None`` when the URI has never been cached at all.
 
         A URI is pending when it has never been cached, OR when it *is*
-        cached but with a note in ``include_notes`` -- e.g.
-        ``("lookup-budget",)`` to retry URIs whose tx-hash verification was
-        cut short by ``classify_all``'s shared per-run lookup budget (H3):
-        such a cached level may be a false negative (a verifying hash sat
-        past the cap), and a fresh run gets a fresh budget. Retrying is cheap
-        relative to a first classification -- the URI's text has to be
-        re-fetched, but that cost (not the RPC lookups) was always the bulk
-        of it. ``include_notes=()`` (the default) reproduces the original,
+        cached but with a note in ``include_notes`` -- e.g. a
+        ``"lookup-budget:N"`` set (see ``evidence_fetch.MAX_LOOKUP_RETRIES``,
+        ``_RETRYABLE_LOOKUP_BUDGET_NOTES``) to retry URIs whose tx-hash
+        verification was cut short by ``classify_all``'s shared per-run
+        lookup budget (H3): such a cached level may be a false negative (a
+        verifying hash sat past the cap), and a fresh run gets a fresh
+        budget. A retry is not free, though -- it re-fetches the URI's whole
+        text (the actually expensive part; the caller bounds how many times
+        this happens per URI, since retrying forever would let a
+        persistently-starved backlog inflate every future run's fetch
+        volume). ``include_notes=()`` (the default) reproduces the original,
         simple "not yet cached at all" behavior -- an ``unfetchable`` or
         ``fetch-error`` cache entry is *not* retried by default; only notes
         explicitly listed are.
+
+        The note comparison is NULL-safe (``COALESCE(e.note, '') NOT IN
+        (...)``): ``evidence_cache.note`` can be SQL NULL for a row written
+        before ``upsert_evidence`` started coercing ``None`` to ``""``, or by
+        a caller bypassing ``upsert_evidence``. Bare ``e.note NOT IN (...)``
+        would evaluate to SQL NULL (neither true nor false) for such a row,
+        so ``NOT EXISTS`` would never see it as blocking -- the row would
+        read as pending on *every* call, including ``include_notes=()``,
+        regardless of what ``include_notes`` actually says.
 
         feedback.client and agents.owner are 0x-hex addresses, which never
         contain a comma, so GROUP_CONCAT's default "," separator can't
@@ -320,11 +355,14 @@ class Store:
         concurrent workers completing out of order) could otherwise race the
         cursor's own re-evaluation of NOT EXISTS.
         """
-        retry_clause = f"AND e.note NOT IN ({','.join('?' * len(include_notes))})" if include_notes else ""
-        q = f"""SELECT f.feedback_uri, GROUP_CONCAT(DISTINCT f.client), GROUP_CONCAT(DISTINCT a.owner)
+        retry_clause = (f"AND COALESCE(e2.note, '') NOT IN ({','.join('?' * len(include_notes))})"
+                         if include_notes else "")
+        q = f"""SELECT f.feedback_uri, GROUP_CONCAT(DISTINCT f.client), GROUP_CONCAT(DISTINCT a.owner),
+                       MAX(e.note)
                 FROM feedback f LEFT JOIN agents a ON a.agent_id=f.agent_id
+                                LEFT JOIN evidence_cache e ON e.uri=f.feedback_uri
                 WHERE f.feedback_uri<>'' AND NOT EXISTS (
-                    SELECT 1 FROM evidence_cache e WHERE e.uri=f.feedback_uri {retry_clause}
+                    SELECT 1 FROM evidence_cache e2 WHERE e2.uri=f.feedback_uri {retry_clause}
                 )
                 GROUP BY f.feedback_uri"""
         return self.conn.execute(q, include_notes).fetchall()
