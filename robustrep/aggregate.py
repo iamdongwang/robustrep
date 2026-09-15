@@ -23,11 +23,13 @@ _TIE_EPS = 1e-9
 # weight for the CI to be considered meaningful.
 MIN_VALID_BOOT_FRACTION = 0.1
 
-# Cap on the number of (resample x vote) float64 cells materialized at once
-# by `bootstrap_ci`'s chunked multinomial draw, so peak memory stays bounded
-# even for a ratee with thousands of votes: a chunk holds at most this many
-# cells regardless of how large `n_boot` is.
-_MAX_BOOT_CHUNK_CELLS = 2_000_000
+# Cap on the number of (resample x vote) cells materialized at once by a
+# chunked bootstrap draw, so peak memory stays bounded even for a ratee with
+# thousands of votes: a chunk holds at most this many cells regardless of how
+# large `n_boot` is. Public because `robustrep.pipeline._ci` chunks its
+# multi-tag bootstrap against the same budget (see M3 there); one constant so
+# the two paths can never bound memory differently.
+MAX_BOOT_CHUNK_CELLS = 2_000_000
 
 
 def _validate(values: np.ndarray, weights: np.ndarray, name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -186,7 +188,7 @@ def bootstrap_ci(
     order = np.argsort(values, kind="stable")
     v_sorted, w_sorted = values[order], weights[order]
 
-    chunk_size = max(1, _MAX_BOOT_CHUNK_CELLS // n)
+    chunk_size = max(1, MAX_BOOT_CHUNK_CELLS // n)
     boots = _bootstrap_draws(v_sorted, w_sorted, n_boot, rng, chunk_size)
 
     min_valid = max(2, int(n_boot * MIN_VALID_BOOT_FRACTION))
