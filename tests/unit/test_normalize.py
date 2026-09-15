@@ -28,15 +28,16 @@ def test_percent_group_divides_by_100(records_factory):
     assert list(df["score"]) == [0.87, 0.40]
 
 
-def test_decimals_applied_then_rank(records_factory):
-    # real values 90.0/95.0/100.0: a d2 scale skips the "percent" rung and none
-    # of [0, 1] fits, so the group falls through to the percentile-rank rule.
+def test_decimals_applied_then_percent(records_factory):
+    # real values 90.0/95.0/100.0 under a d2 scale: "unit" does not fit, but the
+    # any-decimals "percent" rung does, so these are absolute percentages rather
+    # than a group-relative rank.
     rows = [dict(rater="a", ratee="1", value=9000, scale="d2", tag="uptime"),
             dict(rater="b", ratee="2", value=9500, scale="d2", tag="uptime"),
             dict(rater="c", ratee="3", value=10000, scale="d2", tag="uptime")]
     df = _n(records_factory, rows)
-    assert np.allclose(df["score"], [0.0, 0.5, 1.0])
-    assert list(df["norm_rule"]) == ["rank", "rank", "rank"]
+    assert np.allclose(df["score"], [0.90, 0.95, 1.00])
+    assert list(df["norm_rule"]) == ["percent", "percent", "percent"]
 
 
 def test_unit_range_passthrough(records_factory):
@@ -47,15 +48,16 @@ def test_unit_range_passthrough(records_factory):
     assert list(df["norm_rule"]) == ["unit", "unit"]
 
 
-def test_negative_range_uses_rank(records_factory):
-    # only 2 of 3 values are in [0, 100], below the 0.9 fit share, so "percent"
-    # does not fit and the group falls through to the percentile-rank rule.
+def test_negative_outlier_tolerated_and_clipped_under_percent(records_factory):
+    # n=3 tolerates one out-of-range record, so the -10 no longer drags the group
+    # off "percent": it is clipped to 0 and the two honest values keep their
+    # absolute percent scores.
     rows = [dict(rater="a", ratee="1", value=-10, tag="neg"),
             dict(rater="b", ratee="2", value=0, tag="neg"),
             dict(rater="c", ratee="3", value=10, tag="neg")]
     df = _n(records_factory, rows)
-    assert np.allclose(df["score"], [0.0, 0.5, 1.0])
-    assert list(df["norm_rule"]) == ["rank", "rank", "rank"]
+    assert np.allclose(df["score"], [0.0, 0.0, 0.1])
+    assert list(df["norm_rule"]) == ["percent", "percent", "percent"]
 
 
 def test_constant_group_is_half(records_factory):
@@ -80,7 +82,7 @@ def test_norm_rule_recorded(records_factory):
     rows = [dict(rater="a", ratee="1", value=9977, scale="d2", tag="uptime"),
             dict(rater="b", ratee="2", value=9000, scale="d2", tag="uptime")]
     df = _n(records_factory, rows)
-    assert list(df["norm_rule"]) == ["rank", "rank"]
+    assert list(df["norm_rule"]) == ["percent", "percent"]
 
     rows = [dict(rater="a", ratee="1", value=500, tag="rev"), dict(rater="b", ratee="2", value=500, tag="rev")]
     df = _n(records_factory, rows)
@@ -170,14 +172,16 @@ def test_fallback_is_percentile_rank_not_minmax():
 
 
 def test_rank_uses_average_ranks_for_ties():
-    out = normalize(_frame([5, 5, 500]))
+    # no absolute rung fits (nothing is in [0, 100]), so the group reaches "rank".
+    out = normalize(_frame([5000, 5000, 500000]))
+    assert set(out["norm_rule"]) == {RULE_RANK}
     np.testing.assert_allclose(out["score"], [0.25, 0.25, 1.0])
 
 
 def test_binary_group_maps_stray_value_as_percent():
-    # The binary rung fits (10/11 in {0, 1}), but the stray 7 is NOT clipped into
-    # {0, 1}: it takes the next absolute rule for a d0 scale, "percent", so it
-    # scores 0.07. The honest 0s and 1s keep the binary map.
+    # The binary rung fits (one record outside {0, 1}, within the n=11 tolerance),
+    # but the stray 7 is NOT clipped into {0, 1}: it takes the next absolute rung
+    # for a d0 scale, "percent", so it scores 0.07. The 0s and 1s keep the binary map.
     out = normalize(_frame([0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 7]))
     assert set(out["norm_rule"]) == {RULE_BINARY}
     assert out["score"].iloc[-1] == 0.07
@@ -196,18 +200,77 @@ def test_binary_fitting_d2_group_maps_strays_by_unit_rule():
 
 
 def test_binary_flood_cannot_level_honest_percent_values():
-    # The levelling attack: 50 all-zero rows push an honest percent group over the
-    # binary fit share (50/55 = 91%). The rule name changes, but every map is
-    # ABSOLUTE, so the honest 80s still score 0.8 rather than clipping to 1.0.
+    # The levelling attack: 50 all-zero rows carry an honest percent group onto the
+    # binary rung (5 records outside {0, 1}, exactly the n=55 tolerance). Both rungs
+    # involved map each record from its own value, so the honest 80s still score 0.8
+    # rather than clipping to 1.0. Note this is not a general guarantee: a flood past
+    # the tolerance can still re-level, via "rank" or the d0 binary/percent 100x
+    # boundary -- see the module docstring in robustrep.normalize.
     out = normalize(_frame([80] * 5 + [0] * 50))
     assert set(out["norm_rule"]) == {RULE_BINARY}
     np.testing.assert_allclose(out["score"].iloc[:5], [0.8] * 5)
     assert (out["score"].iloc[5:] == 0.0).all()
 
 
-def test_fit_share_below_threshold_falls_through():
-    out = normalize(_frame([10, 20, 30, 5000]))     # 75% fit < 90%
+def test_two_outliers_exceed_the_small_group_tolerance():
+    # the designed limit: n=10 tolerates one out-of-range record, not two, so a
+    # pair of extremes does drag the group onto the group-relative "rank" rung.
+    honest = [10, 50, 90, 100, 0, 75, 25, 60]
+    out = normalize(_frame(honest + [2**127 - 1, -(2**127)]))
     assert set(out["norm_rule"]) == {RULE_RANK}
+
+
+def test_small_group_tolerates_one_outlier_under_percent():
+    # 489 of 654 real (tag, scale) groups on Base hold <= 8 records, where a bare
+    # 0.9 share test still lets ONE record flip the rule. The tolerance is a count,
+    # so an attacker needs at least two records at every group size >= 2.
+    honest = [10, 50, 90, 100, 0, 75, 25, 60]       # n=8
+    base = normalize(_frame(honest))
+    poisoned = normalize(_frame(honest + [2**127 - 1]))
+    assert set(base["norm_rule"]) == {RULE_PERCENT}
+    assert set(poisoned["norm_rule"]) == {RULE_PERCENT}
+    np.testing.assert_allclose(poisoned["score"].iloc[:8], base["score"])
+    assert poisoned["score"].iloc[8] == 1.0
+
+
+def test_small_binary_group_tolerates_one_stray():
+    # tag `execution_success` on Base: 8 records all value 1. One stray v=50 no
+    # longer flips the group to "percent" (which would re-level honest 1.0 -> 0.01).
+    out = normalize(_frame([1, 1, 0, 1, 1, 0, 1, 1, 50]))
+    assert set(out["norm_rule"]) == {RULE_BINARY}
+    np.testing.assert_allclose(out["score"].iloc[:8], [1, 1, 0, 1, 1, 0, 1, 1])
+    assert out["score"].iloc[-1] == 0.5
+
+
+def test_single_record_group_is_constant():
+    # n=1 tolerates nothing, so no ranged rule fits and the lone record is neutral.
+    out = normalize(_frame([500]))
+    assert set(out["norm_rule"]) == {RULE_CONSTANT} and out["score"].iloc[0] == 0.5
+
+
+def test_two_record_identical_group_is_constant():
+    out = normalize(_frame([500, 500]))
+    assert set(out["norm_rule"]) == {RULE_CONSTANT} and (out["score"] == 0.5).all()
+
+
+def test_percent_rung_covers_decimal_scales():
+    # F4: genuine percent data carried at d2 (real 99.77, 98.5, ...) has an
+    # absolute rung of its own instead of falling through to "rank".
+    raw = [9977, 9850, 10000, 9525, 0, 5000, 7550, 8880, 1230, 6660]
+    out = normalize(_frame(raw, scale="d2"))
+    assert set(out["norm_rule"]) == {RULE_PERCENT}
+    np.testing.assert_allclose(
+        out["score"], [0.9977, 0.985, 1.0, 0.9525, 0.0, 0.5, 0.755, 0.888, 0.123, 0.666])
+
+
+def test_unit_wins_over_decimal_percent():
+    # "unit" is tried before the any-decimals "percent" rung, so a d2 group already
+    # confined to [0, 1] is passed through rather than divided by 100 again.
+    raw = [50, 25, 75, 10, 90, 33, 66, 5, 95, 40]   # real 0.50, 0.25, ... all in [0, 1]
+    out = normalize(_frame(raw, scale="d2"))
+    assert set(out["norm_rule"]) == {RULE_UNIT}
+    np.testing.assert_allclose(
+        out["score"], [0.50, 0.25, 0.75, 0.10, 0.90, 0.33, 0.66, 0.05, 0.95, 0.40])
 
 
 def test_unit_group_with_negative_outlier_clips_to_zero():
@@ -235,7 +298,11 @@ def test_normalize_validates_fit_share():
 
 
 def test_fit_share_is_configurable_and_validated():
-    out = normalize(_frame([10, 20, 30, 5000]), fit_share=0.75)
+    # n=10 tolerates 1 outlier at the 0.9 default but 2 at 0.75, so the same pair
+    # of extremes falls to "rank" under the default and stays "percent" at 0.75.
+    rows = [10, 50, 90, 100, 0, 75, 25, 60] + [2**127 - 1, -(2**127)]
+    assert set(normalize(_frame(rows))["norm_rule"]) == {RULE_RANK}
+    out = normalize(_frame(rows), fit_share=0.75)
     assert set(out["norm_rule"]) == {RULE_PERCENT}
     with pytest.raises(ValueError):
         Config(norm_fit_share=0.5)
