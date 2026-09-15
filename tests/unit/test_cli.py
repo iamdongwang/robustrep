@@ -1118,14 +1118,17 @@ def test_report_provenance_includes_config_in_markdown_and_json(tmp_path):
 
     md = (out_dir / "latest" / "report.md").read_text()
     for phrase in ("bootstrap_n", "bootstrap_seed", "min_clusters", "evidence_weights",
-                  "sybil_jaccard", "sybil_window_s", "sybil_max_group"):
+                  "sybil_jaccard", "sybil_window_s", "sybil_max_group", "norm_fit_share"):
         assert phrase in md, phrase
 
     data = json.loads((out_dir / "latest" / "scores.json").read_text())
     config = data["config"]
     assert config["bootstrap_n"] == 5
+    # norm_fit_share decides which normalization rule each (tag, scale) group is
+    # scored under, so a report is not reproducible without it on the record.
+    assert config["norm_fit_share"] == cli.Config().norm_fit_share
     for key in ("bootstrap_seed", "min_clusters", "evidence_weights", "sybil_jaccard",
-                "sybil_window_s", "sybil_max_group", "sybil_flag_share"):
+                "sybil_window_s", "sybil_max_group", "sybil_flag_share", "norm_fit_share"):
         assert key in config
 
 

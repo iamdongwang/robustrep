@@ -269,7 +269,8 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     if config:
         lines.append("- Scoring configuration used:")
         for key in ("bootstrap_n", "bootstrap_seed", "min_clusters", "evidence_weights",
-                    "sybil_jaccard", "sybil_window_s", "sybil_max_group", "sybil_flag_share"):
+                    "sybil_jaccard", "sybil_window_s", "sybil_max_group", "sybil_flag_share",
+                    "norm_fit_share"):
             if key in config:
                 lines.append(f"  - `{key}`: {config[key]}")
     versions = prov.get("versions") or {}

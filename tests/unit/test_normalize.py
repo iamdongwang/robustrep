@@ -174,10 +174,35 @@ def test_rank_uses_average_ranks_for_ties():
     np.testing.assert_allclose(out["score"], [0.25, 0.25, 1.0])
 
 
-def test_binary_group_with_stray_value_clips():
+def test_binary_group_maps_stray_value_as_percent():
+    # The binary rung fits (10/11 in {0, 1}), but the stray 7 is NOT clipped into
+    # {0, 1}: it takes the next absolute rule for a d0 scale, "percent", so it
+    # scores 0.07. The honest 0s and 1s keep the binary map.
     out = normalize(_frame([0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 7]))
     assert set(out["norm_rule"]) == {RULE_BINARY}
+    assert out["score"].iloc[-1] == 0.07
+    np.testing.assert_allclose(out["score"].iloc[:10], [0, 1, 1, 0, 1, 1, 0, 1, 1, 1])
+
+
+def test_binary_fitting_d2_group_maps_strays_by_unit_rule():
+    # Same group shape under a d2 scale: the next absolute rule is "unit", not
+    # "percent", so a stray real 0.6 stays 0.6 and a stray real 5 clips to 1.0.
+    raw = [0, 100] * 9 + [60, 500]          # real: nine 0.0, nine 1.0, 0.6, 5.0
+    out = normalize(_frame(raw, scale="d2"))
+    assert set(out["norm_rule"]) == {RULE_BINARY}
+    assert out["score"].iloc[-2] == 0.6
     assert out["score"].iloc[-1] == 1.0
+    np.testing.assert_allclose(out["score"].iloc[:18], [0.0, 1.0] * 9)
+
+
+def test_binary_flood_cannot_level_honest_percent_values():
+    # The levelling attack: 50 all-zero rows push an honest percent group over the
+    # binary fit share (50/55 = 91%). The rule name changes, but every map is
+    # ABSOLUTE, so the honest 80s still score 0.8 rather than clipping to 1.0.
+    out = normalize(_frame([80] * 5 + [0] * 50))
+    assert set(out["norm_rule"]) == {RULE_BINARY}
+    np.testing.assert_allclose(out["score"].iloc[:5], [0.8] * 5)
+    assert (out["score"].iloc[5:] == 0.0).all()
 
 
 def test_fit_share_below_threshold_falls_through():
@@ -198,6 +223,15 @@ def test_unit_group_with_negative_outlier_clips_to_zero():
 def test_constant_group_is_neutral():
     out = normalize(_frame([500, 500, 500]))
     assert set(out["norm_rule"]) == {RULE_CONSTANT} and (out["score"] == 0.5).all()
+
+
+def test_normalize_validates_fit_share():
+    # normalize() is callable directly, not only through Config, so it range-checks
+    # `fit_share` with the same validator Config uses.
+    with pytest.raises(ValueError):
+        normalize(_frame([10, 20, 30]), fit_share=0.5)
+    with pytest.raises(ValueError):
+        normalize(_frame([10, 20, 30]), fit_share=1.1)
 
 
 def test_fit_share_is_configurable_and_validated():

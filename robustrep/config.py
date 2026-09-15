@@ -16,6 +16,19 @@ DEFAULT_CONFIRMATIONS = 20
 DEFAULT_NORM_FIT_SHARE = 0.9
 
 
+def validate_norm_fit_share(value: float) -> None:
+    """Raise ValueError unless `value` is in (0.5, 1.0].
+
+    Shared by `Config.__post_init__` and `robustrep.normalize.normalize`, which
+    can be called directly with its own `fit_share` rather than through a
+    Config. <= 0.5 would let a minority of a group pick that group's
+    normalization rule, which is the attacker-controlled breakdown the
+    parameter exists to close.
+    """
+    if not 0.5 < value <= 1.0:
+        raise ValueError("norm_fit_share must be in (0.5, 1.0]")
+
+
 @dataclass(frozen=True)
 class Config:
     # evidence level 0..3 -> weight
@@ -51,10 +64,7 @@ class Config:
             raise ValueError("bootstrap_n must be >= 0")
         if self.min_clusters < 1:
             raise ValueError("min_clusters must be >= 1")
-        if not 0.5 < self.norm_fit_share <= 1.0:
-            # <= 0.5 would let a minority of a group pick its normalization rule,
-            # which is the attacker-controlled breakdown this parameter exists to close.
-            raise ValueError("norm_fit_share must be in (0.5, 1.0]")
+        validate_norm_fit_share(self.norm_fit_share)
         if not 0 < self.sybil_jaccard <= 1:
             raise ValueError("sybil_jaccard must be in (0, 1]")  # 0 would match every pair's Jaccard signal
         if self.sybil_max_pairs < 1:
