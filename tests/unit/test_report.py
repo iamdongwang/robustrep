@@ -475,18 +475,21 @@ _BASE_SENS = pd.DataFrame([dict(variant="base", spearman_top=1.0)])
 def _with_cluster_stats(sc, **stats):
     out = sc.copy()
     out.attrs["cluster_stats"] = dict(
-        {"pairs_tested": 0, "ratees_skipped_size": 0, "ratees_skipped_budget": 0, "truncated": False},
+        {"pairs_tested": 0, "pairs_examined": 0, "ratees_skipped_size": 0,
+         "ratees_skipped_budget": 0, "truncated": False},
         **stats)
     return out
 
 
 def test_render_markdown_budget_limited_bullet(records_factory):
     rec, sc = _data(records_factory)
-    sc = _with_cluster_stats(sc, pairs_tested=5, ratees_skipped_budget=2, truncated=True)
+    sc = _with_cluster_stats(sc, pairs_tested=5, pairs_examined=8, ratees_skipped_budget=2,
+                             truncated=True)
     md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
     assert ("Sybil clustering was budget-limited: 0 ratee block(s) skipped for size "
             "(> sybil_max_group), 2 for the per-ratee pair budget, global pair budget "
-            "reached: yes (5 pairs tested). Clusters among the affected raters may be "
+            "reached: yes (8 candidate pairs examined, 5 tested). Clusters among the "
+            "affected raters may be "
             "under-merged, so their ratees' scores are less robust than reported, "
             "never more.") in md
     assert "## Limitations" in md.split("budget-limited")[0]
@@ -494,26 +497,27 @@ def test_render_markdown_budget_limited_bullet(records_factory):
 
 def test_render_markdown_budget_bullet_says_no_when_global_budget_untouched(records_factory):
     rec, sc = _data(records_factory)
-    sc = _with_cluster_stats(sc, pairs_tested=7, ratees_skipped_size=3)
+    sc = _with_cluster_stats(sc, pairs_tested=7, pairs_examined=7, ratees_skipped_size=3)
     md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
     assert ("3 ratee block(s) skipped for size (> sybil_max_group), 0 for the per-ratee "
-            "pair budget, global pair budget reached: no (7 pairs tested).") in md
+            "pair budget, global pair budget reached: no "
+            "(7 candidate pairs examined, 7 tested).") in md
 
 
 def test_render_markdown_budget_bullet_on_truncation_alone(records_factory):
     """`truncated` on its own -- no ratee block skipped either way -- is still a
     budget-limited run and still has to be stated."""
     rec, sc = _data(records_factory)
-    sc = _with_cluster_stats(sc, pairs_tested=9, truncated=True)
+    sc = _with_cluster_stats(sc, pairs_tested=9, pairs_examined=12, truncated=True)
     md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
     assert ("Sybil clustering was budget-limited: 0 ratee block(s) skipped for size "
             "(> sybil_max_group), 0 for the per-ratee pair budget, global pair budget "
-            "reached: yes (9 pairs tested).") in md
+            "reached: yes (12 candidate pairs examined, 9 tested).") in md
 
 
 def test_render_markdown_no_budget_bullet_when_every_counter_is_zero(records_factory):
     rec, sc = _data(records_factory)
-    sc = _with_cluster_stats(sc, pairs_tested=12)
+    sc = _with_cluster_stats(sc, pairs_tested=12, pairs_examined=12)
     md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
     assert "budget-limited" not in md
 
@@ -560,7 +564,8 @@ def test_render_markdown_omits_budget_column_prose_without_the_column(records_fa
 
 def test_export_json_carries_cluster_stats(tmp_path, records_factory):
     rec, sc = _data(records_factory)
-    stats = {"pairs_tested": 7, "ratees_skipped_size": 1, "ratees_skipped_budget": 0, "truncated": False}
+    stats = {"pairs_tested": 7, "pairs_examined": 9, "ratees_skipped_size": 1,
+             "ratees_skipped_budget": 0, "truncated": False}
     p = export_json(sc, block=1, out=tmp_path / "scores.json", config={"bootstrap_n": 5},
                     cluster_stats=stats)
     data = json.loads(p.read_text())
