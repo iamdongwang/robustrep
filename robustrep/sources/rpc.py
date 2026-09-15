@@ -6,6 +6,12 @@ recognizable ``User-Agent``. ``RpcClient`` retries each request up to ``retries`
 times with exponential backoff (1s, 2s, 4s, ...capped at 30s), rotating to the
 next configured URL on every attempt (including the first retry) so a single bad
 endpoint does not stall the whole sync.
+
+Response bodies are read through ``http_util.read_json_capped`` with a
+``max_response_bytes`` cap (security review finding M2): a public endpoint is an
+untrusted third party, and ``requests``' ``Response.json()`` would happily buffer
+an unbounded -- or deliberately endless -- body straight into this process's
+memory.
 """
 from __future__ import annotations
 
@@ -17,7 +23,16 @@ from urllib.parse import urlsplit
 
 import requests
 
+from .http_util import ResponseTooLarge, read_json_capped
+
 logger = logging.getLogger(__name__)
+
+# Largest JSON-RPC response body this client will buffer (M2). A single
+# ``eth_getLogs`` chunk over a busy 2,000-block range is comfortably inside
+# this; a body past it is either a broken endpoint or an attempt to exhaust
+# this process's memory, and either way is not worth parsing. See
+# ``http_util.read_json_capped``.
+DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 class RpcError(RuntimeError):
@@ -126,6 +141,10 @@ class RpcClient:
     ``session`` (for tests) and ``sleep`` function (so backoff is instant in
     tests), and ``retries``/``timeout`` knobs.
 
+    ``max_response_bytes`` caps how much of a response body is ever buffered
+    (M2); a body past it fails the call immediately and non-retryably (see
+    ``_post``).
+
     ``session`` is thread-local when not injected: each calling thread gets
     its own lazily-created ``requests.Session`` (via the ``session`` property
     below), since a single ``requests.Session`` is not guaranteed safe to
@@ -136,12 +155,14 @@ class RpcClient:
     """
 
     def __init__(self, urls, user_agent: str, session=None, retries: int = 5, timeout: int = 30,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES):
         self.urls, self.i = list(urls), 0
         self.headers = {"content-type": "application/json", "user-agent": user_agent}
         self._injected_session = session
         self._local = threading.local()
         self.retries, self.timeout, self.sleep = retries, timeout, sleep
+        self.max_response_bytes = max_response_bytes
 
     @property
     def session(self):
@@ -161,10 +182,31 @@ class RpcClient:
         return sess
 
     def _post(self, payload):
+        """POST ``payload`` and return the decoded body, reading at most
+        ``max_response_bytes`` of it (M2 -- see ``http_util.read_json_capped``).
+
+        The request is streamed so the cap is enforced while reading rather
+        than after ``requests`` has already buffered the whole body, and the
+        response is always closed. An oversized body raises ``RpcError``
+        *immediately*: unlike a timeout or a rate limit, "this endpoint
+        answered with more bytes than we will parse" is deterministic, so
+        ``_with_retry`` must not retry it (``RpcError`` is not one of the
+        exception types it catches) -- re-asking would burn the whole retry
+        budget, and rotating would drag every other configured endpoint into
+        a failure that is not theirs. The message names only the scrubbed
+        endpoint and the limit: never the body, never the full URL (which may
+        embed a provider API key).
+        """
         url = self.urls[self.i % len(self.urls)]
-        r = self.session.post(url, json=payload, headers=self.headers, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+        r = self.session.post(url, json=payload, headers=self.headers, timeout=self.timeout, stream=True)
+        try:
+            r.raise_for_status()
+            return read_json_capped(r, self.max_response_bytes)
+        except ResponseTooLarge:
+            raise RpcError(f"response from {_endpoint(url)} exceeds the "
+                           f"{self.max_response_bytes} byte limit") from None
+        finally:
+            r.close()
 
     def _with_retry(self, payload, check: Callable[[object], Optional[str]]):
         """Post ``payload``, retrying (rotating URL, sleeping with backoff) while

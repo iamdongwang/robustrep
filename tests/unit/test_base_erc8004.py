@@ -667,3 +667,135 @@ def test_owners_of_batch_size_le_1_never_calls_batch():
     out = b.owners_of(rpc, ["1", "2"], batch_size=1)
     assert out == {"1": "0x" + "11" * 20, "2": None}
     assert len([c for c in rpc.calls if c[0] == "eth_call"]) == 2
+
+
+# --- L4: malformed topics / data / agent ids ----------------------------------------
+
+
+def _agent_topic(n=1):
+    return "0x" + (n).to_bytes(32, "big").hex()
+
+
+_CLIENT_TOPIC = "0x" + "00" * 12 + "ab" * 20
+
+
+def test_decode_log_short_topic_returns_none_with_warning(caplog):
+    # A truncated indexed topic would silently yield a short "address" --
+    # skip the log instead (and never crash the whole sync over it).
+    log = _log(b.TOPIC_REVOKED, ["0xdead", _CLIENT_TOPIC, _agent_topic(9)], b"")
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(log) is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "0xdead" in warnings[0].getMessage()
+
+
+def test_decode_log_over_long_topic_returns_none():
+    log = _log(b.TOPIC_REVOKED, ["0x" + "ff" * 40, _CLIENT_TOPIC, _agent_topic(9)], b"")
+    assert b.decode_log(log) is None
+
+
+def test_decode_log_non_hex_topic_returns_none():
+    log = _log(b.TOPIC_REVOKED, ["0x" + "zz" * 32, _CLIENT_TOPIC, _agent_topic(9)], b"")
+    assert b.decode_log(log) is None
+
+
+def test_decode_log_non_string_topic_returns_none():
+    log = _log(b.TOPIC_REVOKED, [12345, _CLIENT_TOPIC, _agent_topic(9)], b"")
+    assert b.decode_log(log) is None
+
+
+def test_decode_log_non_string_topic0_returns_none():
+    log = {"topics": [12345], "data": "0x", "blockNumber": "0x1", "transactionHash": "0xt",
+           "logIndex": "0x0"}
+    assert b.decode_log(log) is None
+
+
+def test_decode_log_non_hex_data_returns_none_with_warning(caplog):
+    log = _log(b.TOPIC_RESPONSE, [_agent_topic(), _CLIENT_TOPIC, _CLIENT_TOPIC], b"")
+    log["data"] = "0xnothexatall"
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(log) is None
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_decode_log_odd_length_data_returns_none():
+    log = _log(b.TOPIC_RESPONSE, [_agent_topic(), _CLIENT_TOPIC, _CLIENT_TOPIC], b"")
+    log["data"] = "0xabc"
+    assert b.decode_log(log) is None
+
+
+def test_decode_log_warning_truncates_a_huge_topic(caplog):
+    log = _log(b.TOPIC_REVOKED, ["0x" + "a" * 100_000, _CLIENT_TOPIC, _agent_topic(9)], b"")
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(log) is None
+    assert len(caplog.text) < 2000
+
+
+def test_addr_rejects_a_topic_that_is_not_an_address():
+    with pytest.raises(ValueError):
+        b._addr("0xnothex")
+
+
+def test_addr_accepts_a_valid_topic():
+    assert b._addr(_CLIENT_TOPIC) == "0x" + "ab" * 20
+
+
+def test_owner_call_data_rejects_an_over_range_agent_id():
+    with pytest.raises(ValueError):
+        b._owner_call_data(str(2 ** 256))
+
+
+def test_owner_call_data_rejects_a_non_decimal_agent_id():
+    with pytest.raises(ValueError):
+        b._owner_call_data("0xdeadbeef")
+
+
+def test_owner_call_data_rejects_a_negative_agent_id():
+    with pytest.raises(ValueError):
+        b._owner_call_data("-1")
+
+
+def test_owner_call_data_accepts_the_max_uint256_id():
+    data = b._owner_call_data(str(2 ** 256 - 1))
+    assert data == b._OWNER_OF_SELECTOR + "ff" * 32
+
+
+def test_owner_of_skips_a_malformed_agent_id_without_calling_rpc(caplog):
+    class NoCallRpc:
+        def call(self, method, params):
+            raise AssertionError("must not reach the RPC for a malformed agent id")
+
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.owner_of(NoCallRpc(), str(2 ** 256)) is None
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_owners_of_skips_malformed_ids_and_still_resolves_the_rest():
+    class BatchRpc:
+        def __init__(self):
+            self.batched = []
+
+        def batch(self, calls):
+            self.batched.append(calls)
+            return ["0x" + "00" * 12 + "ee" * 20] * len(calls)
+
+        def call(self, method, params):
+            raise AssertionError("batch path only")
+
+    rpc = BatchRpc()
+    out = b.owners_of(rpc, ["1", str(2 ** 256), "2"], batch_size=10)
+    assert out["1"] == "0x" + "ee" * 20 and out["2"] == "0x" + "ee" * 20
+    assert out[str(2 ** 256)] is None
+    assert len(rpc.batched[0]) == 2  # the malformed id never entered the batch
+
+
+def test_owners_of_all_ids_malformed_never_batches():
+    class NeverRpc:
+        def batch(self, calls):
+            raise AssertionError("must not batch when every id is malformed")
+
+        def call(self, method, params):
+            raise AssertionError("must not call when every id is malformed")
+
+    assert b.owners_of(NeverRpc(), ["0xzz", str(2 ** 256)], batch_size=10) == {"0xzz": None,
+                                                                               str(2 ** 256): None}

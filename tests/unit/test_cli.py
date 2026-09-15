@@ -1449,3 +1449,71 @@ def test_report_min_clusters_reaches_config(tmp_path, monkeypatch):
 def test_report_rejects_non_positive_min_clusters(tmp_path):
     r = runner.invoke(app, ["report", "--db", str(tmp_path / "t.db"), "--min-clusters", "0"])
     assert r.exit_code == 2
+
+
+# --- fetch --reprofile-raters (M4 escape hatch) -------------------------------------
+
+
+def _stub_fetch_steps(monkeypatch, on_enrich=None):
+    """Stub every fetch step so only the raters step does real work."""
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "enrich_raters", on_enrich or (lambda *a, **k: 0))
+
+
+def test_fetch_reprofile_raters_clears_the_cache_before_profiling(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=2)  # both raters already profiled
+    seen = {}
+
+    def _enrich(store, client, addresses=None):
+        seen["targets"] = list(addresses or [])
+        return len(seen["targets"])
+
+    _stub_fetch_steps(monkeypatch, on_enrich=_enrich)
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--reprofile-raters"])
+    assert r.exit_code == 0, r.output
+    assert "rater profiles cleared: 2" in r.output
+    assert len(seen["targets"]) == 2  # cleared first, so both are targets again
+    with Store(db) as s:
+        assert len(s.load_rater_meta()) == 0
+
+
+def test_fetch_without_reprofile_raters_keeps_the_cache(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=2)
+    seen = {}
+
+    def _enrich(store, client, addresses=None):
+        seen["targets"] = list(addresses or [])
+        return 0
+
+    _stub_fetch_steps(monkeypatch, on_enrich=_enrich)
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert "cleared" not in r.output
+    assert seen["targets"] == []
+    with Store(db) as s:
+        assert len(s.load_rater_meta()) == 2
+
+
+def test_fetch_reprofile_raters_is_ignored_when_raters_are_skipped(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=2)
+    _stub_fetch_steps(monkeypatch, on_enrich=lambda *a, **k: 0)
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--reprofile-raters", "--skip-raters"])
+    assert r.exit_code == 0, r.output
+    with Store(db) as s:
+        assert len(s.load_rater_meta()) == 2
+
+
+def test_fetch_declares_the_reprofile_raters_option():
+    import typer.main
+    cmd = typer.main.get_command(app).commands["fetch"]
+    declared = {opt for p in cmd.params for opt in p.opts}
+    assert "--reprofile-raters" in declared
+    flag = next(p for p in cmd.params if "--reprofile-raters" in p.opts)
+    assert flag.default is False

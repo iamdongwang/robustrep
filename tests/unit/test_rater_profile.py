@@ -1,8 +1,11 @@
+import json
 import logging
 from datetime import datetime, timezone
 
+import pytest
 import requests
 
+from robustrep.sources import http_util, rater_profile
 from robustrep.sources.rater_profile import (
     BLOCKSCOUT_BASE,
     BLOCKSCOUT_V2_BASE,
@@ -25,24 +28,70 @@ def fb(client, block=1, log_index=0, agent_id="1", feedback_index=0):
                 feedback_index=feedback_index)
 
 
+class _FakeRaw:
+    """Stand-in for ``urllib3.HTTPResponse``: the streamed byte source
+    ``read_json_capped`` consumes (bodies are capped, never ``r.json()``-ed
+    -- M2)."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def read(self, amt, decode_content=True):
+        chunk, self.data = self.data[:amt], self.data[amt:]
+        return chunk
+
+
+class _ExplodingRaw:
+    """A body that must never be read (the response already errored)."""
+
+    def read(self, amt, decode_content=True):
+        raise AssertionError("body must not be read when raise_for_status() raises")
+
+
+class _FakeResponse:
+    """Streamed stand-in for ``requests.Response``: exposes ``raw`` (what
+    ``read_json_capped`` reads), ``raise_for_status`` and ``close``."""
+
+    def __init__(self, payload=None, *, body=None, status_code=200, error=None):
+        self.status_code, self._error, self.closed = status_code, error, False
+        if error is not None:
+            self.raw = _ExplodingRaw()
+        else:
+            self.raw = _FakeRaw(body if body is not None else json.dumps(payload).encode())
+
+    def raise_for_status(self):
+        if self._error is not None:
+            raise self._error
+
+    def close(self):
+        self.closed = True
+
+
+def _http_error(status_code, message, headers=None):
+    err = requests.HTTPError(message)
+    resp = requests.Response()
+    resp.status_code = status_code
+    resp.headers.update(headers or {})
+    err.response = resp
+    return err
+
+
 class FakeHttp:
-    """Simulates a JSON body response (success or Etherscan-level error body)."""
+    """Simulates a JSON body response (success or Etherscan-level error body).
+
+    Each item in ``payloads`` is a JSON-able object, or raw ``bytes`` for a
+    body that is malformed or deliberately oversized."""
 
     def __init__(self, payloads):
-        self.payloads, self.calls = list(payloads), []
+        self.payloads, self.calls, self.streams, self.responses = list(payloads), [], [], []
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, stream=None):
         self.calls.append(params)
+        self.streams.append(stream)
         p = self.payloads.pop(0)
-
-        class R:
-            def json(self_inner):
-                return p
-
-            def raise_for_status(self_inner):
-                pass
-
-        return R()
+        r = _FakeResponse(body=p) if isinstance(p, bytes) else _FakeResponse(p)
+        self.responses.append(r)
+        return r
 
 
 class FakeHttpRaisingOnGet:
@@ -51,7 +100,7 @@ class FakeHttpRaisingOnGet:
     def __init__(self, exc):
         self.exc, self.calls = exc, []
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, stream=None):
         self.calls.append(params)
         raise self.exc
 
@@ -65,22 +114,10 @@ class FakeHttpRaisingOnStatus:
     def __init__(self, status_code, message, headers=None):
         self.status_code, self.message, self.headers, self.calls = status_code, message, headers or {}, []
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, stream=None):
         self.calls.append(params)
-
-        class R:
-            def raise_for_status(self_inner):
-                err = requests.HTTPError(self.message)
-                resp = requests.Response()
-                resp.status_code = self.status_code
-                resp.headers.update(self.headers)
-                err.response = resp
-                raise err
-
-            def json(self_inner):
-                raise AssertionError("json() must not be called when raise_for_status() raises")
-
-        return R()
+        return _FakeResponse(status_code=self.status_code,
+                             error=_http_error(self.status_code, self.message, self.headers))
 
 
 class FakeHttpBadJson:
@@ -89,17 +126,9 @@ class FakeHttpBadJson:
     def __init__(self):
         self.calls = []
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, stream=None):
         self.calls.append(params)
-
-        class R:
-            def raise_for_status(self_inner):
-                pass
-
-            def json(self_inner):
-                raise ValueError("Expecting value: line 1 column 1 (char 0)")
-
-        return R()
+        return _FakeResponse(body=b"<html>not json</html>")
 
 
 class FakeV2Http:
@@ -110,42 +139,20 @@ class FakeV2Http:
     ``(429, {"Retry-After": "5"})``)."""
 
     def __init__(self, responses):
-        self.responses, self.calls = list(responses), []
+        self.responses, self.calls, self.streams = list(responses), [], []
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, stream=None):
         self.calls.append(dict(params or {}))
+        self.streams.append(stream)
         item = self.responses.pop(0)
         if isinstance(item, (int, tuple)):
             status, headers = item if isinstance(item, tuple) else (item, {})
-
-            class R:
-                status_code = status
-
-                def raise_for_status(self_inner):
-                    err = requests.HTTPError(f"{status} error for url: {url}?apikey=SECRET")
-                    resp = requests.Response()
-                    resp.status_code = status
-                    resp.headers.update(headers)
-                    err.response = resp
-                    raise err
-
-                def json(self_inner):
-                    raise AssertionError("json() must not be called when raise_for_status() raises")
-
-            return R()
-
-        body = item
-
-        class R2:
-            status_code = 200
-
-            def raise_for_status(self_inner):
-                pass
-
-            def json(self_inner):
-                return body
-
-        return R2()
+            return _FakeResponse(
+                status_code=status,
+                error=_http_error(status, f"{status} error for url: {url}?apikey=SECRET", headers))
+        if isinstance(item, bytes):
+            return _FakeResponse(body=item)
+        return _FakeResponse(item)
 
 
 class FakeV2HttpConnErr:
@@ -156,22 +163,12 @@ class FakeV2HttpConnErr:
         self.exc, self.then_body, self.calls = exc, then_body, []
         self._raised = False
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, stream=None):
         self.calls.append(dict(params or {}))
         if not self._raised:
             self._raised = True
             raise self.exc
-
-        class R:
-            status_code = 200
-
-            def raise_for_status(self_inner):
-                pass
-
-            def json(self_inner):
-                return self.then_body
-
-        return R()
+        return _FakeResponse(self.then_body)
 
 
 class FakeV2HttpBadJson:
@@ -180,19 +177,9 @@ class FakeV2HttpBadJson:
     def __init__(self):
         self.calls = []
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, stream=None):
         self.calls.append(dict(params or {}))
-
-        class R:
-            status_code = 200
-
-            def raise_for_status(self_inner):
-                pass
-
-            def json(self_inner):
-                raise ValueError("Expecting value: line 1 column 1 (char 0)")
-
-        return R()
+        return _FakeResponse(body=b"<html>not json</html>")
 
 
 def bs_tx(hash_, block, ts, from_hash, to_hash="0x6974"):
@@ -207,7 +194,7 @@ def test_first_tx_parses_etherscan_v2():
     http = FakeHttp([{"status": "1", "result": [{"blockNumber": "10", "timeStamp": "1700", "from": "0xF"}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     assert c.first_tx("0xA") == (10, 1700, "0xf")
-    assert http.calls[0]["chainid"] == 8453 and http.calls[0]["apikey"] == "KEY"
+    assert http.calls[0]["chainid"] == 8453 and http.calls[0]["apikey"] == "KEY"  # pragma: allowlist secret
 
 
 def test_first_tx_none_when_empty():
@@ -331,7 +318,7 @@ def test_first_tx_retries_body_rate_limit_then_raises():
 
 
 def test_first_tx_scrubs_429_http_error_and_retries(caplog):
-    secret_url = "https://api.etherscan.io/v2/api?chainid=8453&apikey=SECRET"
+    secret_url = "https://api.etherscan.io/v2/api?chainid=8453&apikey=SECRET"  # pragma: allowlist secret
     http = FakeHttpRaisingOnStatus(429, f"429 Client Error: Too Many Requests for url: {secret_url}")
     sleeps = []
     c = EtherscanClient("SECRET", session=http, retries=3, sleep=sleeps.append)
@@ -496,14 +483,17 @@ def test_first_tx_malformed_entry_missing_from_raises_value_error():
         assert "0xa" in str(e).lower()
 
 
-def test_first_tx_malformed_entry_bad_timestamp_raises_value_error():
+def test_first_tx_unparseable_timestamp_returns_none_with_one_warning(caplog):
+    # M4: an unparseable third-party timestamp must not reach the raters cache
+    # (a bad first_seen_ts there wedges every later score/report run), and must
+    # not raise either -- the address simply goes unprofiled.
     http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "not-a-number", "from": "0xF"}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
-    try:
-        c.first_tx("0xA")
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "0xa" in str(e).lower()
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+        assert c.first_tx("0xA") is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "not-a-number" in warnings[0].getMessage() and "0xa" in warnings[0].getMessage()
 
 
 # --- estimate_seconds ---------------------------------------------------------------
@@ -1130,3 +1120,245 @@ def test_enrich_with_blockscout_v2_client_records_blockscout_mode(tmp_path):
     assert m["funder"] == "0xf"
     assert m["first_seen_ts"] == int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
     assert s.get_sync("rater_profile_mode") == "blockscout"
+
+
+# --- M1: the Etherscan API key never reaches urllib3's DEBUG log line ----------------
+
+
+@pytest.fixture
+def clean_urllib3_filters():
+    """Start from (and restore) a urllib3 logger with no redactors installed.
+
+    The filters live on process-wide loggers and the install registry is a
+    module global, so every other test that builds a keyed ``EtherscanClient``
+    leaks one in -- strip them for the duration of these tests, then put the
+    original list back."""
+    names = ("urllib3", "urllib3.connectionpool")
+    before = {n: list(logging.getLogger(n).filters) for n in names}
+    for n in names:
+        lg = logging.getLogger(n)
+        lg.filters = [f for f in lg.filters if not isinstance(f, http_util.ApiKeyRedactor)]
+    saved = dict(http_util._installed_redactors)
+    http_util._installed_redactors.clear()
+    yield
+    for n, filters in before.items():
+        logging.getLogger(n).filters = filters
+    http_util._installed_redactors.clear()
+    http_util._installed_redactors.update(saved)
+
+
+def test_api_key_is_redacted_from_urllib3_debug_records(caplog, clean_urllib3_filters):
+    EtherscanClient("SECRET-KEY-VALUE", session=FakeHttp([]), sleep=lambda _: None)
+    with caplog.at_level(logging.DEBUG, logger="urllib3"):
+        logging.getLogger("urllib3").debug(
+            '%s://%s:%s "%s %s %s" %s %s', "https", "api.etherscan.io", 443,
+            "GET", "/v2/api?module=account&apikey=SECRET-KEY-VALUE", "HTTP/1.1", 200, 512)
+    assert "SECRET-KEY-VALUE" not in caplog.text
+    assert "[redacted]" in caplog.text
+
+
+def test_api_key_is_redacted_from_connectionpool_log_during_a_real_call(caplog, clean_urllib3_filters):
+    class LoggingHttp(FakeHttp):
+        """A session that logs urllib3's connectionpool DEBUG line (the one
+        that carries the whole query string, API key included) mid-request."""
+
+        def get(self, url, params=None, timeout=None, stream=None):
+            logging.getLogger("urllib3.connectionpool").debug(
+                '%s://%s:%s "%s %s %s" %s %s', "https", "api.etherscan.io", 443, "GET",
+                f"/v2/api?module=account&apikey={params['apikey']}", "HTTP/1.1", 200, 512)
+            return super().get(url, params=params, timeout=timeout, stream=stream)
+
+    http = LoggingHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+    c = EtherscanClient("SECRET-KEY-VALUE", session=http, sleep=lambda _: None)
+    with caplog.at_level(logging.DEBUG, logger="urllib3.connectionpool"):
+        assert c.first_tx("0xA") == (3, 99, "0xf")
+    assert "SECRET-KEY-VALUE" not in caplog.text
+    assert "[redacted]" in caplog.text
+
+
+def test_api_key_redactor_installed_once_per_key(clean_urllib3_filters):
+    EtherscanClient("SAME-KEY", session=FakeHttp([]), sleep=lambda _: None)
+    EtherscanClient("SAME-KEY", session=FakeHttp([]), sleep=lambda _: None)
+    for name in ("urllib3", "urllib3.connectionpool"):
+        installed = [f for f in logging.getLogger(name).filters
+                     if isinstance(f, http_util.ApiKeyRedactor)]
+        assert len(installed) == 1
+
+
+def test_keyless_client_installs_no_redactor(clean_urllib3_filters):
+    EtherscanClient(None, session=FakeHttp([]), sleep=lambda _: None)
+    BlockscoutV2Client(session=FakeV2Http([]), sleep=lambda _: None)
+    installed = [f for f in logging.getLogger("urllib3").filters
+                 if isinstance(f, http_util.ApiKeyRedactor)]
+    assert installed == []
+
+
+# --- M2: capped response bodies ------------------------------------------------------
+
+
+def test_etherscan_streams_the_response():
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    c.first_tx("0xA")
+    assert http.streams == [True]
+    assert http.responses[0].closed is True
+
+
+def test_max_profile_response_bytes_is_8_mib():
+    assert rater_profile.MAX_PROFILE_RESPONSE_BYTES == 8 * 1024 * 1024
+
+
+def test_etherscan_oversized_body_raises_without_leaking_key_or_body(caplog, monkeypatch):
+    monkeypatch.setattr(rater_profile, "MAX_PROFILE_RESPONSE_BYTES", 1024)
+    http = FakeHttp([b'{"status": "1", "leak": "' + b"SECRETBODY" * 2000 + b'"}'])
+    c = EtherscanClient("SECRET-KEY-VALUE", session=http, sleep=lambda _: None)
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RuntimeError) as exc:
+            c.first_tx("0xA")
+    msg = str(exc.value)
+    assert "SECRET-KEY-VALUE" not in msg and "SECRETBODY" not in msg
+    assert "0xa" in msg.lower()
+    assert "SECRET-KEY-VALUE" not in caplog.text and "SECRETBODY" not in caplog.text
+
+
+def test_etherscan_oversized_body_is_not_retried(monkeypatch):
+    monkeypatch.setattr(rater_profile, "MAX_PROFILE_RESPONSE_BYTES", 1024)
+    http = FakeHttp([b"x" * 200_000] * 3)
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None, retries=3)
+    with pytest.raises(RuntimeError):
+        c.first_tx("0xA")
+    assert len(http.calls) == 1
+
+
+def test_blockscout_v2_streams_the_response():
+    body = {"items": [bs_tx("0x1", 1, "2026-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    http = FakeV2Http([body])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    c.first_tx("0xA")
+    assert http.streams == [True]
+
+
+def test_blockscout_v2_oversized_body_raises_without_leaking_body(monkeypatch):
+    monkeypatch.setattr(rater_profile, "MAX_PROFILE_RESPONSE_BYTES", 1024)
+    http = FakeV2Http([b'{"items": [], "leak": "' + b"SECRETBODY" * 2000 + b'"}'])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    with pytest.raises(RuntimeError) as exc:
+        c.first_tx("0xA")
+    assert "SECRETBODY" not in str(exc.value)
+    assert "0xa" in str(exc.value).lower()
+
+
+# --- M4: implausible timestamps never reach the raters cache ------------------------
+
+
+def test_etherscan_negative_timestamp_returns_none_with_one_warning(caplog):
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-1", "from": "0xF"}]}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+        assert c.first_tx("0xA") is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "'-1'" in warnings[0].getMessage()
+
+
+def test_etherscan_zero_timestamp_returns_none():
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "0", "from": "0xF"}]}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    assert c.first_tx("0xA") is None
+
+
+def test_etherscan_absurd_future_timestamp_returns_none():
+    absurd = str(rater_profile.MAX_PLAUSIBLE_TS + 1)
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": absurd, "from": "0xF"}]}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    assert c.first_tx("0xA") is None
+
+
+def test_max_plausible_ts_is_2100_01_01():
+    assert rater_profile.MAX_PLAUSIBLE_TS == 4102444800
+
+
+def test_blockscout_pre_1970_timestamp_returns_none_with_one_warning(caplog):
+    body = {"items": [bs_tx("0x1", 1, "1900-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+        assert c.first_tx("0xA") is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "1900-01-01" in warnings[0].getMessage()
+
+
+def test_blockscout_far_future_timestamp_returns_none_with_one_warning(caplog):
+    body = {"items": [bs_tx("0x1", 1, "2200-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+        assert c.first_tx("0xA") is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "2200-01-01" in warnings[0].getMessage()
+
+
+def test_blockscout_garbage_timestamp_returns_none_with_one_warning(caplog):
+    body = {"items": [bs_tx("0x1", 1, "garbage", "0xf")], "next_page_params": None}
+    c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+        assert c.first_tx("0xA") is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "garbage" in warnings[0].getMessage()
+
+
+def test_implausible_timestamp_never_reaches_upsert_rater(tmp_path):
+    # The whole point of M4: nothing implausible is cached, so a later
+    # score/report run cannot be wedged by one hostile third-party row.
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([fb("0xa")])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-99", "from": "0xF"}]}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    assert enrich_raters(s, c) == 1
+    meta = s.load_rater_meta()
+    assert meta["first_seen_ts"].isna().all()
+
+
+# --- L5: Blockscout pagination params are allowlisted, not echoed verbatim -----------
+
+
+def test_next_page_params_drops_unsafe_keys_and_values():
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+             "next_page_params": {"block_number": 100, "index": 5, "../../etc/passwd": "x",
+                                  "Uppercase": "y", "nested": {"a": 1}, "listy": [1, 2]}}
+    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+             "next_page_params": None}
+    http = FakeV2Http([page1, page2])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    assert c.first_tx("0xA")[0] == 100
+    sent = http.calls[1]
+    assert sent["block_number"] == 100 and sent["index"] == 5 and sent["filter"] == "to"
+    assert set(sent) == {"block_number", "index", "filter"}
+
+
+def test_next_page_params_with_nothing_safe_stops_paging(caplog):
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+             "next_page_params": {"BAD/KEY": "x"}}
+    http = FakeV2Http([page1])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+        assert c.first_tx("0xA") is None
+    assert len(http.calls) == 1
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_next_page_params_non_dict_stops_paging():
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+             "next_page_params": ["not", "a", "dict"]}
+    http = FakeV2Http([page1])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    assert c.first_tx("0xA") is None
+    assert len(http.calls) == 1
+
+
+def test_next_page_params_key_length_is_bounded():
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+             "next_page_params": {"a" * 33: 1, "index": 5}}
+    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+             "next_page_params": None}
+    http = FakeV2Http([page1, page2])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    c.first_tx("0xA")
+    assert set(http.calls[1]) == {"index", "filter"}
