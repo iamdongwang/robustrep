@@ -30,7 +30,7 @@ import typer
 
 from . import __version__
 from .config import Config
-from .pipeline import score as score_fn
+from .pipeline import prepare, score as score_fn
 from .report.adversarial import scenario_table
 from .report.export import export_json
 from .report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
@@ -406,6 +406,19 @@ def _evidence_shares_for_provenance(records: pandas.DataFrame) -> dict:
     return {int(level): float(share) for level, share in shares.items()}
 
 
+def _norm_rule_counts_for_provenance(records: pandas.DataFrame, cfg: Config) -> dict:
+    """Records per normalization rule, as a JSON-friendly ``{rule: count}`` dict.
+
+    Computed through ``prepare`` so it reflects exactly the rules the scored run
+    used (revoked rows dropped, ``cfg.norm_fit_share`` applied). Normalization
+    picks a rule per (tag, scale) group from the group's own contents, so a rung
+    flip is the visible symptom of a value-poisoning attempt -- publishing the
+    counts makes one show up as a plain diff between two runs' reports.
+    """
+    rules = prepare(records, cfg)["norm_rule"]
+    return {str(rule): int(n) for rule, n in rules.value_counts().items()}
+
+
 def _provenance(mode: str, cfg: Config, records: pandas.DataFrame) -> dict:
     config = dict(
         bootstrap_n=cfg.bootstrap_n,
@@ -417,6 +430,7 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame) -> dict:
         sybil_max_group=cfg.sybil_max_group,
         sybil_flag_share=cfg.sybil_flag_share,
         norm_fit_share=cfg.norm_fit_share,
+        norm_rule_counts=_norm_rule_counts_for_provenance(records, cfg),
         evidence_level_shares=_evidence_shares_for_provenance(records),
     )
     return dict(

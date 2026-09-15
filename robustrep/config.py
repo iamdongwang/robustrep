@@ -23,7 +23,12 @@ def validate_norm_fit_share(value: float) -> None:
     can be called directly with its own `fit_share` rather than through a
     Config. <= 0.5 would let a minority of a group pick that group's
     normalization rule, which is the attacker-controlled breakdown the
-    parameter exists to close.
+    parameter exists to close; it is also what makes the `constant` rung's
+    median test safe (see `robustrep.normalize._group_scores`).
+
+    1.0 is allowed and is strictly all-or-nothing: every value in a group must
+    fall inside a rule's range for that rule to apply, with no small-group
+    tolerance. It is the only way to ask for the pre-tolerance behaviour.
     """
     if not 0.5 < value <= 1.0:
         raise ValueError("norm_fit_share must be in (0.5, 1.0]")
@@ -34,7 +39,9 @@ class Config:
     # evidence level 0..3 -> weight
     evidence_weights: tuple[float, float, float, float] = (0.1, 0.3, 0.7, 1.0)
     # normalization: share of a (tag, scale) group that must fit a rule's range
-    # for that rule to be chosen; out-of-range values are clipped, not fitted
+    # for that rule to be chosen; out-of-range values are clipped, not fitted.
+    # Small groups always tolerate one outlier (see robustrep.normalize._fits)
+    # EXCEPT at exactly 1.0, which is strictly all-or-nothing.
     norm_fit_share: float = DEFAULT_NORM_FIT_SHARE
     # sybil clustering
     sybil_window_s: int = 24 * 3600

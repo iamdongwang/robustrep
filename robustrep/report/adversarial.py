@@ -6,10 +6,11 @@ generators, funder/meta helpers, and the `run`/`build` glue) exercised by
 defining their own copies, so the report's "adversarial evidence" table and
 the test suite's assertions can never silently drift apart.
 
-`scenario_table()` reports six representative scenarios for the report
-(spec Sec 5.5b): A (boosting sybils), B (smearing sybils), D (evidence-free
-flood without clustering), E (fresh-tag attack), F (sybil farm split across
-two funders), and H at k=20 (the evasive-attacker limitation case: distinct
+`scenario_table()` reports seven representative scenarios for the report
+(spec Sec 5.5b): A (boosting sybils), B (smearing sybils), C (int128 value
+poisoning of a normalization group), D (evidence-free flood without
+clustering), E (fresh-tag attack), F (sybil farm split across two funders),
+and H at k=20 (the evasive-attacker limitation case: distinct
 funders, >24h spacing, decoy ratees -- clustering never fires, but the
 weighted median and evidence weighting still hold the honest value). All
 computed with `Config(bootstrap_n=0)`: point estimates only, no CI claims.
@@ -63,6 +64,35 @@ def run(rows):
     df = build(rows)
     clusters = cluster_raters(profiles_from_records(df, meta_for(rows)), CFG)
     return score(df, CFG, clusters=clusters).set_index("ratee").loc["A"]
+
+
+# --- scenario C: int128 value poisoning of the normalization group --------------
+
+C_HONEST_VALUES = (10, 50, 90, 100, 0, 75, 25, 60, 40, 80, 30, 70, 20, 65, 55, 45, 35, 85, 95, 5)
+
+
+def scenario_c_rows() -> tuple[list, list]:
+    """`(honest_rows, poison_rows)` for the C2 value-poisoning scenario.
+
+    20 independent, level-2 raters give ratee "A" a spread of honest percentages
+    under the default tag; two throwaway raters post +/-2**127 on a throwaway
+    ratee "Z" under the SAME tag. `normalize` groups by (tag, scale) across the
+    whole dataset, so those two records decide how "A" is scored even though they
+    never rate "A" -- under the old min-max fallback they flattened every honest
+    score to exactly 0.5.
+
+    20 honest rows, not 10: two out-of-range records fall inside the group's
+    outlier tolerance only from n=20 up (see `robustrep.normalize._fits`). With
+    10 honest rows the group correctly drops to the group-relative `rank` rung
+    instead, which preserves order and spread but not the exact honest scores --
+    that is the documented limit of the tolerance, not the property this scenario
+    pins.
+    """
+    honest_rows = [dict(rater=f"c{i}", ratee="A", value=v, ts=i * 7 * DAY, evidence_level=2)
+                   for i, v in enumerate(C_HONEST_VALUES)]
+    poison_rows = [dict(rater="atk0", ratee="Z", value=2**127 - 1, ts=0, evidence_level=0),
+                   dict(rater="atk1", ratee="Z", value=-(2**127), ts=0, evidence_level=0)]
+    return honest_rows, poison_rows
 
 
 # --- scenario F: sybil farm split across two funders ----------------------------
@@ -186,7 +216,7 @@ def h_boost_breakeven():
 
 
 def scenario_table() -> pd.DataFrame:
-    """Naive-vs-robust numbers for scenarios A, B, D, E, F, H(k=20), plus three
+    """Naive-vs-robust numbers for scenarios A, B, C, D, E, F, H(k=20), plus three
     measured attacker break-even rows, for the report.
 
     Side-effect free: computes and returns a DataFrame, never writes a file.
@@ -198,6 +228,9 @@ def scenario_table() -> pd.DataFrame:
     """
     a = run(honest("A", 5) + sybils("A", 50, val=100, ts=100 * DAY))
     b = run(honest("A", 5) + sybils("A", 50, val=0, ts=100 * DAY))
+
+    c_honest, c_poison = scenario_c_rows()
+    c = score(build(c_honest + c_poison), CFG).set_index("ratee").loc["A"]
 
     d_rows = honest("A", 5, val=80) + [dict(rater=f"z{i}", ratee="A", value=0, ts=i * 3 * DAY, evidence_level=0)
                                        for i in range(20)]
@@ -220,8 +253,9 @@ def scenario_table() -> pd.DataFrame:
     h = score(h_df, CFG, clusters=h_clusters).set_index("ratee").loc["A"]
 
     rows = []
-    for name, row in (("A_boosting", a), ("B_smearing", b), ("D_evidence_free_flood", d),
-                       ("E_fresh_tag", e), ("F_split_funders", f), ("H_evasive_k20", h)):
+    for name, row in (("A_boosting", a), ("B_smearing", b), ("C_value_poisoning", c),
+                       ("D_evidence_free_flood", d), ("E_fresh_tag", e),
+                       ("F_split_funders", f), ("H_evasive_k20", h)):
         rows.append(dict(scenario=name, naive_mean=row["naive_mean"], robust_score=row["robust_score"],
                           n_clusters=row["n_clusters"], sybil_flag=row["sybil_flag"],
                           zero_evidence_ratio=row["zero_evidence_ratio"]))

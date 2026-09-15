@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from robustrep import Config, score
+from robustrep.pipeline import prepare
 from robustrep.schema import RECORD_COLUMNS, RESULT_COLUMNS
 
 
@@ -223,3 +224,15 @@ def test_one_extreme_value_cannot_flatten_other_agents(records_factory):
     for ratee in ("A0", "A1"):
         pd.testing.assert_series_equal(clean.loc[ratee], poisoned.loc[ratee])
     assert poisoned.loc["Z", "robust_score"] == 1.0
+
+
+def test_prepare_passes_norm_fit_share_through(records_factory):
+    # I-2(b): `prepare` must hand Config.norm_fit_share to normalize, not the
+    # module default. n=10 tolerates one outlier at 0.9 but two at 0.75.
+    honest = [10, 50, 90, 100, 0, 75, 25, 60]
+    rows = [dict(rater=f"r{i}", ratee="A", value=v) for i, v in enumerate(honest)]
+    rows += [dict(rater="x1", ratee="Z", value=2**127 - 1),
+             dict(rater="x2", ratee="Z", value=-(2**127))]
+    df = records_factory(rows)
+    assert set(prepare(df, Config(norm_fit_share=0.9))["norm_rule"]) == {"rank"}
+    assert set(prepare(df, Config(norm_fit_share=0.75))["norm_rule"]) == {"percent"}

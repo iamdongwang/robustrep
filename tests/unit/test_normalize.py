@@ -9,6 +9,7 @@ from robustrep.normalize import (
     RULE_PERCENT,
     RULE_RANK,
     RULE_UNIT,
+    _fits,
     normalize,
 )
 from robustrep.schema import validate_records
@@ -172,10 +173,11 @@ def test_fallback_is_percentile_rank_not_minmax():
 
 
 def test_rank_uses_average_ranks_for_ties():
-    # no absolute rung fits (nothing is in [0, 100]), so the group reaches "rank".
-    out = normalize(_frame([5000, 5000, 500000]))
+    # no absolute rung fits (nothing is in [0, 100]) and the group is not constant
+    # within tolerance, so it reaches "rank"; the tied pair shares an average rank.
+    out = normalize(_frame([5000, 5000, 500000, 900000]))
     assert set(out["norm_rule"]) == {RULE_RANK}
-    np.testing.assert_allclose(out["score"], [0.25, 0.25, 1.0])
+    np.testing.assert_allclose(out["score"], [1 / 6, 1 / 6, 2 / 3, 1.0])
 
 
 def test_binary_group_maps_stray_value_as_percent():
@@ -308,3 +310,83 @@ def test_fit_share_is_configurable_and_validated():
         Config(norm_fit_share=0.5)
     with pytest.raises(ValueError):
         Config(norm_fit_share=1.1)
+
+
+def test_decimal_unit_group_is_not_captured_by_the_percent_rung():
+    # C-1 regression: the any-decimals "percent" rung sits just below "unit" with a
+    # 100x wider range, so without positive evidence two records of real 1.01 would
+    # carry this unit group onto it and collapse every honest value to ~0.002-0.0095.
+    # The rung now also requires a fit share of values ABOVE 1, which honest
+    # 0.20..0.95 data does not have, so the group falls to "rank" and keeps its
+    # order and spread instead of being rescaled by 100.
+    honest = [20, 35, 50, 65, 80, 95, 25, 40, 55, 70]     # real 0.20 .. 0.95 under d2
+    out = normalize(_frame(honest + [101, 101], scale="d2"))
+    assert set(out["norm_rule"]) == {RULE_RANK}
+    honest_scores = out["score"].iloc[:10].to_numpy()
+    assert list(np.argsort(honest_scores)) == list(np.argsort(honest))
+    # the percent rung would have squeezed all ten into a band < 0.01 wide
+    assert honest_scores.max() - honest_scores.min() >= 0.8
+    assert ((out["score"] >= 0) & (out["score"] <= 1)).all()
+
+
+def test_constant_group_tolerates_one_outlier():
+    # I-1: without a tolerance on the constant rung, one record moved an n=8
+    # constant group off the neutral 0.5 and onto a group-relative rank.
+    out = normalize(_frame([500] * 8 + [10**6]))
+    assert set(out["norm_rule"]) == {RULE_CONSTANT}
+    assert (out["score"] == 0.5).all()
+
+
+def test_constant_group_with_two_outliers_falls_to_rank():
+    out = normalize(_frame([500] * 8 + [10**6, 10**7]))
+    assert set(out["norm_rule"]) == {RULE_RANK}
+
+
+def test_decimal_percent_rung_clips_its_outlier():
+    # I-2(a): the rung-4 clip had no test of its own.
+    raw = [9977, 9850, 10000, 9525, 5000, 7550, 8880, 1230, 6660, 3330, 10**30]
+    out = normalize(_frame(raw, scale="d2"))
+    assert set(out["norm_rule"]) == {RULE_PERCENT}
+    assert out["score"].iloc[-1] == 1.0
+    assert ((out["score"] >= 0) & (out["score"] <= 1)).all()
+    np.testing.assert_allclose(
+        out["score"].iloc[:10],
+        [0.9977, 0.985, 1.0, 0.9525, 0.5, 0.755, 0.888, 0.123, 0.666, 0.333])
+
+
+def test_fits_tolerance_survives_float_error_at_other_fit_shares():
+    # I-2(c): n=100 at fit_share=0.55 must allow exactly 45 outliers. Both
+    # `n * (1 - 0.55)` and `n - n * 0.55` land a hair under 45 in float, so without
+    # the floor epsilon the tolerance silently tightens to 44.
+    assert _fits(np.array([True] * 55 + [False] * 45), 0.55)
+    assert not _fits(np.array([True] * 54 + [False] * 46), 0.55)
+
+
+def test_fit_share_one_is_strict():
+    # I-3: at fit_share == 1.0 nothing is tolerated, not even the one record the
+    # small-group floor normally allows.
+    honest = [10, 50, 90, 100, 0, 75, 25, 60]
+    assert set(normalize(_frame(honest), fit_share=1.0)["norm_rule"]) == {RULE_PERCENT}
+    assert set(normalize(_frame(honest + [2**127 - 1]), fit_share=1.0)["norm_rule"]) == {RULE_RANK}
+
+
+def test_randomized_groups_always_produce_valid_scores():
+    """Seeded fuzz over group shapes: no shape may yield a NaN, a score outside
+    [0, 1], or an unknown rule -- int128 and 10**255 extremes under every legal
+    scale included."""
+    rng = np.random.default_rng(20260915)
+    pool = [0, 1, 3, 7, 50, 80, 100, 500, -1, -50, 10**6, 10**18,
+            2**127 - 1, -(2**127), 10**255, -(10**255)]
+    rows = []
+    for g in range(2000):
+        n = int(rng.integers(1, 31))
+        scale = f"d{int(rng.choice([0, 1, 2, 18, 255]))}"
+        picks = rng.integers(0, len(pool), size=n)
+        rows += [dict(rater=f"r{g}_{i}", ratee=str(i), value=pool[int(k)], scale=scale,
+                      tag=f"t{g}", ts=0, evidence_uri=None, source="test")
+                 for i, k in enumerate(picks)]
+    out = normalize(validate_records(pd.DataFrame(rows)))
+    scores = out["score"].to_numpy(dtype=float)
+    assert np.isfinite(scores).all()
+    assert ((scores >= 0.0) & (scores <= 1.0)).all()
+    assert set(out["norm_rule"]) <= {RULE_BINARY, RULE_PERCENT, RULE_UNIT, RULE_CONSTANT, RULE_RANK}

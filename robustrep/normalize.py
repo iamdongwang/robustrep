@@ -27,11 +27,18 @@ What this does NOT buy, stated plainly because it is security-load-bearing:
   score in it. This is the designed limit of the scheme, not an oversight.
 * Which rung applies is still a group-level decision, so an attacker who posts
   MORE than the tolerance allows can still re-level honest records by forcing a
-  rule change. At d0 a binary <-> percent switch rescales by 100x: tag
-  `execution_success` on Base is 8 records all of value 1, and under a bare
-  share test one added record of value 50 turned those honest 1.0s into 0.01.
-  The count-based tolerance raises that floor -- it now takes at least two
-  records at every group size >= 2 -- but it does not remove the effect.
+  rule change. Two rung pairs differ by exactly 100x and are the ones to watch:
+  binary <-> percent at d0 (tag `execution_success` on Base is 8 records all of
+  value 1; under a bare share test one added record of value 50 turned those
+  honest 1.0s into 0.01), and unit <-> percent at any decimal scale (a d2 group
+  of 0.20..0.95 would collapse to 0.002..0.0095). The count-based tolerance
+  raises the floor to at least two records at every group size >= 2, and the
+  percent rung additionally demands positive evidence of percent shape before it
+  can take a unit-shaped group, but neither removes the effect.
+* `value` is float64 by the time it reaches here (validate_records coerces it),
+  so two distinct int128s above 2**53 can land on the same float and therefore
+  tie under `rank`. Ties share an average rank, so this costs resolution between
+  two enormous values, never an honest record's position.
 
 Cost of the `rank` fallback beyond the above: it preserves only within-group
 ORDER, so a 0.8 under one (tag, scale) group means something different from a
@@ -54,10 +61,13 @@ RULE_UNIT = "unit"
 RULE_CONSTANT = "constant"
 RULE_RANK = "rank"
 
-# Guards the floor below against float error. `n - n * fit_share` is used rather
-# than the algebraically equal `n * (1 - fit_share)` because the latter is short
-# by one at every multiple of 10 for fit_share=0.9 (1 - 0.9 is not exact in
-# binary, so n=20 gives 1.9999999999999996 and floors to 1, not 2).
+# The tolerance below floors a float, so it needs both of these. `n - n *
+# fit_share` is used rather than the algebraically equal `n * (1 - fit_share)`,
+# which is systematically short by one wherever the true answer is a whole
+# number -- at every multiple of 1/(1 - fit_share), e.g. every 10th n at 0.9,
+# where n=20 gives 1.9999999999999996 and floors to 1 instead of 2. The epsilon
+# then absorbs the residual error that survives at other fit_share values
+# (0.55 at n=100 lands just under 45 either way).
 _FLOOR_EPS = 1e-9
 
 
@@ -66,20 +76,36 @@ def _fits(mask: np.ndarray, fit_share: float) -> bool:
 
     The single place the tolerance is computed. It is a COUNT, not a share:
 
-        allowed_outside = 0            if n < 2
+        allowed_outside = 0                                  if n < 2
+                          0                                  if fit_share == 1.0
                           max(1, floor(n - n * fit_share))   otherwise
 
     For n >= 10 at the default fit_share this is identical to "share in range
     >= fit_share". For 2 <= n <= 9 it is deliberately looser: exactly one
     out-of-range record is tolerated where a share test would tolerate none.
-    That closes single-record poisoning at every group size >= 2 -- an attacker
-    always needs at least two records -- which matters because most real
-    (tag, scale) groups are that small. At n == 1 nothing is tolerated, so a
-    lone record only ever matches a rule it genuinely falls inside.
+    That closes single-record poisoning for any group holding at least 2 honest
+    records -- an attacker always needs at least two of its own -- which matters
+    because most real (tag, scale) groups are that small. A group of 1 honest
+    record is not protectable and is not claimed to be: at n == 1 nothing is
+    tolerated, so a lone record only ever matches a rule it genuinely falls
+    inside, and a 1-honest-plus-1-attacker group is simply a 2-record group with
+    no majority to appeal to.
+
+    `fit_share == 1.0` means strictly all-or-nothing, with no small-group floor:
+    every value must fall in the rule's range. That is the only way to ask for
+    the pre-tolerance behaviour, so the floor must not quietly override it.
     """
     n = mask.size
-    allowed_outside = 0 if n < 2 else max(1, int(math.floor(n - n * fit_share + _FLOOR_EPS)))
+    if n < 2 or fit_share >= 1.0:
+        allowed_outside = 0
+    else:
+        allowed_outside = max(1, int(math.floor(n - n * fit_share + _FLOOR_EPS)))
     return int((~mask).sum()) <= allowed_outside
+
+
+def _percent_scores(vals: np.ndarray) -> np.ndarray:
+    """Percent map: clip into [0, 100], then divide by 100."""
+    return np.clip(vals, 0.0, 100.0) / 100.0
 
 
 def _binary_scores(vals: np.ndarray, decimals: int) -> np.ndarray:
@@ -98,7 +124,7 @@ def _binary_scores(vals: np.ndarray, decimals: int) -> np.ndarray:
     binary group has nothing outside {0, 1} to map.
     """
     in_set = np.isin(vals, (0.0, 1.0))
-    other = np.clip(vals, 0.0, 100.0) / 100.0 if decimals == 0 else np.clip(vals, 0.0, 1.0)
+    other = _percent_scores(vals) if decimals == 0 else np.clip(vals, 0.0, 1.0)
     return np.where(in_set, vals, other)
 
 
@@ -115,13 +141,20 @@ def _group_scores(real: pd.Series, decimals: int, fit_share: float) -> tuple[np.
        Tried before "unit" so an integer-scaled group that happens to sit
        inside [0, 1] is read as a percentage, not as already-normalized.
     3. unit     - values in [0, 1]: clipped, passed through.
-    4. percent (any scale) - values in [0, 100]: clipped, / 100. Genuine
-       percent data is also carried at d2 and up (real 99.77 under d2), which
-       would otherwise have no absolute rung at all. After "unit" so a decimal
-       group already confined to [0, 1] is not divided by 100 a second time.
-    5. constant - every value identical: a neutral 0.5. After "percent" so a
-       constant all-100 d0 group scores 1.0 there, while a constant all-500 d0
-       group has no natural anchor.
+    4. percent (any scale) - values in [0, 100] AND a fit share strictly above
+       1: clipped, / 100. Genuine percent data is also carried at d2 and up
+       (real 99.77 under d2), which would otherwise have no absolute rung at
+       all. It sits below "unit" and spans a 100x wider range, so it demands
+       positive evidence of percent shape before it may claim a group: without
+       the "above 1" test, two records of real 1.01 would carry a d2 unit group
+       of 0.20..0.95 onto this rung and collapse it to 0.002..0.0095.
+    5. constant - all values identical, within the same outlier tolerance: a
+       neutral 0.5. Tolerance matters here too, or one record would move an
+       otherwise-constant group onto the group-relative "rank" rung. The test is
+       against the group's MEDIAN, which is an honest value whenever
+       allowed_outside < n/2 -- guaranteed by the `fit_share > 0.5` validator.
+       After "percent" so a constant all-100 d0 group scores 1.0 there, while a
+       constant all-500 d0 group has no natural anchor.
     6. rank     - fallback: percentile rank, `(rank - 1) / (n - 1)` over
        average ranks (ties share a rank). n >= 2 here, since a 1-value group is
        caught by "constant".
@@ -129,20 +162,21 @@ def _group_scores(real: pd.Series, decimals: int, fit_share: float) -> tuple[np.
     Rungs 1-5 map each record from its own value alone. Rung 6 does not: a rank
     is a position within the group, so records added to a `rank` group re-level
     every honest score in it. Pushing a group past its tolerance and onto
-    `rank`, or across the d0 binary/percent boundary (a 100x rescale), is the
-    residual way to move honest records -- see the module docstring.
+    `rank`, or across one of the two 100x rung boundaries (binary/percent at d0,
+    unit/percent at any scale), is the residual way to move honest records --
+    see the module docstring.
     """
     vals = real.to_numpy(dtype=float)
-    percent_fits = _fits((vals >= 0) & (vals <= 100), fit_share)   # rungs 2 and 4 share it
     if _fits(np.isin(vals, (0.0, 1.0)), fit_share):
         return _binary_scores(vals, decimals), RULE_BINARY
+    percent_fits = _fits((vals >= 0) & (vals <= 100), fit_share)   # rungs 2 and 4 share it
     if decimals == 0 and percent_fits:
-        return np.clip(vals, 0.0, 100.0) / 100.0, RULE_PERCENT
+        return _percent_scores(vals), RULE_PERCENT
     if _fits((vals >= 0) & (vals <= 1), fit_share):
         return np.clip(vals, 0.0, 1.0), RULE_UNIT
-    if percent_fits:
-        return np.clip(vals, 0.0, 100.0) / 100.0, RULE_PERCENT
-    if vals.min() == vals.max():
+    if percent_fits and _fits((vals > 1) & (vals <= 100), fit_share):
+        return _percent_scores(vals), RULE_PERCENT
+    if _fits(vals == np.median(vals), fit_share):
         return np.full_like(vals, 0.5), RULE_CONSTANT
     ranks = pd.Series(vals).rank(method="average").to_numpy()
     return (ranks - 1.0) / (len(vals) - 1.0), RULE_RANK
