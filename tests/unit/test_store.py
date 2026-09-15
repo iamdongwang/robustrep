@@ -139,6 +139,40 @@ def test_distinct_helpers(tmp_path):
     assert set(s.distinct_agents()) == {"8", "9"}
 
 
+def test_pending_uris_default_excludes_anything_cached(tmp_path):
+    s = Store(tmp_path / "tpending.db")
+    s.upsert_feedback([
+        FB,  # feedback_uri "https://e"
+        {**FB, "feedback_index": 2, "feedback_uri": "https://never"},
+        {**FB, "feedback_index": 3, "feedback_uri": "https://budgeted"},
+        {**FB, "feedback_index": 4, "feedback_uri": "https://miss"},
+        {**FB, "feedback_index": 5, "feedback_uri": ""},
+    ])
+    s.upsert_evidence("https://e", 3)  # ordinary cached result -- note ""
+    s.upsert_evidence("https://budgeted", 2, "lookup-budget")
+    s.upsert_evidence("https://miss", 1, "unfetchable")
+    # With no include_notes, only the never-cached URI is pending -- matches
+    # the original distinct_uris()/NOT EXISTS behavior exactly.
+    assert s.pending_uris() == [("https://never", "0xc", None)]
+
+
+def test_pending_uris_retries_only_the_given_notes(tmp_path):
+    s = Store(tmp_path / "tpending2.db")
+    s.upsert_feedback([
+        FB,
+        {**FB, "feedback_index": 2, "feedback_uri": "https://never"},
+        {**FB, "feedback_index": 3, "feedback_uri": "https://budgeted"},
+        {**FB, "feedback_index": 4, "feedback_uri": "https://miss"},
+    ])
+    s.upsert_evidence("https://e", 3)
+    s.upsert_evidence("https://budgeted", 2, "lookup-budget")
+    s.upsert_evidence("https://miss", 1, "unfetchable")
+    pending = {row[0] for row in s.pending_uris(include_notes=("lookup-budget",))}
+    # The never-cached URI and the retryable "lookup-budget" one are pending;
+    # the ordinary result and the (not included) "unfetchable" one are not.
+    assert pending == {"https://never", "https://budgeted"}
+
+
 def test_add_response_idempotent(tmp_path):
     s = Store(tmp_path / "t.db")
     resp = dict(agent_id="7", client="0xc", feedback_index=1, responder="0xr",
