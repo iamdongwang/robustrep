@@ -1,6 +1,7 @@
 """Evidence level (0..3) for a rating and the level -> weight mapping."""
 from __future__ import annotations
 
+import itertools
 import logging
 import re
 from typing import Callable, Optional
@@ -13,6 +14,16 @@ TX_RE = re.compile(r"0x[0-9a-fA-F]{64}(?![0-9a-fA-F])")
 # Deliberately strict (double-quoted JSON keys only): misses fall to level 1,
 # the conservative direction.
 TASK_KEY_RE = re.compile(r'"(?:taskId|task_id|jobId|job_id|orderId|order_id)"\s*:')
+
+# H3 (security review): a 200 KB evidence document can pack ~2,985 distinct
+# non-matching 64-hex tx hashes, and each one used to cost one
+# eth_getTransactionByHash RPC call before `classify` gave up -- a single
+# attacker-supplied URI could force ~3,000 RPC calls (x8 concurrent workers in
+# `classify_all`), enough to push a free-tier RPC endpoint into backoff and
+# stall `fetch` for everyone. Only the first `max_lookups` unique hashes
+# (document order) are ever looked up; anything beyond that is treated as
+# unverified rather than checked.
+MAX_TX_LOOKUPS_PER_URI = 8
 
 FetchText = Callable[[str], Optional[str]]
 TxParties = Callable[[str], Optional[set[str]]]  # tx hash -> {from, to} lowercased, or None
@@ -44,7 +55,8 @@ def _verified(h: str, tx_parties: TxParties, parties_lc: set[str]) -> bool:
         return False
 
 
-def classify(uri: Optional[str], fetch_text: FetchText, tx_parties: TxParties, parties: set[str]) -> int:
+def classify(uri: Optional[str], fetch_text: FetchText, tx_parties: TxParties, parties: set[str],
+             max_lookups: int = MAX_TX_LOOKUPS_PER_URI) -> int:
     """Evidence level 0..3 per the spec table.
 
     parties: lowercased addresses of rater and ratee; falsy entries ignored.
@@ -53,6 +65,13 @@ def classify(uri: Optional[str], fetch_text: FetchText, tx_parties: TxParties, p
     own fetcher must handle its own errors); `tx_parties` exceptions, or a
     None/falsy return, are tolerated and degrade that hash to unverified
     (logged at DEBUG), never raising out of `classify`.
+
+    `max_lookups` bounds how many *unique* hashes (in document order) are
+    ever passed to `tx_parties` -- see `MAX_TX_LOOKUPS_PER_URI` for why. Any
+    hash beyond that cap is simply never looked up and so stays unverified;
+    it does not affect whether the document counts as level 2 (any hash or
+    task-id key present is already enough for that). `max_lookups <= 0`
+    performs no lookups at all.
     """
     if not uri or not uri.strip():
         return 0
@@ -63,7 +82,8 @@ def classify(uri: Optional[str], fetch_text: FetchText, tx_parties: TxParties, p
     if not hashes and not TASK_KEY_RE.search(text):
         return 1
     parties_lc = {p.lower() for p in parties if p}
-    for h in dict.fromkeys(x.lower() for x in hashes):
+    unique_hashes = dict.fromkeys(x.lower() for x in hashes)
+    for h in itertools.islice(unique_hashes, max(max_lookups, 0)):
         if _verified(h, tx_parties, parties_lc):
             return 3
     return 2
