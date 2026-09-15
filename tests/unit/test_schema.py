@@ -172,6 +172,9 @@ def test_config_sybil_pair_and_jaccard_bounds():
         Config(sybil_jaccard=0)
     with pytest.raises(ValueError):
         Config(sybil_max_pairs=0)
+    with pytest.raises(ValueError):
+        Config(sybil_max_pairs_per_ratee=0)
+    assert Config().sybil_max_pairs_per_ratee == 500_000
 
 
 def test_config_rejects_invalid_timing_and_count_params():

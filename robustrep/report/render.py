@@ -132,6 +132,31 @@ def _top_tie_block_lines(scored: pd.DataFrame, sensitivity: pd.DataFrame) -> lis
     return [text]
 
 
+def _budget_limit_lines(scores: pd.DataFrame) -> list:
+    """The budget-limited-clustering bullet, or [] when nothing was skipped (or
+    the caller attached no stats at all).
+
+    Read off `scores.attrs["cluster_stats"]` -- a `robustrep.sybil.ClusterStats`
+    as a dict, stamped by the CLI. Pair budgets degrade the clustering instead
+    of aborting the run, and degrading can only UNDER-merge, so a budget-limited
+    run has to say so and say which way its error points: never the flattering
+    direction left unsaid.
+    """
+    stats = scores.attrs.get("cluster_stats") or {}
+    size = int(stats.get("ratees_skipped_size", 0))
+    per_ratee = int(stats.get("ratees_skipped_budget", 0))
+    truncated = bool(stats.get("truncated", False))
+    if not (size or per_ratee or truncated):
+        return []
+    return [
+        f"- **Budget-limited clustering.** Sybil clustering was budget-limited: {size} ratee "
+        f"block(s) skipped for size (> sybil_max_group), {per_ratee} for the per-ratee pair "
+        f"budget, global pair budget reached: {'yes' if truncated else 'no'} "
+        f"({int(stats.get('pairs_tested', 0))} pairs tested). Clusters among the affected raters "
+        "may be under-merged, so their ratees' scores are less robust than reported, never more."
+    ]
+
+
 def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, figures: dict,
                     sensitivity: pd.DataFrame, adversarial: Optional[pd.DataFrame] = None,
                     provenance: Optional[dict] = None) -> str:
@@ -142,7 +167,12 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     link -- the title is the heading text, never the raw filename. `provenance`,
     when given, may carry `rater_profile_mode`, `confirmations`, `config` (a dict
     of the scoring parameters actually used: bootstrap_n, bootstrap_seed,
-    min_clusters, evidence_weights, and the sybil_* thresholds), and `versions`.
+    min_clusters, evidence_weights, and the sybil_* thresholds and pair budgets),
+    and `versions`.
+
+    `scores.attrs["cluster_stats"]`, when present (the CLI stamps it -- see
+    `robustrep.sybil.ClusterStats`), adds a Limitations bullet whenever a sybil
+    pair budget cut the clustering short.
     """
     non_revoked, n_revoked = _non_revoked(records)
     scored = scores[scores["insufficient"] == 0]
@@ -243,6 +273,7 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
         "skipped entirely for ratee-based blocking (see `robustrep.sybil`), so a farm "
         "concentrated on one very popular ratee can evade the ratee-sharing signal by sheer "
         "volume, independent of the evasion technique above.",
+        *_budget_limit_lines(scores),
         "- **DNS rebinding in the evidence fetcher (not mitigated in v0.1).** The SSRF guard "
         "resolves and checks an evidence URI's host once, but the HTTP client resolves it again "
         "independently; a rebinding attacker timed between the two resolutions can route a "
@@ -269,8 +300,9 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     if config:
         lines.append("- Scoring configuration used:")
         for key in ("bootstrap_n", "bootstrap_seed", "min_clusters", "evidence_weights",
-                    "sybil_jaccard", "sybil_window_s", "sybil_max_group", "sybil_flag_share",
-                    "norm_fit_share", "norm_rule_counts"):
+                    "sybil_jaccard", "sybil_window_s", "sybil_max_group", "sybil_max_pairs",
+                    "sybil_max_pairs_per_ratee", "sybil_flag_share", "norm_fit_share",
+                    "norm_rule_counts"):
             if key in config:
                 lines.append(f"  - `{key}`: {config[key]}")
     versions = prov.get("versions") or {}
