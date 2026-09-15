@@ -168,7 +168,8 @@ def _budget_limit_lines(scores: pd.DataFrame) -> list:
         f"- **Budget-limited clustering.** Sybil clustering was budget-limited: {size} ratee "
         f"block(s) skipped for size (> sybil_max_group), {per_ratee} for the per-ratee pair "
         f"budget, global pair budget reached: {'yes' if truncated else 'no'} "
-        f"({int(stats.get('pairs_tested', 0))} pairs tested). Clusters among the affected raters "
+        f"({int(stats.get('pairs_examined', 0))} candidate pairs examined, "
+        f"{int(stats.get('pairs_tested', 0))} tested). Clusters among the affected raters "
         "may be under-merged, so their ratees' scores are less robust than reported, never more."
     ]
 

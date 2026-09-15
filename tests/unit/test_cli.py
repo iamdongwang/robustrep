@@ -1269,7 +1269,8 @@ def test_score_attaches_cluster_stats_to_scores_frame(tmp_path, monkeypatch):
     r = runner.invoke(app, ["score", "--db", str(db), "--out", str(out), "--bootstrap-n", "5"])
     assert r.exit_code == 0, r.output
     stats = seen["result"].attrs["cluster_stats"]
-    assert set(stats) == {"pairs_tested", "ratees_skipped_size", "ratees_skipped_budget", "truncated"}
+    assert set(stats) == {"pairs_tested", "pairs_examined", "ratees_skipped_size",
+                          "ratees_skipped_budget", "truncated"}
     assert stats["truncated"] is False
 
 
@@ -1314,7 +1315,8 @@ def test_report_scores_json_carries_cluster_stats(tmp_path):
     assert r.exit_code == 0, r.output
     data = json.loads((out_dir / "latest" / "scores.json").read_text())
     stats = data["cluster_stats"]
-    assert set(stats) == {"pairs_tested", "ratees_skipped_size", "ratees_skipped_budget", "truncated"}
+    assert set(stats) == {"pairs_tested", "pairs_examined", "ratees_skipped_size",
+                          "ratees_skipped_budget", "truncated"}
     assert stats["truncated"] is False
 
 

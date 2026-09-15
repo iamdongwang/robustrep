@@ -1,17 +1,21 @@
 import json
 import logging
 import os
+import random
 import subprocess
 import sys
 import time
+from collections import defaultdict
+from itertools import combinations
 
 import pandas as pd
 import pytest
 
 from robustrep.config import Config
 from robustrep.sybil import (
-    ClusterStats, RaterProfile, _BlockCharge, _Budget, _candidate_pairs, _jaccard, _ratee_group_pairs,
-    cluster_raters, cluster_raters_with_stats, profiles_from_records,
+    ClusterStats, RaterProfile, _BlockCharge, _Budget, _candidate_pairs, _emits_at, _jaccard,
+    _ratee_group_pairs, _ratee_same_funder_pairs, _small_ratees_by_rater, cluster_raters,
+    cluster_raters_with_stats, profiles_from_records,
 )
 from robustrep.schema import validate_records
 
@@ -259,7 +263,8 @@ def test_same_funder_subbucket_mixed_window_skips_in_window_pair():
         P("c", 100_000, "F", {"1"}),
     ]
     charge = _BlockCharge(_Budget.for_config(Config()), "1")
-    pairs = list(_ratee_group_pairs("1", profiles, Config(), {"1"}, charge))
+    small_sorted = _small_ratees_by_rater(profiles, {"1"})
+    pairs = list(_ratee_group_pairs("1", profiles, Config(), small_sorted, charge))
     assert pairs == [("a", "c")]
 
 
@@ -298,8 +303,9 @@ def test_size_skip_is_counted():
 
 def test_stats_are_all_zero_within_budget():
     _, stats = cluster_raters_with_stats(_farm(5, ["a"]), Config())
-    assert stats == ClusterStats(pairs_tested=10, ratees_skipped_size=0,
+    assert stats == ClusterStats(pairs_tested=10, pairs_examined=10, ratees_skipped_size=0,
                                  ratees_skipped_budget=0, truncated=False)
+    assert stats.budget_limited is False
 
 
 def test_global_budget_can_truncate_during_funder_blocking():
@@ -363,16 +369,20 @@ def test_non_emitting_scans_are_bounded_by_the_budget():
     # budget charged on emitted pairs alone left the CPU cost unbounded in the
     # number of shared ratees (measured: 33s at 25 ratees, 105s at 50, with
     # every ClusterStats counter still reading zero).
+    cfg = Config()
     profiles = _same_funder_farm(2000, 50, 2 * 24 * H)
     start = time.perf_counter()
-    clusters, stats = cluster_raters_with_stats(profiles, Config())
+    clusters, stats = cluster_raters_with_stats(profiles, cfg)
     elapsed = time.perf_counter() - start
     assert len(clusters) == 2000
-    # Generous: ~9s here, ~20s under CI's `pytest --cov` tracing. The point is
-    # the order of magnitude -- the unbounded version took 105s untraced and
-    # grew linearly with the number of shared ratees, with nothing to stop it.
-    assert elapsed < 90.0, elapsed
-    assert stats.ratees_skipped_budget > 0 or stats.truncated
+    # The exact invariant, not a wall-clock claim: no input shape can make
+    # candidate generation examine more pairs than the global budget allows.
+    assert stats.pairs_examined <= cfg.sybil_max_pairs
+    assert stats.truncated or stats.ratees_skipped_budget > 0
+    # Loose smoke bound only (~4s here, ~10s under CI's `pytest --cov`
+    # tracing): the unbounded version took 105s and grew linearly with the
+    # number of shared ratees, with nothing to stop it.
+    assert elapsed < 300.0, elapsed
 
 
 def test_h2_farm_still_collapses_to_one_cluster_under_the_budget():
@@ -449,3 +459,99 @@ def test_abandoned_block_is_counted_once_across_both_inner_loops():
     _, stats = cluster_raters_with_stats(profiles, Config(sybil_max_pairs_per_ratee=2))
     assert stats.ratees_skipped_budget == 1
     assert stats.truncated is False
+
+
+def test_budget_limited_is_true_for_a_size_skip_alone():
+    """A ratee block skipped for size under-merges just like an abandoned one,
+    so it alone makes a run budget-limited. `render._budget_limit_lines` mirrors
+    this test on the dict form -- see the report test that renders the bullet
+    from a size skip alone."""
+    stats = ClusterStats(pairs_tested=5, pairs_examined=5, ratees_skipped_size=1,
+                         ratees_skipped_budget=0, truncated=False)
+    assert stats.budget_limited is True
+
+
+def test_ratee_blocks_are_visited_largest_first():
+    # Both the name order ("a_small" < "z_big") and the profile/insertion order
+    # (the small block's raters come first) point the other way, so only a
+    # largest-first visit can spend the budget on the big block.
+    small_block = [P(f"s{i}", 1000 + i, None, {"a_small"}) for i in range(3)]
+    big_block = [P(f"b{i}", 1000 + i, None, {"z_big"}) for i in range(5)]
+    cfg = Config(sybil_max_pairs=10, sybil_max_pairs_per_ratee=10 ** 9)  # exactly C(5, 2)
+    clusters, stats = cluster_raters_with_stats(small_block + big_block, cfg)
+    assert stats.truncated is True
+    assert len({clusters[p.rater] for p in big_block}) == 1  # big block got the budget
+    assert len({clusters[p.rater] for p in small_block}) == 3  # small block never ran
+
+
+# --- the shared-ratee lookup matches the naive intersection (I2 follow-up) ----
+
+
+def _naive_same_funder_pairs(ratee, group, cfg, small):
+    """The straightforward `min(p.ratees & q.ratees & small)` de-dup that
+    `_ratee_same_funder_pairs` replaces with a sorted first-match lookup. The
+    two must emit exactly the same pairs, in the same order."""
+    by_funder = defaultdict(list)
+    for p in group:
+        if p.funder is not None:
+            by_funder[p.funder.lower()].append(p)
+    for funder in sorted(by_funder):
+        sub = by_funder[funder]
+        sub_by_ts = sorted(sub, key=lambda p: p.first_seen_ts)
+        if sub_by_ts[-1].first_seen_ts - sub_by_ts[0].first_seen_ts <= cfg.sybil_window_s:
+            continue
+        for p, q in combinations(sub, 2):
+            if abs(p.first_seen_ts - q.first_seen_ts) <= cfg.sybil_window_s:
+                continue
+            shared = p.ratees & q.ratees & small
+            if shared and min(shared) == ratee:
+                yield _pair_key_for_test(p, q)
+
+
+def _pair_key_for_test(p, q):
+    return (p.rater, q.rater) if p.rater < q.rater else (q.rater, p.rater)
+
+
+def _random_profiles(seed, n=60, n_ratees=12, n_funders=4):
+    """Randomized raters: overlapping ratee sets (so `shared` is often
+    non-trivial), a handful of shared funders (so same-funder sub-buckets
+    exist), timestamps spanning several windows (so out-of-window pairs do)."""
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        ratees = rng.sample([f"t{k:02d}" for k in range(n_ratees)], rng.randint(1, 5))
+        funder = rng.choice([f"F{k}" for k in range(n_funders)] + [None])
+        out.append(P(f"r{i:03d}", rng.randint(0, 10) * 24 * H, funder, ratees))
+    return out
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_shared_ratee_lookup_matches_naive_intersection(seed):
+    cfg = Config(sybil_max_group=20)
+    profiles = _random_profiles(seed)
+    by_ratee = defaultdict(list)
+    for p in profiles:
+        for r in p.ratees:
+            by_ratee[r].append(p)
+    small = {r for r, g in by_ratee.items() if len(g) <= cfg.sybil_max_group}
+    small_sorted = _small_ratees_by_rater(profiles, small)
+    emitted = 0
+    for ratee, group in sorted(by_ratee.items()):
+        if len(group) > cfg.sybil_max_group:
+            continue
+        charge = _BlockCharge(_Budget.for_config(cfg), ratee)
+        fast = list(_ratee_same_funder_pairs(ratee, group, cfg, small_sorted, charge))
+        assert fast == list(_naive_same_funder_pairs(ratee, group, cfg, small)), ratee
+        emitted += len(fast)
+    assert emitted > 0  # the fixture must actually exercise the de-dup
+
+
+def test_emits_at_is_min_of_the_shared_blockable_ratees():
+    """Unit-pins the de-dup predicate itself: emit at `ratee` only when it is
+    the lexicographically smallest ratee both raters share and that is small
+    enough to block on."""
+    assert _emits_at(["a", "b"], frozenset({"b"}), "b") is True  # only "b" is shared
+    assert _emits_at(["a", "b"], frozenset({"a", "b"}), "b") is False  # "a" shares and sorts first
+    assert _emits_at(["a", "b"], frozenset({"a"}), "b") is False  # the ratee itself is not shared
+    assert _emits_at(["a"], frozenset({"a"}), "z") is False  # the ratee is not blockable at all
+    assert _emits_at(["a"], frozenset({"b"}), "z") is False  # nothing blockable is shared at all

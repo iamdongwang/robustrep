@@ -17,8 +17,11 @@ de-dup emits a pair only at the lexicographically smallest of its shared
 ratees, so m-1 of m identical blocks scan in full and yield nothing), so
 counting emitted pairs would have bounded the output while leaving the CPU
 cost of the scan unbounded in m, the number of ratees a farm rates. Charging
-examinations bounds the whole of candidate generation -- hence its CPU cost --
-at `sybil_max_pairs` examinations, whatever shape the input takes.
+examinations bounds the whole of candidate generation at `sybil_max_pairs`
+examinations, whatever shape the input takes; each examination is O(1) except
+for the shared-ratee de-dup, which scans a rater's sorted blockable ratees
+only until the answer is settled (see `_emits_at`) -- one lookup for the farm
+shapes that matter, O(m) only if the shared ratee sorts last.
 
 Blocks are visited in a fixed order (funders by name; then ratee blocks
 largest first, ties by name), never in `dict` insertion order, which for ratee
@@ -81,7 +84,10 @@ class RaterProfile:
 class ClusterStats:
     """What one `cluster_raters_with_stats` run actually managed to test.
 
-    `pairs_tested` candidate pairs reached the signal test; `ratees_skipped_size`
+    `pairs_examined` candidate pairs were charged against the budgets and
+    `pairs_tested` of them survived blocking to reach the signal test (emitted
+    pairs are a subset of examined ones -- a block can examine a pair and drop
+    it, e.g. as out-of-window, without ever emitting it); `ratees_skipped_size`
     ratee blocks were skipped whole for holding more than
     `Config.sybil_max_group` raters; `ratees_skipped_budget` blocks were
     abandoned part-way for exceeding `Config.sybil_max_pairs_per_ratee`; and
@@ -94,6 +100,7 @@ class ClusterStats:
     """
 
     pairs_tested: int
+    pairs_examined: int
     ratees_skipped_size: int
     ratees_skipped_budget: int
     truncated: bool
@@ -225,6 +232,37 @@ def _pair_key(p: RaterProfile, q: RaterProfile) -> tuple[str, str]:
     return (a, b) if a < b else (b, a)
 
 
+def _small_ratees_by_rater(profiles: list[RaterProfile], small: set) -> dict:
+    """rater -> its blockable ("small") ratees, sorted ascending.
+
+    Built once per run so the same-funder de-dup below can answer "is this
+    block's ratee the smallest ratee the pair shares?" by scanning until the
+    answer is settled, instead of intersecting two ratee sets and taking a
+    `min` over the result for every examined pair. Profiled at 2,000 raters x
+    500 shared ratees, those two lines were 60s + 31.5s of a 95.6s run.
+    """
+    return {p.rater: sorted(p.ratees & small) for p in profiles}
+
+
+def _emits_at(ordered_small: list, other: frozenset, ratee: str) -> bool:
+    """Exactly `min(p.ratees & q.ratees & small) == ratee`, without building
+    the intersection.
+
+    `ordered_small` is `sorted(p.ratees & small)` (see `_small_ratees_by_rater`)
+    and `other` is `q.ratees`. Scanning ascending settles it at the first entry
+    the two share -- that entry IS the minimum -- or at `ratee` itself, since
+    nothing after it can sort before it. Both raters of a block rate its ratee
+    by construction, so the scan normally stops there; `r in other` is still
+    checked on that entry so the result stays exact for any caller.
+    """
+    for r in ordered_small:
+        if r == ratee:
+            return r in other
+        if r in other:
+            return False
+    return False
+
+
 def _funder_group_pairs(group: list[RaterProfile], cfg: Config, charge: _BlockCharge):
     # same_funder + in_window is already 2 signals, so every in-window pair
     # unions. Unioning consecutive in-window neighbours (sorted by
@@ -277,7 +315,7 @@ def _ratee_window_pairs(group: list[RaterProfile], cfg: Config, charge: _BlockCh
                 yield _pair_key(pi, pj)
 
 
-def _ratee_same_funder_pairs(ratee: str, group: list[RaterProfile], cfg: Config, small: set,
+def _ratee_same_funder_pairs(ratee: str, group: list[RaterProfile], cfg: Config, small_sorted: dict,
                              charge: _BlockCharge):
     # Same-funder, out-of-window pairs sharing this ratee: funder + Jaccard is
     # already 2 signals, so the window does not apply to them.
@@ -306,23 +344,23 @@ def _ratee_same_funder_pairs(ratee: str, group: list[RaterProfile], cfg: Config,
             # exactly once, at the lexicographically smallest of its shared
             # small ratees. The m-1 blocks that emit nothing still SCAN this
             # loop in full, which is why `charge` is spent per examination.
-            shared = p.ratees & q.ratees & small
-            if shared and min(shared) == ratee:
+            if _emits_at(small_sorted[p.rater], q.ratees, ratee):
                 yield _pair_key(p, q)
 
 
-def _ratee_group_pairs(ratee: str, group: list[RaterProfile], cfg: Config, small: set,
+def _ratee_group_pairs(ratee: str, group: list[RaterProfile], cfg: Config, small_sorted: dict,
                        charge: _BlockCharge):
     """Candidate pairs from one ratee block, bounded by `charge`.
 
     Callers screen out over-sized groups (see `_candidate_pairs`, which owns
-    the `sybil_max_group` check so it can count what it skipped). Both inner
+    the `sybil_max_group` check so it can count what it skipped) and supply
+    `small_sorted` (see `_small_ratees_by_rater`). Both inner
     generators share one `charge`, so the block's per-ratee budget covers the
     two of them together and the second stops immediately if the first used
     the block up.
     """
     yield from _ratee_window_pairs(group, cfg, charge)
-    yield from _ratee_same_funder_pairs(ratee, group, cfg, small, charge)
+    yield from _ratee_same_funder_pairs(ratee, group, cfg, small_sorted, charge)
 
 
 def _candidate_pairs(profiles: list[RaterProfile], cfg: Config, budget: Optional[_Budget] = None):
@@ -354,6 +392,7 @@ def _candidate_pairs(profiles: list[RaterProfile], cfg: Config, budget: Optional
         for r in p.ratees:
             by_ratee[r].append(p)
     small = {ratee for ratee, group in by_ratee.items() if len(group) <= cfg.sybil_max_group}
+    small_sorted = _small_ratees_by_rater(profiles, small)
     for funder in sorted(by_funder):
         yield from _funder_group_pairs(by_funder[funder], cfg, _BlockCharge(budget))
         if budget.truncated:
@@ -363,7 +402,8 @@ def _candidate_pairs(profiles: list[RaterProfile], cfg: Config, budget: Optional
         if len(group) > cfg.sybil_max_group:
             budget.ratees_skipped_size += 1
             continue
-        yield from _ratee_group_pairs(ratee, group, cfg, small, _BlockCharge(budget, ratee))
+        yield from _ratee_group_pairs(ratee, group, cfg, small_sorted,
+                                      _BlockCharge(budget, ratee))
         if budget.truncated:
             return
 
@@ -383,15 +423,16 @@ def _index_profiles(profiles: list[RaterProfile]) -> dict[str, RaterProfile]:
 def _log_budget(cfg: Config, stats: ClusterStats) -> None:
     """One INFO summary per run, plus one WARNING when the global budget cut
     generation short (per-ratee abandonments log their own, in `_emit`)."""
-    logger.info("sybil candidate pairs tested: %d (ratee blocks skipped: %d for size, %d for budget)",
-                stats.pairs_tested, stats.ratees_skipped_size, stats.ratees_skipped_budget)
+    logger.info("sybil candidate pairs: %d examined, %d tested (ratee blocks skipped: %d for size, "
+                "%d for budget)", stats.pairs_examined, stats.pairs_tested,
+                stats.ratees_skipped_size, stats.ratees_skipped_budget)
     if stats.truncated:
         logger.warning(
-            "sybil: candidate-pair generation stopped at sybil_max_pairs=%d (%d pairs tested, "
-            "%d ratee block(s) skipped for size, %d for the per-ratee budget); the clusters found "
-            "so far stand, but some raters may be under-merged",
-            cfg.sybil_max_pairs, stats.pairs_tested, stats.ratees_skipped_size,
-            stats.ratees_skipped_budget)
+            "sybil: candidate-pair generation stopped at sybil_max_pairs=%d (%d pairs examined, "
+            "%d tested, %d ratee block(s) skipped for size, %d for the per-ratee budget); the "
+            "clusters found so far stand, but some raters may be under-merged",
+            cfg.sybil_max_pairs, stats.pairs_examined, stats.pairs_tested,
+            stats.ratees_skipped_size, stats.ratees_skipped_budget)
 
 
 def cluster_raters_with_stats(profiles: list[RaterProfile],
@@ -411,8 +452,10 @@ def cluster_raters_with_stats(profiles: list[RaterProfile],
         tested += 1
         if _signals(by_id[a], by_id[b], cfg) >= 2:
             uf.union(a, b)
-    stats = ClusterStats(pairs_tested=tested, ratees_skipped_size=budget.ratees_skipped_size,
-                         ratees_skipped_budget=budget.ratees_skipped_budget, truncated=budget.truncated)
+    stats = ClusterStats(pairs_tested=tested, pairs_examined=budget.total,
+                         ratees_skipped_size=budget.ratees_skipped_size,
+                         ratees_skipped_budget=budget.ratees_skipped_budget,
+                         truncated=budget.truncated)
     _log_budget(cfg, stats)
     return {r: uf.find(r) for r in by_id}, stats
 
