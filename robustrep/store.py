@@ -206,14 +206,14 @@ class Store:
 
     def n_lookup_budget_starved(self) -> int:
         """Count of ``evidence_cache`` rows still marked ``"lookup-budget:N"``
-        (H3, see ``evidence_fetch``) -- a URI whose tx-hash verification was
+        (H3, see ``evidence_batch``) -- a URI whose tx-hash verification was
         cut short by a shared per-run lookup budget, and so may hold a false
         negative. Published in report provenance (``cli._provenance``'s
         ``evidence_lookup_starved_uris``) so a report is auditable against
         how many of its cached evidence levels are still, as of that run,
         possibly under-checked -- whether because a later ``fetch`` run
         hasn't retried them yet, or because they hit the retry cap
-        (``evidence_fetch.MAX_LOOKUP_RETRIES``) and are no longer retried at
+        (``evidence_batch.MAX_LOOKUP_RETRIES``) and are no longer retried at
         all.
         """
         r = self.conn.execute(
@@ -333,7 +333,7 @@ class Store:
                       ) -> list[tuple[str, Optional[str], Optional[str], Optional[str]]]:
         """Feedback URIs (empty ones excluded) that still need evidence
         classification, each with its rater/owner parties GROUP_CONCAT-joined
-        exactly as ``evidence_fetch.classify_all`` consumes them, plus its
+        exactly as ``evidence_batch.classify_all`` consumes them, plus its
         existing cache note (if any): ``(uri, clients_csv, owners_csv,
         prior_note)``. ``clients_csv``/``owners_csv`` are ``None`` when there
         is nothing to join (e.g. no agent-owner row yet); ``prior_note`` is
@@ -341,7 +341,7 @@ class Store:
 
         A URI is pending when it has never been cached, OR when it *is*
         cached but with a note in ``include_notes`` -- e.g. a
-        ``"lookup-budget:N"`` set (see ``evidence_fetch.MAX_LOOKUP_RETRIES``,
+        ``"lookup-budget:N"`` set (see ``evidence_batch.MAX_LOOKUP_RETRIES``,
         ``_RETRYABLE_LOOKUP_BUDGET_NOTES``) to retry URIs whose tx-hash
         verification was cut short by ``classify_all``'s shared per-run
         lookup budget (H3): such a cached level may be a false negative (a

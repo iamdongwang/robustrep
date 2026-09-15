@@ -160,7 +160,7 @@ def test_fetch_evidence_line_reports_lookup_caps(tmp_path, monkeypatch):
     # this run produced must be visible in the fetch step's own summary line,
     # not just buried in a later report's provenance.
     from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
-    from robustrep.sources.evidence_fetch import DEFAULT_MAX_TOTAL_LOOKUPS
+    from robustrep.sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
 
     db = tmp_path / "t.db"
     _seed_agents(db, ["1", "2"])
@@ -1163,11 +1163,11 @@ def test_report_provenance_includes_config_in_markdown_and_json(tmp_path):
 def test_report_provenance_includes_evidence_lookup_caps(tmp_path):
     # H3 (security review): evidence_max_lookups_per_uri/evidence_max_total_lookups
     # bound which cached evidence levels might be false negatives (see
-    # evidence_fetch's "lookup-budget:N" note) -- publish them next to
+    # evidence_batch's "lookup-budget:N" note) -- publish them next to
     # evidence_level_shares so a report is auditable against the caps that
     # actually produced it.
     from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
-    from robustrep.sources.evidence_fetch import DEFAULT_MAX_TOTAL_LOOKUPS
+    from robustrep.sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
 
     db = tmp_path / "t.db"
     _seed(db)

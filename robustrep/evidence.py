@@ -74,7 +74,7 @@ def classify(uri: Optional[str], fetch_text: FetchText, tx_parties: TxParties, p
     performs no lookups at all. This is an honest false negative, not a
     security gap: a document whose one verifying hash sits at position
     `max_lookups` or later is downgraded from level 3 to level 2 -- callers
-    that care (e.g. `evidence_fetch.classify_all`'s shared run-wide budget)
+    that care (e.g. `evidence_batch.classify_all`'s shared run-wide budget)
     can mark such a result retryable rather than final. A `tx_parties` call
     that raises still counts as one spent lookup against `max_lookups` (and
     against any shared budget a caller wraps it with) -- the failed attempt
