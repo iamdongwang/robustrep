@@ -1,15 +1,31 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: pip }
-      - run: pip install -e ".[dev]"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            constraints.txt
+      - run: pip install -e ".[dev]" -c constraints.txt
+      # Audit the pinned set CI just installed. Auditing the *environment*
+      # instead would hard-fail under --strict on the editable, unpublished
+      # robustrep itself ("Dependency not found on PyPI"), and --skip-editable
+      # does not help: --strict fails on any skipped dependency.
+      - run: pip-audit --strict --progress-spinner off --no-deps -r constraints.txt
       - run: pytest --cov --cov-report=term-missing

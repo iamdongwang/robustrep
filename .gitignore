@@ -3,11 +3,24 @@
 __pycache__/
 *.pyc
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 .coverage
 htmlcov/
+.pytest_cache/
 dist/
 build/
 *.egg-info/
+
+# Secrets: API keys live in the environment, never in the tree.
+.env
+.env.*
+
+# Local run artifacts: fetched chain data, logs and preliminary reports.
+data/
+logs/
+*.log
+reports-prelim/
 reports/*/
 !reports/latest/
