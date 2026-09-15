@@ -84,6 +84,11 @@ def _lookup_budget_attempts(prior_note: Optional[str]) -> int:
 
     The bare ``"lookup-budget"`` (7f391ef, before the counter existed) reads
     as 1: that build had already starved the URI once.
+
+    A malformed count (``"lookup-budget:xyz"``) reads as 0, but note that
+    ``classify_all`` never asks: ``_RETRYABLE_LOOKUP_BUDGET_NOTES`` is an
+    exact-match list, so such a URI is not pending and is never re-classified.
+    See the branch comment below.
     """
     if prior_note == _LEGACY_LOOKUP_BUDGET_NOTE:
         return 1
@@ -91,9 +96,14 @@ def _lookup_budget_attempts(prior_note: Optional[str]) -> int:
         try:
             return int(prior_note.split(":", 1)[1])
         except ValueError:
-            # A malformed count parses to 0 deliberately: an unreadable note
-            # gives the URI its full attempt budget back rather than pinning
-            # it at an arbitrary number (or aborting the whole batch).
+            # Deliberately 0, and deliberately unreachable from the batch
+            # layer: `_RETRYABLE_LOOKUP_BUDGET_NOTES` matches exact strings,
+            # so a URI cached with a malformed count is never re-queued by
+            # `classify_all` -- it is terminal, and stays counted by
+            # `Store.n_lookup_budget_starved` (which matches on the prefix) as
+            # starved for good. This branch is defence in depth for any other
+            # caller: an unreadable note must not raise out of the batch, and
+            # 0 is the only honest reading of a count nobody can parse.
             return 0
     return 0
 

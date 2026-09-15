@@ -503,3 +503,18 @@ def test_classify_all_max_lookups_per_uri_defaults_to_the_module_constant(tmp_pa
 
     classify_all(s, fetch_text=fetch, tx_parties=tx_parties, workers=1)
     assert len(looked_up) == MAX_TX_LOOKUPS_PER_URI
+
+
+def test_a_malformed_lookup_budget_note_is_terminal_not_retried(tmp_path):
+    # `_lookup_budget_attempts` parses a malformed count to 0, but that branch
+    # is defence in depth only: `_RETRYABLE_LOOKUP_BUDGET_NOTES` is an exact
+    # match list, so a URI cached with "lookup-budget:xyz" is never re-queued
+    # by the batch layer at all -- it is terminal, and stays counted as
+    # starved. Pinned so the comment in `_lookup_budget_attempts` stays true.
+    s = Store(tmp_path / "tmalformed.db")
+    s.upsert_feedback([_fb("https://malformed")])
+    s.upsert_evidence("https://malformed", 2, "lookup-budget:xyz")
+
+    assert s.pending_uris(include_notes=eb._RETRYABLE_LOOKUP_BUDGET_NOTES) == []
+    assert classify_all(s, fetch_text=lambda uri, session=None: "x", workers=1) == 0
+    assert s.n_lookup_budget_starved() == 1

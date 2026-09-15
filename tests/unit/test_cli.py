@@ -1670,3 +1670,197 @@ def test_evidence_caps_for_provenance_falls_back_to_constants(tmp_path):
     with Store(tmp_path / "bad.db") as store:
         store.set_sync("evidence_max_total_lookups", "not-a-number")
         assert cli._evidence_caps_for_provenance(store) == expected
+
+
+# --- review round 2: the export guard must land on report's error path -------
+
+
+def _seed_address_ratee(db, block="5"):
+    """Seed a store whose agent_id (-> the scored frame's `ratee`) is a 0x
+    address, so `export_json`'s address guard refuses the export. `block` is
+    the checkpoint, which picks the block directory the run writes into."""
+    s = Store(db)
+    address = "0x" + "ab" * 20
+    rows = []
+    for i in range(4):
+        rows.append(dict(chain="base", block=1, tx_hash="0x", log_index=i, agent_id=address,
+                          client=f"0x{i:040x}", feedback_index=0, value="80", value_decimals=0,
+                          tag1="q", tag2="", endpoint="", feedback_uri="", feedback_hash=""))
+    s.upsert_feedback(rows)
+    s.upsert_block_ts([(1, 10)])
+    for i in range(4):
+        s.upsert_rater(f"0x{i:040x}", 10 + i * 100000, None)
+    s.set_sync("last_block", block)
+    s.close()
+
+
+def test_report_address_in_scores_exits_1_and_leaves_latest_alone(tmp_path):
+    # export_json's address guard raises ValueError from inside _write_report,
+    # which runs after report()'s try/except -- it must be caught the same way
+    # every other rejection is (ERROR line, exit 1, no traceback) and must not
+    # damage the last good `latest/`.
+    out_dir = tmp_path / "reports"
+    good_db = tmp_path / "good.db"
+    _seed(good_db)
+    r1 = runner.invoke(app, ["report", "--db", str(good_db), "--out-dir", str(out_dir),
+                             "--bootstrap-n", "5"])
+    assert r1.exit_code == 0, r1.output
+    before = {p.name: p.read_bytes() for p in (out_dir / "latest").iterdir()}
+
+    bad_db = tmp_path / "bad.db"
+    _seed_address_ratee(bad_db, block="5")
+    r2 = runner.invoke(app, ["report", "--db", str(bad_db), "--out-dir", str(out_dir),
+                             "--bootstrap-n", "5"])
+    assert r2.exit_code == 1, r2.output
+    assert "ERROR: " in r2.output and "address" in r2.output
+    assert r2.exception is None or isinstance(r2.exception, SystemExit)
+    # The refusal must not name the address it found.
+    assert "0xab" not in r2.output
+    after = {p.name: p.read_bytes() for p in (out_dir / "latest").iterdir()}
+    assert after == before
+
+
+def test_report_address_in_scores_leaves_no_half_written_block_dir(tmp_path):
+    # scores.json is written first precisely so a refused export cannot leave
+    # figures and a report.md behind that look like a finished run.
+    db = tmp_path / "bad.db"
+    _seed_address_ratee(db, block="5")
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir),
+                            "--bootstrap-n", "5"])
+    assert r.exit_code == 1, r.output
+    block_dir = out_dir / "5"
+    assert not (block_dir / "report.md").exists()
+    assert not (block_dir / "scores.json").exists()
+    assert list(block_dir.glob("*.png")) == []
+
+
+# --- one versions source for report.md and scores.json (I2) ------------------
+
+
+def test_report_markdown_and_json_agree_on_versions(tmp_path):
+    from robustrep.report.export import versions as export_versions
+
+    db = tmp_path / "t.db"
+    _seed(db)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+
+    data = json.loads((out_dir / "latest" / "scores.json").read_text())
+    assert set(data["versions"]) == set(export_versions())
+
+    md = (out_dir / "latest" / "report.md").read_text()
+    line = next(ln for ln in md.splitlines() if ln.startswith("- Versions:"))
+    for name in ("python", "matplotlib", "requests", "urllib3", "eth_abi", "numpy", "pandas",
+                 "robustrep"):
+        assert name in line, name
+
+
+def test_provenance_versions_come_from_the_export_module(tmp_path):
+    from robustrep import Config
+    from robustrep.report.export import versions as export_versions
+    from robustrep.schema import validate_records
+
+    records = validate_records(pd.DataFrame([dict(
+        rater="r", ratee="A", value=50, scale="d0", tag="q", ts=0,
+        evidence_uri=None, source="test", evidence_level=0)]))
+    assert cli._provenance("onchain", Config(), records)["versions"] == export_versions()
+
+
+# --- publish: symlink sources, missing core files, log ordering --------------
+
+
+def test_published_files_never_follows_a_symlink(tmp_path):
+    # A figure-shaped symlink in the block directory must not publish whatever
+    # it points at -- the allowlist is about bytes leaving the machine, not
+    # about names.
+    block_dir = tmp_path / "3"
+    block_dir.mkdir()
+    (block_dir / "report.md").write_text("# report")
+    (block_dir / "scores.json").write_text("{}")
+    (block_dir / "fig1.png").write_bytes(b"png")
+    secret = tmp_path / "secret"
+    secret.write_text("private key material")
+    (block_dir / "fig3.png").symlink_to(secret)
+
+    names = {p.name for p in cli._published_files(block_dir)}
+    assert names == {"report.md", "scores.json", "fig1.png"}
+
+    out_dir = tmp_path / "reports"
+    cli._publish_latest(out_dir, block_dir)
+    assert not (out_dir / "latest" / "fig3.png").exists()
+
+
+@pytest.mark.parametrize("missing", ["report.md", "scores.json"])
+def test_publish_latest_refuses_when_a_core_file_is_missing(tmp_path, missing):
+    # Publishing an empty (or figure-only) `latest/` would take the live
+    # report offline; refuse and let report() turn it into an ERROR line.
+    out_dir = tmp_path / "reports"
+    block_dir = out_dir / "9"
+    block_dir.mkdir(parents=True)
+    for name in ("report.md", "scores.json"):
+        if name != missing:
+            (block_dir / name).write_text("x")
+    (block_dir / "fig1.png").write_bytes(b"png")
+
+    with pytest.raises(ValueError) as e:
+        cli._publish_latest(out_dir, block_dir)
+    assert missing in str(e.value)
+    assert not (out_dir / "latest").exists()
+
+
+def test_publish_latest_logs_only_after_latest_is_in_place(tmp_path, caplog):
+    # The DEBUG line says what *was* published, so it must not be emitted
+    # while the staged copy could still fail to move into place.
+    out_dir = tmp_path / "reports"
+    block_dir = out_dir / "3"
+    block_dir.mkdir(parents=True)
+    (block_dir / "report.md").write_text("# report")
+    (block_dir / "scores.json").write_text("{}")
+    (block_dir / "fig1.png").write_bytes(b"png")
+
+    published_at_log_time = []
+
+    class _Probe(logging.Handler):
+        def emit(self, record):
+            published_at_log_time.append((out_dir / "latest" / "report.md").exists())
+
+    probe = _Probe(level=logging.DEBUG)
+    logger = logging.getLogger("robustrep.cli")
+    logger.addHandler(probe)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="robustrep.cli"):
+            cli._publish_latest(out_dir, block_dir)
+    finally:
+        logger.removeHandler(probe)
+
+    assert published_at_log_time and all(published_at_log_time)
+
+
+# --- evidence caps: a non-positive recorded value is not usable --------------
+
+
+def test_evidence_caps_for_provenance_rejects_non_positive_values(tmp_path, caplog):
+    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
+    from robustrep.sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
+
+    expected = {"evidence_max_lookups_per_uri": MAX_TX_LOOKUPS_PER_URI,
+                "evidence_max_total_lookups": DEFAULT_MAX_TOTAL_LOOKUPS}
+    with Store(tmp_path / "nonpos.db") as store:
+        store.set_sync("evidence_max_lookups_per_uri", "0")
+        store.set_sync("evidence_max_total_lookups", "-5")
+        with caplog.at_level(logging.WARNING, logger="robustrep.cli"):
+            assert cli._evidence_caps_for_provenance(store) == expected
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert "evidence_max_lookups_per_uri" in warned and "evidence_max_total_lookups" in warned
+
+
+def test_step_evidence_uses_the_named_cap_keys(tmp_path, monkeypatch):
+    # The writer and the reader must name the same sync_state keys.
+    monkeypatch.setattr(cli, "classify_all", lambda store, **k: 0)
+    with Store(tmp_path / "t.db") as store:
+        cli._step_evidence(store, rpc=None, workers=1)
+        assert all(store.get_sync(key) is not None for key in cli.EVIDENCE_CAP_KEYS)
+        assert cli._evidence_caps_for_provenance(store) == {
+            "evidence_max_lookups_per_uri": 8, "evidence_max_total_lookups": 20000}
