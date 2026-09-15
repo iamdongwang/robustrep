@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from robustrep import Config, score
+from robustrep.report import export as export_mod
 from robustrep.report.adversarial import scenario_table
 from robustrep.report.export import export_json
 from robustrep.report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
@@ -655,6 +656,7 @@ def test_address_guard_scope_is_exactly_the_documented_one(tmp_path, records_fac
     # The guard is a backstop against an accidental future leak, not a
     # sanitizer: these three shapes are documented as NOT caught, and the
     # docstring stays honest only if the behaviour is pinned.
+    assert "does not catch" in export_mod.__doc__
     rec, sc = _data(records_factory)
     for uncaught in ("0X" + "AB" * 20,                  # uppercase 0X prefix
                      "0x" + "00" * 12 + "ab" * 20,      # ABI-padded to 32 bytes
