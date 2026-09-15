@@ -80,6 +80,19 @@ in the evidence cache, classifies it, and persists the level -- one bad URI (an
 unexpected exception out of ``classify``) is caught, logged, and recorded as
 level 1 rather than aborting the whole batch.
 
+**H3 (security review): tx-hash lookup budget.** ``robustrep.evidence.classify``
+already caps lookups *per URI* at ``MAX_TX_LOOKUPS_PER_URI``, but that alone
+does not bound a whole ``fetch`` run: an attacker can post many distinct
+evidence URIs, each packed with hashes up to that per-URI cap, and still
+multiply out to a large number of RPC calls across the batch. ``classify_all``
+additionally shares one ``_LookupBudget`` across every URI and every worker
+thread for the run (``max_total_lookups``, default 20,000): once it is spent,
+the wrapped ``tx_parties`` stops calling the underlying function at all and
+returns ``None`` for every further hash, which ``classify`` treats as
+"unverified" (its documented, conservative degrade path) rather than raising.
+Exactly one WARNING is logged for the whole run, the moment the budget is
+exhausted.
+
 **Known limitation -- DNS rebinding (the residual unmitigated gap in v0.1):**
 the guard above resolves the host and checks *those* addresses, but the actual
 connection is made by ``requests``/``urllib3``, which resolves the host *again*
@@ -129,6 +142,10 @@ CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 10
 DEFAULT_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 USER_AGENT = "robustrep/0.1"
+# H3: total eth_getTransactionByHash calls allowed across one classify_all
+# run, shared by every URI and every worker thread -- see the module
+# docstring and `_LookupBudget`.
+DEFAULT_MAX_TOTAL_LOOKUPS = 20_000
 
 _log = logging.getLogger(__name__)
 
@@ -540,9 +557,58 @@ def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Call
     return level, ("unfetchable" if fetched_none else "")
 
 
+class _LookupBudget:
+    """Thread-safe counter that wraps ``tx_parties`` to cap the total number
+    of RPC lookups spent across one ``classify_all`` run (H3, see module
+    docstring).
+
+    ``spend()`` is called once per candidate hash, from whichever worker
+    thread ``robustrep.evidence.classify`` happens to be running in, so the
+    decrement-and-check has to be atomic -- a plain ``if self.remaining > 0``
+    followed by a decrement would let two threads both pass the check for the
+    last unit of budget. Once exhausted, ``wrap`` stops calling the
+    underlying ``tx_parties`` entirely and returns ``None`` (the same
+    "unverified" signal a real RPC miss would give), and logs one WARNING for
+    the whole run -- not once per hash, which would just be a second flavor
+    of the same log-flooding problem this budget exists to prevent.
+    """
+
+    def __init__(self, total: int):
+        self._remaining = max(total, 0)
+        self._lock = threading.Lock()
+        self._warned = False
+        self.spent = 0
+
+    def _spend_one(self) -> bool:
+        """Atomically consume one unit of budget; True if one was available."""
+        with self._lock:
+            if self._remaining <= 0:
+                if not self._warned:
+                    self._warned = True
+                    _log.warning(
+                        "evidence: tx lookup budget of %d exhausted; "
+                        "remaining hashes treated as unverified", self.spent)
+                return False
+            self._remaining -= 1
+            self.spent += 1
+            return True
+
+    def wrap(self, tx_parties: Callable[[str], Optional[set]]) -> Callable[[str], Optional[set]]:
+        """A ``tx_parties``-shaped callable that spends one unit of this
+        budget per call and, once exhausted, calls ``tx_parties`` no further."""
+
+        def _budgeted(h: str) -> Optional[set]:
+            if not self._spend_one():
+                return None
+            return tx_parties(h)
+
+        return _budgeted
+
+
 def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
                   tx_parties: Callable[[str], Optional[set]] = lambda h: None,
-                  log_every: int = 500, workers: int = 8) -> int:
+                  log_every: int = 500, workers: int = 8,
+                  max_total_lookups: int = DEFAULT_MAX_TOTAL_LOOKUPS) -> int:
     """Classify every distinct URI referenced by ``feedback`` that is not yet in
     the evidence cache, and persist each result via ``store.upsert_evidence``.
 
@@ -570,6 +636,12 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
     Logs progress at INFO every ``log_every`` URIs *completed* (regardless of
     completion order); ``log_every <= 0`` disables progress logging entirely
     (also guards against a ``ZeroDivisionError`` from ``% log_every``).
+
+    ``max_total_lookups`` (H3, see module docstring) bounds the total number
+    of ``tx_parties`` calls across the *whole run*, shared by every URI and
+    every worker thread via a single ``_LookupBudget``; the number actually
+    spent is logged at INFO once the run completes.
+
     Returns the number of URIs processed.
     """
     # feedback.client and agents.owner are 0x-hex addresses, which never
@@ -587,6 +659,9 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
     # otherwise race the cursor's own re-evaluation of NOT EXISTS.
     rows = store.conn.execute(q).fetchall()
 
+    budget = _LookupBudget(max_total_lookups)
+    budgeted_tx_parties = budget.wrap(tx_parties)
+
     thread_local = threading.local()
     sessions: list = []
     sessions_lock = threading.Lock()
@@ -602,7 +677,7 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
 
     def _classify_one(uri: str, parties: set):
         session = _thread_session()
-        return _classify_uri(uri, parties, fetch_text, tx_parties, session)
+        return _classify_uri(uri, parties, fetch_text, budgeted_tx_parties, session)
 
     processed = 0
     try:
@@ -622,4 +697,5 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
     finally:
         for sess in sessions:
             sess.close()
+    _log.info("classify_all: tx lookup budget spent %d/%d", budget.spent, max_total_lookups)
     return processed

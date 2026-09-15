@@ -685,6 +685,61 @@ def test_classify_all_writes_store_only_from_main_thread(tmp_path):
     assert all(tid == main_thread_id for tid in write_thread_ids)
 
 
+# --- H3: total tx-hash lookup budget shared across a whole classify_all run --------
+
+def _many_hashes_text(n: int, seed: int) -> str:
+    """``n`` distinct 64-hex tx hashes, offset by ``seed`` so different URIs
+    contribute disjoint hash sets (nothing to verify against)."""
+    return " ".join("0x" + f"{seed * n + i:064x}" for i in range(n))
+
+
+def test_classify_all_total_lookup_budget_is_shared_across_uris(tmp_path, caplog):
+    s = Store(tmp_path / "tbudget.db")
+    rows = [{**_fb(f"https://b{i}"), "feedback_index": i} for i in range(5)]
+    s.upsert_feedback(rows)
+
+    def fetch(uri, session=None):
+        i = int(uri.rsplit("b", 1)[-1])
+        return _many_hashes_text(8, i)
+
+    calls = []
+
+    def tx_parties(h):
+        calls.append(h)
+        return None  # nothing ever verifies
+
+    with caplog.at_level(logging.WARNING):
+        n = classify_all(s, fetch_text=fetch, tx_parties=tx_parties,
+                          max_total_lookups=20, workers=2)
+    assert n == 5
+    assert len(calls) == 20
+    levels = s.conn.execute("SELECT level FROM evidence_cache").fetchall()
+    assert all(level == 2 for (level,) in levels)
+    warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "budget" in warnings[0].message
+
+
+def test_classify_all_budget_not_exhausted_logs_no_warning(tmp_path, caplog):
+    s = Store(tmp_path / "tbudget2.db")
+    rows = [{**_fb(f"https://c{i}"), "feedback_index": i} for i in range(5)]
+    s.upsert_feedback(rows)
+
+    def fetch(uri, session=None):
+        i = int(uri.rsplit("c", 1)[-1])
+        return _many_hashes_text(8, i)
+
+    def tx_parties(h):
+        return None
+
+    with caplog.at_level(logging.WARNING):
+        n = classify_all(s, fetch_text=fetch, tx_parties=tx_parties,
+                          max_total_lookups=20_000, workers=2)
+    assert n == 5
+    warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert warnings == []
+
+
 def test_classify_all_each_worker_thread_gets_its_own_session(tmp_path):
     s = Store(tmp_path / "tsess.db")
     _seed_many(s, 40, prefix="s")

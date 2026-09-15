@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from robustrep.config import Config
-from robustrep.evidence import classify, weights_for
+from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI, classify, weights_for
 
 TX = "0x" + "ab" * 32
 
@@ -168,3 +168,51 @@ def test_dedupe_hashes_case_insensitive():
     result = classify("https://x", lambda u: text, tx_parties, {"0xrater"})
     assert result == 2
     assert len(calls) == 1
+
+
+# --- H3: cap tx-hash lookups per URI (a 200 KB document can pack thousands of
+# distinct non-matching hashes, forcing one RPC call per hash) ----------------
+
+def test_classify_verifies_at_most_max_lookups_hashes():
+    calls = []
+    text = " ".join("0x" + f"{i:064x}" for i in range(50))
+
+    def tx_parties(h):
+        calls.append(h)
+        return None
+
+    level = classify("u", lambda u: text, tx_parties, {"0xabc"})
+    assert level == 2
+    assert len(calls) == MAX_TX_LOOKUPS_PER_URI == 8
+
+
+def test_classify_max_lookups_override_and_zero():
+    calls = []
+    text = " ".join("0x" + f"{i:064x}" for i in range(50))
+
+    def tx_parties(h):
+        calls.append(h)
+        return None
+
+    level = classify("u", lambda u: text, tx_parties, {"0xabc"}, max_lookups=3)
+    assert level == 2
+    assert len(calls) == 3
+
+    calls.clear()
+    level = classify("u", lambda u: text, tx_parties, {"0xabc"}, max_lookups=0)
+    assert level == 2
+    assert len(calls) == 0
+
+
+def test_classify_stops_at_first_verified_hash_within_cap():
+    hashes = ["0x" + f"{i:064x}" for i in range(50)]
+    text = " ".join(hashes)
+    calls = []
+
+    def tx_parties(h):
+        calls.append(h)
+        return {"0xabc"} if h == hashes[5] else None
+
+    level = classify("u", lambda u: text, tx_parties, {"0xabc"})
+    assert level == 3
+    assert len(calls) == 6
