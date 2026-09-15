@@ -1,16 +1,16 @@
 # Robust reputation on ERC-8004 (Base)
 
-Data cut at block 51318897. Ratings: 476207 (87 revoked, excluded below). Agents rated: 29729. Agents scored (>= min_clusters independent clusters): 5170; insufficient (too few clusters): 24559.
+Data cut at block 51322403. Ratings: 476234 (87 revoked, excluded below). Agents rated: 29729. Agents scored (>= min_clusters independent clusters): 4964; insufficient (too few clusters): 24765.
 
 ## Headline numbers
 - No evidence URI (level 0): 16.2%
 - No verifiable interaction evidence (levels 0-1): 99.5%. This is comparable to the study's (arXiv 2606.26028) reported 98.7-100% of ratings with no interaction evidence.
 - Verified on chain (level 3): 0.1%
-- Agents flagged (largest single cluster >= 50% of that agent's records, among scored agents only): 3161 (61.1%)
+- Agents flagged (largest single cluster >= 50% of that agent's records, among scored agents only): 3292 (66.3%)
 - Read `sybil_flag` together with `n_clusters` and `zero_evidence_ratio`: in scenario F an attack split across two funders held 91% of the records while the largest single cluster was 45%, leaving the flag at 0.
-- Rater concentration: 13421 distinct raters, 476207 ratings (1.0 median, 44666 max ratings per rater). With repeat raters this dense, the largest-single-cluster flag is mostly single-rater dominance (one address rating the same agent many times); read it with `n_raw` and `n_clusters`.
+- Rater concentration: 13421 distinct raters, 476234 ratings (1.0 median, 44666 max ratings per rater). With repeat raters this dense, the largest-single-cluster flag is mostly single-rater dominance (one address rating the same agent many times); read it with `n_raw` and `n_clusters`.
 - Tag hygiene: 631 distinct tags; 0.2% of records carry a tag with fewer than 10 records overall. tag1 is free text on ERC-8004; many values are sentences rather than categories. v0.1 keeps every tag as its own group; a rare-tag merge is a v0.2 item.
-- Median |mean - robust| among scored agents: 0.065
+- Median |mean - robust| among scored agents: 0.067
 
 ## Figures
 ### Fig 1. Mean vs robust score
@@ -33,13 +33,13 @@ Rank stability of the top-N robust-score ranking under reasonable parameter pert
 
 | variant         |   spearman_union |   spearman_top |   top_set_jaccard |   top_set_size |
 |:----------------|-----------------:|---------------:|------------------:|---------------:|
-| base            |       1          |     1          |          1        |           1067 |
-| weights_flatter |      -0.0558104  |    -0.0558104  |          0.543256 |            592 |
-| weights_steeper |      -0.0059696  |    -0.0059696  |          0.946714 |           1125 |
-| jaccard_0.6     |       1          |     1          |          1        |           1067 |
-| jaccard_0.9     |                  |                |          0.930253 |           1147 |
-| window_6h       |      -0.00109931 |    -0.00109931 |          0.997194 |           1068 |
-| window_72h      |                  |                |          0.999063 |           1066 |
+| base            |        1         |      1         |          1        |           1090 |
+| weights_flatter |       -0.0567751 |     -0.0567751 |          0.55     |            615 |
+| weights_steeper |                  |                |          0.950305 |           1147 |
+| jaccard_0.6     |                  |                |          0.997248 |           1087 |
+| jaccard_0.9     |                  |                |          0.969751 |           1124 |
+| window_6h       |                  |                |          0.999083 |           1091 |
+| window_72h      |                  |                |          0.999083 |           1089 |
 
 ## Adversarial evidence
 Known-answer attack scenarios (see `robustrep.report.adversarial.scenario_table`), each computed with **bootstrap_n=0**: point estimates only -- no confidence-interval claims are made from this table.
@@ -73,7 +73,7 @@ normalize per (tag, scale) -> evidence weights -> sybil collapse (2-of-3 signals
 - **Tag hygiene.** tag1 is free text on ERC-8004; many values are sentences rather than categories. v0.1 keeps every tag as its own group; a rare-tag merge is a v0.2 item.
 
 ## Provenance
-- Rater profile mode: fallback
+- Rater profile mode: blockscout
 - Confirmations lag (data cut is final as of this block): 20
 - Scoring configuration used:
   - `bootstrap_n`: 1000
