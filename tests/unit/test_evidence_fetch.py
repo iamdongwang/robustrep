@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+import robustrep.sources.evidence_fetch as ef
 from robustrep.sources.evidence_fetch import (
     IPFS_GATEWAYS,
     MAX_BYTES,
@@ -51,9 +52,11 @@ class FakeSession:
     def __init__(self, by_url):
         self.by_url = dict(by_url)
         self.calls = []
+        self.call_kwargs = []
 
     def get(self, url, **kwargs):
         self.calls.append(url)
+        self.call_kwargs.append(kwargs)
         resp = self.by_url.get(url)
         if resp is None:
             raise RuntimeError(f"unexpected fetch of {url}")
@@ -704,3 +707,111 @@ def test_classify_all_each_worker_thread_gets_its_own_session(tmp_path):
     if len(by_thread) > 1:
         session_ids_by_thread = [next(iter(sids)) for sids in by_thread.values()]
         assert len(set(session_ids_by_thread)) == len(by_thread)
+
+
+# --- parser differential: urlsplit vs urllib3 (C1) -------------------------------------
+
+def _public_resolver(host):
+    """Resolver stub answering one public address for every host, so these
+    tests exercise the parsing/authority checks rather than the DNS check."""
+    return ["93.184.216.34"]
+
+
+@pytest.mark.parametrize("url", [
+    # urlsplit sees host "example.com" (port 80) while urllib3 -- which is what
+    # requests actually connects with -- terminates the authority at the
+    # backslash and sees 127.0.0.1:6379.
+    "http://127.0.0.1:6379\\@example.com/",
+    "http://169.254.169.254\\@example.com/latest/meta-data/",
+    "http://example.com\\@127.0.0.1/",
+    "http://user@example.com/",  # any userinfo is refused outright
+    "http://exa mple.com/",
+    "http://example.com\x00/",
+    "http://example.com\r\n/",  # urlsplit strips CR/LF; the raw URL must not
+    "http://example.com\x85/",
+])
+def test_is_safe_url_refuses_authority_with_backslash_userinfo_or_control_chars(url):
+    assert ef._is_safe_url(url, resolver=_public_resolver) is False
+
+
+def test_is_safe_url_cross_checks_urllib3_parse(monkeypatch):
+    # Stand in for any future parser differential: if urllib3 disagrees with
+    # urlsplit about scheme/host/port, the URL is refused rather than fetched.
+    from urllib3.util import Url
+
+    monkeypatch.setattr(
+        ef, "_urllib3_parse",
+        lambda u: Url(scheme="http", host="127.0.0.1", port=6379, path="/"))
+    assert ef._is_safe_url("http://example.com/", resolver=_public_resolver) is False
+
+
+def test_is_safe_url_still_allows_ordinary_public_url():
+    assert ef._is_safe_url("https://example.com/path?x=1", resolver=_public_resolver) is True
+
+
+def test_is_safe_url_still_refuses_bracketed_ipv6_literal():
+    # A public IPv6 literal is still refused as a bare IP literal, as before --
+    # the bracket stripping in the parser cross-check must not open a bypass.
+    assert ef._is_safe_url("http://[2606:2800:220:1:248:1893:25c8:1946]/",
+                           resolver=_public_resolver) is False
+
+
+def test_canonical_url_is_rebuilt_from_vetted_parts():
+    assert ef._canonical_url("HTTP://Example.COM:80/a/b?x=1#frag") == "http://example.com/a/b?x=1"
+    assert ef._canonical_url("https://example.com/") == "https://example.com/"
+    assert ef._canonical_url("https://example.com") == "https://example.com/"
+    assert ef._canonical_url("https://example.com.:8443/x") == "https://example.com:8443/x"
+
+
+def test_fetch_url_requests_canonical_url_not_raw():
+    resp = FakeResp(200, body=b"ok")
+    sess = FakeSession({"http://example.com/p?q=1": resp})
+    # Raw string differs from the canonical form in scheme case, host case,
+    # redundant default port and fragment -- the request must use the form
+    # rebuilt from the components the guard actually vetted.
+    text = ef._fetch_url("HTTP://Example.com:80/p?q=1#f", sess, _public_resolver,
+                         ef.DEFAULT_TIMEOUT)
+    assert text == "ok"
+    assert sess.calls == ["http://example.com/p?q=1"]
+    headers = {k.lower(): v for k, v in sess.call_kwargs[0]["headers"].items()}
+    assert headers["accept-encoding"] == "identity"
+    assert headers["user-agent"] == ef.USER_AGENT
+    assert resp.closed is True
+
+
+def test_redirect_target_is_canonicalized_and_guarded():
+    first = FakeResp(302, headers={"location": "HTTP://Other.example:80/next#x"})
+    final = FakeResp(200, body=b"done")
+    sess = FakeSession({
+        "http://example.com/a": first,
+        "http://other.example/next": final,
+    })
+    assert ef._fetch_url("http://example.com/a", sess, _public_resolver,
+                         ef.DEFAULT_TIMEOUT) == "done"
+    assert sess.calls == ["http://example.com/a", "http://other.example/next"]
+
+
+def test_redirect_location_with_backslash_authority_is_not_requested():
+    first = FakeResp(302, headers={"location": "http://127.0.0.1\\@other.example/"})
+    sess = FakeSession({"http://example.com/a": first})
+    assert ef._fetch_url("http://example.com/a", sess, _public_resolver,
+                         ef.DEFAULT_TIMEOUT) is None
+    # Recording the calls (rather than relying on FakeSession's raise) is what
+    # proves the redirect target never reached the transport.
+    assert sess.calls == ["http://example.com/a"]
+
+
+def test_resolve_uri_ipfs_gateway_is_not_cloudflare():
+    # cloudflare-ipfs.com was retired; a dead gateway is a wasted hop.
+    assert "cloudflare" not in resolve_uri("ipfs://bafy123")
+    assert not any("cloudflare" in gw for gw in IPFS_GATEWAYS)
+
+
+def test_is_safe_url_refuses_when_urllib3_cannot_parse(monkeypatch):
+    # urllib3 rejecting a URL that urlsplit happily parses is itself a
+    # differential: refuse rather than fetch a URL only one parser understands.
+    def boom(url):
+        raise ValueError("cannot parse")
+
+    monkeypatch.setattr(ef, "_urllib3_parse", boom)
+    assert ef._is_safe_url("http://example.com/", resolver=_public_resolver) is False
