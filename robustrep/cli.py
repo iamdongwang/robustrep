@@ -416,6 +416,7 @@ def _provenance(mode: str, cfg: Config, records: pandas.DataFrame) -> dict:
         sybil_window_s=cfg.sybil_window_s,
         sybil_max_group=cfg.sybil_max_group,
         sybil_flag_share=cfg.sybil_flag_share,
+        norm_fit_share=cfg.norm_fit_share,
         evidence_level_shares=_evidence_shares_for_provenance(records),
     )
     return dict(
