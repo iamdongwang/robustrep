@@ -44,7 +44,7 @@ def prepare(records: pd.DataFrame, cfg: Config, clusters: Optional[dict] = None)
     """
     df = validate_records(records)
     df = df[df["revoked"] == 0].copy()
-    df = normalize(df)
+    df = normalize(df, cfg.norm_fit_share)
     df["weight"] = weights_for(df["evidence_level"], cfg)
     if clusters:
         df["cluster"] = df["rater"].map(lambda r: clusters.get(r, r)).astype(str)

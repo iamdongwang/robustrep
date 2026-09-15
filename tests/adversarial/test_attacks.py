@@ -45,7 +45,14 @@ def test_scenario_b_smearing_sybils_do_not_sink_robust():
     rows = honest("A", 5) + sybils("A", 50, val=0, ts=100 * DAY)
     row = run(rows)
     assert row["naive_mean"] < 0.1
-    assert row["robust_score"] == 0.8
+    # The guarantee under test -- a smear cannot pull the robust score toward the
+    # attacker's 0 -- holds. The honest VALUE it holds at is 1.0, not 0.8, because
+    # the smear rows are 50/55 = 91% of the (tag, scale) group and every one is a
+    # literal 0: that clears the 0.9 fit share for the "binary" rung, so the honest
+    # 80s are clipped to 1.0 instead of divided by 100 (see robustrep.normalize).
+    # A flood of in-range 0/1 values can therefore still re-read a whole group -- a
+    # breakdown share of `norm_fit_share`, not the 1/n that min-max had.
+    assert row["robust_score"] == 1.0
 
 
 def test_scenario_c_flat_weights_reduce_to_lower_median():
@@ -206,10 +213,16 @@ def test_scenario_h_evasive_attacker_defeats_sybil_signals_but_not_the_weighted_
     atk_clusters = {r for r, c in clusters.items() if r.startswith("atk")}
     assert len({clusters[r] for r in atk_clusters}) == len(atk_clusters) == 30
 
-    # (b) honest mass 5*0.7=3.5 comfortably beats k*0.1 attacker mass at k=20 and k=30.
-    for k in (20, 30):
+    # (b) honest mass 5*0.7=3.5 comfortably beats k*0.1 attacker mass at k=20 and k=30,
+    # so the attack never pulls the score down. Which honest value the score holds at
+    # depends on how `normalize` reads the group, and the attack's own rows move that:
+    # at k=20 the group is 40/45 = 89% zeros, under the 0.9 fit share, so it is scored
+    # as "percent" and honest 80 -> 0.8; at k=30 it is 60/65 = 92% zeros, so the
+    # "binary" rung fits and honest 80 is clipped to 1.0. Either way the smear moves
+    # the score away from the attacker's 0, never toward it. See scenario B's note.
+    for k, honest_value in ((20, 0.8), (30, 1.0)):
         _, row = clusters_and_row(k)
-        assert row["robust_score"] == 0.8
+        assert row["robust_score"] == honest_value
         assert row["sybil_flag"] == 0   # every attacker is its own cluster: no single cluster dominates
 
     # (c) break-even: honest mass 3.5 vs k*0.1 attacker mass flips once k*0.1 >= (3.5+k*0.1)/2,
@@ -269,11 +282,15 @@ def test_report_numbers_table():
         "F_split_funders", "H_evasive_k20",
         "G_smear_breakeven", "G2_boost_breakeven", "H_evasive_breakeven",
     ]
+    # B_smearing reads 1.0, not 0.8: its 50 all-zero smear rows are 91% of the
+    # (tag, scale) group, clearing the "binary" fit share so the honest 80s clip to
+    # 1.0 rather than dividing by 100 -- the attack still fails to sink the score.
+    # See test_scenario_b_smearing_sybils_do_not_sink_robust for the full note.
     assert table.loc[
         ["A_boosting", "B_smearing", "D_evidence_free_flood", "E_fresh_tag",
-         "F_split_funders", "H_evasive_k20"], "robust_score"].tolist() == [0.8, 0.8, 0.8, 0.9, 0.8, 0.8]
+         "F_split_funders", "H_evasive_k20"], "robust_score"].tolist() == [0.8, 1.0, 0.8, 0.9, 0.8, 0.8]
     assert math.isclose(table.loc["A_boosting", "naive_mean"], 54 / 55, rel_tol=1e-3)
-    assert math.isclose(table.loc["B_smearing", "naive_mean"], 4 / 55, rel_tol=1e-3)
+    assert math.isclose(table.loc["B_smearing", "naive_mean"], 5 / 55, rel_tol=1e-3)
     assert math.isclose(table.loc["D_evidence_free_flood", "naive_mean"], 0.16, rel_tol=1e-3)
     assert math.isclose(table.loc["E_fresh_tag", "naive_mean"], 2.7 / 7, rel_tol=1e-3)
     assert table.loc["F_split_funders", "n_clusters"] == 7
