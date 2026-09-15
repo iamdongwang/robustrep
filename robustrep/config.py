@@ -9,11 +9,20 @@ from dataclasses import dataclass
 # default, so the two can never silently drift apart.
 DEFAULT_CONFIRMATIONS = 20
 
+# Share of a (tag, scale) group's values that must land inside a normalization
+# rule's range for that rule to be selected (see robustrep.normalize). Single
+# source of truth for both Config.norm_fit_share's default and normalize()'s own
+# default, so the two can never silently drift apart.
+DEFAULT_NORM_FIT_SHARE = 0.9
+
 
 @dataclass(frozen=True)
 class Config:
     # evidence level 0..3 -> weight
     evidence_weights: tuple[float, float, float, float] = (0.1, 0.3, 0.7, 1.0)
+    # normalization: share of a (tag, scale) group that must fit a rule's range
+    # for that rule to be chosen; out-of-range values are clipped, not fitted
+    norm_fit_share: float = DEFAULT_NORM_FIT_SHARE
     # sybil clustering
     sybil_window_s: int = 24 * 3600
     sybil_jaccard: float = 0.8
@@ -42,6 +51,10 @@ class Config:
             raise ValueError("bootstrap_n must be >= 0")
         if self.min_clusters < 1:
             raise ValueError("min_clusters must be >= 1")
+        if not 0.5 < self.norm_fit_share <= 1.0:
+            # <= 0.5 would let a minority of a group pick its normalization rule,
+            # which is the attacker-controlled breakdown this parameter exists to close.
+            raise ValueError("norm_fit_share must be in (0.5, 1.0]")
         if not 0 < self.sybil_jaccard <= 1:
             raise ValueError("sybil_jaccard must be in (0, 1]")  # 0 would match every pair's Jaccard signal
         if self.sybil_max_pairs < 1:

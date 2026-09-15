@@ -205,3 +205,21 @@ def test_performance_smoke(records_factory):
     elapsed = time.perf_counter() - start
     assert len(out) == 2000
     assert elapsed < 20.0
+
+
+def test_one_extreme_value_cannot_flatten_other_agents(records_factory):
+    # C2: `value` is an attacker-chosen int128. Under the old min-max fallback a
+    # single record of 2**127-1 dragged the whole (tag, scale) group out of the
+    # "percent" rule and flattened every honest score to ~0. Fit-share rule
+    # selection keeps the group on "percent" and clips the outlier, so only the
+    # attacker's own record is affected and every honest ratee scores identically
+    # with and without it.
+    honest_values = [10, 50, 90, 100, 0, 75, 25, 60, 40, 80]
+    rows = [dict(rater=f"r{i}", ratee=f"A{i % 2}", value=v) for i, v in enumerate(honest_values)]
+    cfg = Config(bootstrap_n=0, min_clusters=1)
+    clean = score(records_factory(rows), cfg).set_index("ratee")
+    poisoned = score(records_factory(rows + [dict(rater="atk", ratee="Z", value=2**127 - 1)]),
+                     cfg).set_index("ratee")
+    for ratee in ("A0", "A1"):
+        pd.testing.assert_series_equal(clean.loc[ratee], poisoned.loc[ratee])
+    assert poisoned.loc["Z", "robust_score"] == 1.0
