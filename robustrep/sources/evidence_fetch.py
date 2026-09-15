@@ -23,6 +23,18 @@ the fetcher here is a security boundary, not just an HTTP client:
   under the other, so non-ASCII hosts are refused rather than trusted to a
   resolver check that might be answering about a different host than the one
   ``requests`` will actually connect to.
+- **One parser, one URL** (``_parsers_agree`` / ``_canonical_url``): the guard
+  vets what ``urlsplit`` sees, but ``requests`` hands the *raw string* to
+  ``urllib3``, whose ``parse_url`` treats a backslash as an authority
+  terminator. ``http://127.0.0.1:6379\\@example.com/`` therefore vets as host
+  ``example.com`` port 80 and connects to ``127.0.0.1:6379`` -- a complete
+  bypass of every check above. Three layers close that differential: a URL
+  containing whitespace/C0/C1 control characters anywhere, or an authority
+  containing ``\\``, ``@``, whitespace or a control character, is refused
+  outright (``_AUTHORITY_FORBIDDEN``/``_URL_FORBIDDEN``); the scheme/host/port
+  ``urllib3.util.parse_url`` reads must match the ones ``urlsplit`` produced;
+  and the request is then issued against a URL *rebuilt* from the vetted
+  components (``_canonical_url``), never the attacker's raw string.
 - **Bounded manual redirects**: automatic redirects are disabled
   (``allow_redirects=False``); up to ``MAX_REDIRECTS`` 3xx hops are followed by
   hand, re-running the SSRF guard against each ``Location`` before following it.
@@ -32,22 +44,34 @@ the fetcher here is a security boundary, not just an HTTP client:
   (regardless of any ``Content-Length`` claim -- we just want the beginning),
   clamped a second time after the read as a belt-and-suspenders check against a
   non-conforming stream, and every request uses a ``(connect, read)`` timeout.
+  Requests also ask for ``accept-encoding: identity``: a bounded read of
+  *uncompressed* bytes makes a decompression bomb moot regardless of which
+  urllib3 version is installed.
 
 ``classify_all`` walks every URI referenced by ``feedback`` rows that is not yet
 in the evidence cache, classifies it, and persists the level -- one bad URI (an
 unexpected exception out of ``classify``) is caught, logged, and recorded as
 level 1 rather than aborting the whole batch.
 
-**Known limitation -- DNS rebinding (not mitigated in v0.1):** the guard above
-resolves the host and checks *those* addresses, but the actual connection is
-made by ``requests``/``urllib3``, which resolves the host *again* independently.
-A DNS-rebinding attacker (answering a public IP on the first lookup and a
-private one on the second, timed to land between the two resolutions) can pass
-the guard and cause a blind GET to a private address. The blast radius is
-bounded -- no response content is ever exposed to the caller or stored, only a
-0-3 evidence level -- but this is still a real gap. Proper mitigation (resolve
-once, then fetch via a pinned-IP transport adapter with the original hostname
-kept for TLS SNI/Host) is scheduled for v0.2; see
+**Known limitation -- DNS rebinding (the residual unmitigated gap in v0.1):**
+the guard above resolves the host and checks *those* addresses, but the actual
+connection is made by ``requests``/``urllib3``, which resolves the host *again*
+independently. A DNS-rebinding attacker (answering a public IP on the first
+lookup and a private one on the second, timed to land between the two
+resolutions) can pass the guard and cause a GET to a private address.
+
+The blast radius is *not* nil: the fetched text is consumed by
+``robustrep.evidence.classify``, which scans it for a transaction hash and for
+task-id JSON keys, and the outcome is persisted per URI as ``(level, note)``.
+A bypass is therefore a four-state oracle about the target --
+``(1, "unfetchable")`` (no response), ``(1, "")`` (responded, no markers),
+``(2, "")`` (response contained a 0x-hash or task-id key) and ``(3, "")``
+(a hash in the response involves the rater/owner addresses) -- not a blind
+request. That is precisely why the parser cross-check and canonical rebuild
+above exist: "the response body is never returned to the caller" is not a
+sufficient reason to tolerate a reachable bypass. Proper mitigation of the
+remaining DNS gap (resolve once, then fetch via a pinned-IP transport adapter
+with the original hostname kept for TLS SNI/Host) is scheduled for v0.2; see
 ``test_dns_rebinding_not_mitigated_in_v0_1`` in the test suite, which documents
 this with a ``strict=True`` xfail so it starts failing (as a reminder to update
 docs/tests) the moment it's actually fixed.
@@ -57,18 +81,20 @@ from __future__ import annotations
 import base64
 import ipaddress
 import logging
+import re
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Sequence
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import requests
+from urllib3.util import parse_url as _urllib3_parse_impl
 
 from ..evidence import classify
 from ..store import Store
 
-IPFS_GATEWAYS = ("https://ipfs.io/ipfs/", "https://cloudflare-ipfs.com/ipfs/")
+IPFS_GATEWAYS = ("https://ipfs.io/ipfs/", "https://dweb.link/ipfs/")
 MAX_BYTES = 200_000
 MAX_REDIRECTS = 3
 ALLOWED_PORTS = (80, 443)
@@ -80,6 +106,16 @@ USER_AGENT = "robustrep/0.1"
 _log = logging.getLogger(__name__)
 
 Resolver = Callable[[str], Sequence[str]]
+
+# Characters that must never appear in a URL's authority. `\\` and `@` are where
+# `urlsplit` and urllib3's `parse_url` disagree about where the authority ends
+# (see the module docstring); whitespace and C0/C1 controls are request-smuggling
+# material. An evidence URI needs none of them, so they are refused rather than
+# normalized -- normalizing would just pick a winner between the two parsers.
+_AUTHORITY_FORBIDDEN = re.compile(r"[\\@\s\x00-\x1f\x7f-\x9f]")
+# The same character classes anywhere in the URL: `urlsplit` silently strips
+# tab/CR/LF *before* parsing, so an authority-only check never sees them.
+_URL_FORBIDDEN = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
 
 # 6to4 (RFC 3056): embeds an IPv4 address in bits 16-47 of the IPv6 address.
 # Python's ipaddress module does not treat 2002::/16 itself as non-global, so
@@ -118,13 +154,97 @@ def _is_disallowed_ip(ip_str: str) -> bool:
     return False
 
 
+def _urllib3_parse(url: str):
+    """Module-level indirection over ``urllib3.util.parse_url``.
+
+    Named (rather than called through the import directly) so the cross-parser
+    check below can be exercised against a parser that deliberately disagrees:
+    the differential this guards against is by definition one the *installed*
+    urllib3 may not currently exhibit, and the guard must not depend on that.
+    """
+    return _urllib3_parse_impl(url)
+
+
+def _canonical_url(url: str) -> str:
+    """Rebuild ``url`` from the components the guard vetted.
+
+    A request must never carry the attacker's raw string: anything the guard's
+    parser ignored or normalized away is something a parser further down the
+    stack might still act on. The rebuilt URL has a lower-cased scheme and
+    host with the FQDN root dot and a redundant default port dropped, an
+    explicit ``"/"`` path, and no fragment (fragments are never sent on the
+    wire anyway -- keeping one would only preserve bytes to smuggle).
+
+    Only ever called on a URL ``_is_safe_url`` accepted, so the host is a
+    plain ASCII hostname -- never a bracketed IP literal, which this would not
+    re-bracket.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").rstrip(".").lower()
+    default_port = 443 if scheme == "https" else 80
+    netloc = host if parts.port in (None, default_port) else f"{host}:{parts.port}"
+    return urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
+
+
+def _vetted_host(parts) -> Optional[str]:
+    """The hostname of an already-split URL, or ``None`` (logged at DEBUG,
+    host only) when it is one this fetcher must never touch: missing,
+    ``localhost`` (any trailing FQDN root dot stripped first), non-ASCII, or a
+    bare IP literal. See the module docstring for why the last two are refused
+    outright rather than checked more cleverly.
+    """
+    host = parts.hostname
+    if host:
+        host = host.rstrip(".")  # normalize a trailing FQDN root dot, e.g. "localhost."
+    if not host:
+        _log.debug("evidence fetch refused: no host")
+        return None
+    if not host.isascii():
+        _log.debug("evidence fetch refused: non-ASCII host")
+        return None
+    if host.lower() == "localhost":
+        _log.debug("evidence fetch refused: localhost host")
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    _log.debug("evidence fetch refused: bare IP literal host %r", host)
+    return None
+
+
+def _parsers_agree(url: str, scheme: str, host: str, port: int) -> bool:
+    """True if urllib3 reads the same scheme/host/port out of ``url`` as
+    ``urlsplit`` did (``scheme``/``host``/``port``, already normalized by the
+    caller, ``port`` with the scheme default applied).
+
+    ``requests`` passes the raw string to urllib3, so *urllib3's* reading --
+    not ``urlsplit``'s -- decides which host is actually connected to. Where
+    the two disagree (see the module docstring's backslash example) the URL is
+    refused rather than guessing which parser wins. A URL urllib3 cannot parse
+    at all is refused for the same reason.
+    """
+    try:
+        u3 = _urllib3_parse(url)
+    except Exception:
+        _log.debug("evidence fetch refused: urllib3 cannot parse URL for host %r", host)
+        return False
+    u3_host = (u3.host or "").rstrip(".").strip("[]").lower()
+    default_port = 443 if scheme == "https" else 80
+    return ((u3.scheme or "").lower() == scheme
+            and u3_host == host.lower()
+            and (u3.port or default_port) == port)
+
+
 def _is_safe_url(url: str, resolver: Resolver = _default_resolver) -> bool:
     """SSRF allowlist check for one URL. Never raises; returns ``False`` (and
     logs at DEBUG with just the host, never the full URL/path) for anything
-    disallowed: non-http(s) scheme, missing/localhost/non-ASCII/IP-literal
-    host, a non-standard port, or a host that resolves (via ``resolver``) to
-    any address ``_is_disallowed_ip`` rejects. See the module docstring for
-    the full rationale, including the IP-literal and non-ASCII refusals.
+    disallowed: non-http(s) scheme, a forbidden character in the URL or its
+    authority, missing/localhost/non-ASCII/IP-literal host, a non-standard
+    port, a scheme/host/port urllib3 reads differently than ``urlsplit``, or a
+    host that resolves (via ``resolver``) to any address ``_is_disallowed_ip``
+    rejects. See the module docstring for the full rationale.
     """
     try:
         parts = urlsplit(url)
@@ -134,43 +254,33 @@ def _is_safe_url(url: str, resolver: Resolver = _default_resolver) -> bool:
     if parts.scheme not in ("http", "https"):
         _log.debug("evidence fetch refused: scheme %r not http/https", parts.scheme)
         return False
-    host = parts.hostname
-    if host:
-        host = host.rstrip(".")  # normalize a trailing FQDN root dot, e.g. "localhost."
-    if not host:
-        _log.debug("evidence fetch refused: no host")
+    if _URL_FORBIDDEN.search(url) or _AUTHORITY_FORBIDDEN.search(parts.netloc):
+        _log.debug("evidence fetch refused: forbidden character in URL or authority")
         return False
-    if not host.isascii():
-        _log.debug("evidence fetch refused: non-ASCII host")
+    host = _vetted_host(parts)
+    if host is None:
         return False
     default_port = 443 if parts.scheme == "https" else 80
     try:
-        port = parts.port
-    except ValueError:
         # Malformed port (out of range, non-numeric): refuse rather than
         # silently falling back to the scheme's default port.
-        _log.debug("evidence fetch refused: malformed port for host %s", host)
-        return False
-    if (port or default_port) not in ALLOWED_PORTS:
-        _log.debug("evidence fetch refused: non-standard port for host %s", host)
-        return False
-    if host.lower() == "localhost":
-        _log.debug("evidence fetch refused: localhost host")
-        return False
-    try:
-        ipaddress.ip_address(host)
+        port = parts.port or default_port
     except ValueError:
-        pass
-    else:
-        _log.debug("evidence fetch refused: bare IP literal host %s", host)
+        _log.debug("evidence fetch refused: malformed port for host %r", host)
+        return False
+    if port not in ALLOWED_PORTS:
+        _log.debug("evidence fetch refused: non-standard port for host %r", host)
+        return False
+    if not _parsers_agree(url, parts.scheme, host, port):
+        _log.debug("evidence fetch refused: parser disagreement for host %r", host)
         return False
     try:
         addrs = resolver(host)
     except Exception:
-        _log.debug("evidence fetch refused: DNS resolution failed for host %s", host)
+        _log.debug("evidence fetch refused: DNS resolution failed for host %r", host)
         return False
     if not addrs or any(_is_disallowed_ip(a) for a in addrs):
-        _log.debug("evidence fetch refused: disallowed resolved address for host %s", host)
+        _log.debug("evidence fetch refused: disallowed resolved address for host %r", host)
         return False
     return True
 
@@ -216,18 +326,25 @@ def _fetch_url(url: str, session, resolver: Resolver, timeout, redirects_left: i
     ``redirects_left`` 3xx hops manually (re-checking each ``Location``), and
     reading at most ``MAX_BYTES`` bytes of the (final) response body.
 
+    The URL actually requested is the canonical one rebuilt from the vetted
+    components (``_canonical_url``), never the raw input string -- that holds
+    on every redirect hop too, since each ``urljoin``ed ``Location`` re-enters
+    this function through the same guard. ``accept-encoding: identity`` keeps
+    the ``MAX_BYTES`` cap a bound on uncompressed bytes.
+
     The response is always closed (in a ``finally``) before this call returns
     or recurses into the next redirect hop, regardless of which path (success,
     redirect, HTTP error, or a body-read failure) was taken.
     """
     if not _is_safe_url(url, resolver):
         return None
+    url = _canonical_url(url)
     sess = session or requests.Session()
     try:
         r = sess.get(url, timeout=timeout, stream=True, allow_redirects=False,
-                      headers={"user-agent": USER_AGENT})
+                      headers={"user-agent": USER_AGENT, "accept-encoding": "identity"})
     except Exception:
-        _log.debug("evidence fetch failed for %s", url, exc_info=True)
+        _log.debug("evidence fetch failed for %r", url, exc_info=True)
         return None
     next_url: Optional[str] = None
     text: Optional[str] = None
@@ -243,7 +360,7 @@ def _fetch_url(url: str, session, resolver: Resolver, timeout, redirects_left: i
             raw = raw[:MAX_BYTES]  # belt-and-suspenders: don't trust a non-conforming stream
             text = raw.decode("utf-8", errors="replace")
     except Exception:
-        _log.debug("evidence fetch failed reading body for %s", url, exc_info=True)
+        _log.debug("evidence fetch failed reading body for %r", url, exc_info=True)
         return None
     finally:
         r.close()
