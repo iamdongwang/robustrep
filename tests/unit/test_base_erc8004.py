@@ -103,26 +103,26 @@ def test_sync_chunks_and_checkpoints(tmp_path):
     agent = "0x" + (3).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
     log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=42)
     rpc = FakeRpc({(0, 1999): [log]}, head=3999)
-    store = Store(tmp_path / "t.db")
-    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
-    assert n == 1 and store.get_sync("last_block") == "3999"
-    ranges = [(int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16)) for m, p in rpc.calls if m == "eth_getLogs"]
-    assert ranges == [(0, 1999), (2000, 3999)]
-    first_getlogs_params = next(p for m, p in rpc.calls if m == "eth_getLogs")[0]
-    assert first_getlogs_params["topics"] == [[b.TOPIC_NEW_FEEDBACK, b.TOPIC_REVOKED, b.TOPIC_RESPONSE]]
-    b.fill_block_timestamps(store, rpc)
-    assert store.load_records()["ts"].iloc[0] == 1042
-    assert b.owner_of(rpc, "3") == "0x" + "ee" * 20
-    assert b.tx_parties(rpc, "0xh") == {"0xaa", "0xbb"}
+    with Store(tmp_path / "t.db") as store:
+        n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
+        assert n == 1 and store.get_sync("last_block") == "3999"
+        ranges = [(int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16)) for m, p in rpc.calls if m == "eth_getLogs"]
+        assert ranges == [(0, 1999), (2000, 3999)]
+        first_getlogs_params = next(p for m, p in rpc.calls if m == "eth_getLogs")[0]
+        assert first_getlogs_params["topics"] == [[b.TOPIC_NEW_FEEDBACK, b.TOPIC_REVOKED, b.TOPIC_RESPONSE]]
+        b.fill_block_timestamps(store, rpc)
+        assert store.load_records()["ts"].iloc[0] == 1042
+        assert b.owner_of(rpc, "3") == "0x" + "ee" * 20
+        assert b.tx_parties(rpc, "0xh") == {"0xaa", "0xbb"}
 
 
 def test_first_chunk_fails_last_block_still_advances(tmp_path):
     rpc = FakeRpc({}, head=3999, fail_ranges={(0, 1999)})
-    store = Store(tmp_path / "t1.db")
-    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
-    assert n == 0
-    assert store.get_sync("last_block") == "3999"
-    assert store.pop_failed_ranges() == [(0, 1999)]
+    with Store(tmp_path / "t1.db") as store:
+        n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
+        assert n == 0
+        assert store.get_sync("last_block") == "3999"
+        assert store.pop_failed_ranges() == [(0, 1999)]
 
 
 def test_failed_range_retried_and_does_not_rewind_checkpoint(tmp_path):
@@ -132,54 +132,54 @@ def test_failed_range_retried_and_does_not_rewind_checkpoint(tmp_path):
     log0 = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=100)
 
     rpc = FakeRpc({}, head=3999, fail_ranges={(0, 1999)})
-    store = Store(tmp_path / "t2.db")
-    n1 = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
-    assert n1 == 0
-    assert store.get_sync("last_block") == "3999"
+    with Store(tmp_path / "t2.db") as store:
+        n1 = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
+        assert n1 == 0
+        assert store.get_sync("last_block") == "3999"
 
-    # the failed range now succeeds and has a log to deliver
-    rpc.fail_ranges.clear()
-    rpc.logs_by_range[(0, 1999)] = [log0]
-    n2 = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
-    ranges_called = [(int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16))
-                      for m, p in rpc.calls if m == "eth_getLogs"]
-    assert (0, 1999) in ranges_called
-    assert n2 == 1
-    # retrying an old, low range must never rewind the checkpoint backward
-    assert store.get_sync("last_block") == "3999"
+        # the failed range now succeeds and has a log to deliver
+        rpc.fail_ranges.clear()
+        rpc.logs_by_range[(0, 1999)] = [log0]
+        n2 = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
+        ranges_called = [(int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16))
+                          for m, p in rpc.calls if m == "eth_getLogs"]
+        assert (0, 1999) in ranges_called
+        assert n2 == 1
+        # retrying an old, low range must never rewind the checkpoint backward
+        assert store.get_sync("last_block") == "3999"
 
 
 def test_sync_feedback_no_op_when_checkpoint_at_head(tmp_path):
     rpc = FakeRpc({}, head=100)
-    store = Store(tmp_path / "t3.db")
-    store.set_sync("last_block", "100")
-    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
-    assert n == 0
-    assert not any(m == "eth_getLogs" for m, _ in rpc.calls)
+    with Store(tmp_path / "t3.db") as store:
+        store.set_sync("last_block", "100")
+        n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
+        assert n == 0
+        assert not any(m == "eth_getLogs" for m, _ in rpc.calls)
 
 
 def test_fill_block_timestamps_no_missing_no_batch_calls(tmp_path):
     rpc = FakeRpc({})
-    store = Store(tmp_path / "t4.db")
-    n = b.fill_block_timestamps(store, rpc)
-    assert n == 0
-    assert rpc.batch_calls == 0
+    with Store(tmp_path / "t4.db") as store:
+        n = b.fill_block_timestamps(store, rpc)
+        assert n == 0
+        assert rpc.batch_calls == 0
 
 
 def test_fill_block_timestamps_batches_of_100(tmp_path):
     rpc = FakeRpc({})
-    store = Store(tmp_path / "t5.db")
-    rows = []
-    for i in range(250):
-        data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
-                      [i, 1, 0, "q", "", "", "", b"\x00" * 32])
-        agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
-        log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=i)
-        rows.append(b.decode_log(log))
-    store.upsert_feedback([r for r in rows if r["kind"] == "feedback"])
-    n = b.fill_block_timestamps(store, rpc)
-    assert n == 250
-    assert rpc.batch_calls == 3
+    with Store(tmp_path / "t5.db") as store:
+        rows = []
+        for i in range(250):
+            data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                          [i, 1, 0, "q", "", "", "", b"\x00" * 32])
+            agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+            log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=i)
+            rows.append(b.decode_log(log))
+        store.upsert_feedback([r for r in rows if r["kind"] == "feedback"])
+        n = b.fill_block_timestamps(store, rpc)
+        assert n == 250
+        assert rpc.batch_calls == 3
 
 
 def test_owner_of_zero_address_returns_none():
@@ -204,10 +204,10 @@ def test_tx_parties_not_found_returns_none():
 
 def test_sync_feedback_confirmations_lag_behind_head(tmp_path):
     rpc = FakeRpc({}, head=10_019)
-    store = Store(tmp_path / "t_conf.db")
-    n = b.sync_feedback(store, rpc, chunk=20_000, start_block=0)  # default confirmations=20
-    assert n == 0
-    assert store.get_sync("last_block") == "9999"
+    with Store(tmp_path / "t_conf.db") as store:
+        n = b.sync_feedback(store, rpc, chunk=20_000, start_block=0)  # default confirmations=20
+        assert n == 0
+        assert store.get_sync("last_block") == "9999"
 
 
 def test_config_confirmations_default_and_validation():
@@ -222,34 +222,34 @@ def test_sync_feedback_decode_failure_raises_and_records_range(tmp_path):
     bad_log = {"topics": [b.TOPIC_NEW_FEEDBACK, "0x" + (1).to_bytes(32, "big").hex()], "data": "0x",
                "blockNumber": hex(1500), "transactionHash": "0xbad", "logIndex": "0x0"}
     rpc = FakeRpc({(0, 999): [], (1000, 1999): [bad_log]}, head=1999)
-    store = Store(tmp_path / "t_crash1.db")
-    with pytest.raises(ValueError):
-        b.sync_feedback(store, rpc, chunk=1000, start_block=0, confirmations=0)
-    assert store.get_sync("last_block") == "999"
-    assert store.pop_failed_ranges() == [(1000, 1999)]
+    with Store(tmp_path / "t_crash1.db") as store:
+        with pytest.raises(ValueError):
+            b.sync_feedback(store, rpc, chunk=1000, start_block=0, confirmations=0)
+        assert store.get_sync("last_block") == "999"
+        assert store.pop_failed_ranges() == [(1000, 1999)]
 
 
 def test_sync_feedback_interrupt_during_fetch_requeues_remaining(tmp_path):
-    store = Store(tmp_path / "t_crash2.db")
-    store.add_failed_range(100, 199, "prior failure")
-    store.add_failed_range(200, 299, "prior failure")
-    store.add_failed_range(300, 399, "prior failure")
-    store.set_sync("last_block", "1000")
+    with Store(tmp_path / "t_crash2.db") as store:
+        store.add_failed_range(100, 199, "prior failure")
+        store.add_failed_range(200, 299, "prior failure")
+        store.add_failed_range(300, 399, "prior failure")
+        store.set_sync("last_block", "1000")
 
-    class InterruptingRpc(FakeRpc):
-        def call(self, method, params):
-            if method == "eth_getLogs":
-                f, t = int(params[0]["fromBlock"], 16), int(params[0]["toBlock"], 16)
-                self.calls.append((method, params))
-                if (f, t) == (200, 299):
-                    raise KeyboardInterrupt()
-                return []
-            return super().call(method, params)
+        class InterruptingRpc(FakeRpc):
+            def call(self, method, params):
+                if method == "eth_getLogs":
+                    f, t = int(params[0]["fromBlock"], 16), int(params[0]["toBlock"], 16)
+                    self.calls.append((method, params))
+                    if (f, t) == (200, 299):
+                        raise KeyboardInterrupt()
+                    return []
+                return super().call(method, params)
 
-    rpc = InterruptingRpc({})
-    with pytest.raises(KeyboardInterrupt):
-        b.sync_feedback(store, rpc, chunk=100, start_block=0, end_block=1000, confirmations=0)
-    assert store.pop_failed_ranges() == [(200, 299), (300, 399)]
+        rpc = InterruptingRpc({})
+        with pytest.raises(KeyboardInterrupt):
+            b.sync_feedback(store, rpc, chunk=100, start_block=0, end_block=1000, confirmations=0)
+        assert store.pop_failed_ranges() == [(200, 299), (300, 399)]
 
 
 def test_sync_feedback_applies_feedback_revoked_and_response(tmp_path):
@@ -266,13 +266,13 @@ def test_sync_feedback_applies_feedback_revoked_and_response(tmp_path):
     resp_log = _log(b.TOPIC_RESPONSE, [agent, client, responder], resp_data, block=10, tx="0xrp", idx=2)
 
     rpc = FakeRpc({(0, 1999): [fb_log, rv_log, resp_log]}, head=1999)
-    store = Store(tmp_path / "t_combo.db")
-    n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
-    assert n == 1
-    recs = store.load_records()
-    assert recs["revoked"].iloc[0] == 1
-    row = store.conn.execute("SELECT responder, response_uri FROM responses").fetchone()
-    assert row == ("0x" + "cd" * 20, "https://r")
+    with Store(tmp_path / "t_combo.db") as store:
+        n = b.sync_feedback(store, rpc, chunk=2000, start_block=0, confirmations=0)
+        assert n == 1
+        recs = store.load_records()
+        assert recs["revoked"].iloc[0] == 1
+        row = store.conn.execute("SELECT responder, response_uri FROM responses").fetchone()
+        assert row == ("0x" + "cd" * 20, "https://r")
 
 
 # --- decode_log: _hexint and topic-count validation --------------------------------
@@ -322,79 +322,79 @@ class FlakyBatchRpc(FakeRpc):
 
 
 def test_fill_block_timestamps_falls_back_to_per_block_on_rpcerror(tmp_path):
-    store = Store(tmp_path / "t_fallback.db")
-    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
-                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
-    agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
-    log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=7)
-    store.upsert_feedback([b.decode_log(log)])
-    rpc = FlakyBatchRpc({})
-    n = b.fill_block_timestamps(store, rpc)
-    assert n == 1
-    assert store.load_records()["ts"].iloc[0] == 1007
+    with Store(tmp_path / "t_fallback.db") as store:
+        data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                      [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+        agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+        log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=7)
+        store.upsert_feedback([b.decode_log(log)])
+        rpc = FlakyBatchRpc({})
+        n = b.fill_block_timestamps(store, rpc)
+        assert n == 1
+        assert store.load_records()["ts"].iloc[0] == 1007
 
 
 def test_fill_block_timestamps_skips_int_timestamp_via_batch(tmp_path):
-    store = Store(tmp_path / "t_int_ts_batch.db")
-    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
-                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
-    agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
-    log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=7)
-    store.upsert_feedback([b.decode_log(log)])
+    with Store(tmp_path / "t_int_ts_batch.db") as store:
+        data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                      [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+        agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+        log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=7)
+        store.upsert_feedback([b.decode_log(log)])
 
-    class IntTsRpc(FakeRpc):
-        def batch(self, calls):
-            self.batch_calls += 1
-            return [{"timestamp": 1000 + int(p[0], 16)} for _, p in calls]  # int, not "0x..." hex
+        class IntTsRpc(FakeRpc):
+            def batch(self, calls):
+                self.batch_calls += 1
+                return [{"timestamp": 1000 + int(p[0], 16)} for _, p in calls]  # int, not "0x..." hex
 
-    rpc = IntTsRpc({})
-    n = b.fill_block_timestamps(store, rpc)
-    assert n == 0  # skipped: not the 0x-hex wire form
-    assert store.load_records()["ts"].iloc[0] == 0  # no timestamp cached
-    assert store.missing_block_ts() == [7]  # still retryable on the next run
+        rpc = IntTsRpc({})
+        n = b.fill_block_timestamps(store, rpc)
+        assert n == 0  # skipped: not the 0x-hex wire form
+        assert store.load_records()["ts"].iloc[0] == 0  # no timestamp cached
+        assert store.missing_block_ts() == [7]  # still retryable on the next run
 
 
 def test_fill_block_timestamps_skips_int_timestamp_via_fallback(tmp_path):
-    store = Store(tmp_path / "t_int_ts_fallback.db")
-    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
-                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
-    agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
-    log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=9)
-    store.upsert_feedback([b.decode_log(log)])
+    with Store(tmp_path / "t_int_ts_fallback.db") as store:
+        data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                      [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+        agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+        log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=9)
+        store.upsert_feedback([b.decode_log(log)])
 
-    class IntTsFallbackRpc(FakeRpc):
-        def batch(self, calls):
-            self.batch_calls += 1
-            raise RpcError("batch endpoint down")
+        class IntTsFallbackRpc(FakeRpc):
+            def batch(self, calls):
+                self.batch_calls += 1
+                raise RpcError("batch endpoint down")
 
-        def call(self, method, params):
-            if method == "eth_getBlockByNumber":
-                self.calls.append((method, params))
-                return {"timestamp": 1000 + int(params[0], 16)}  # int, not "0x..." hex
-            return super().call(method, params)
+            def call(self, method, params):
+                if method == "eth_getBlockByNumber":
+                    self.calls.append((method, params))
+                    return {"timestamp": 1000 + int(params[0], 16)}  # int, not "0x..." hex
+                return super().call(method, params)
 
-    rpc = IntTsFallbackRpc({})
-    n = b.fill_block_timestamps(store, rpc)
-    assert n == 0  # skipped: not the 0x-hex wire form
-    assert store.missing_block_ts() == [9]
+        rpc = IntTsFallbackRpc({})
+        n = b.fill_block_timestamps(store, rpc)
+        assert n == 0  # skipped: not the 0x-hex wire form
+        assert store.missing_block_ts() == [9]
 
 
 def test_fill_block_timestamps_null_block_raises_rpcerror(tmp_path):
-    store = Store(tmp_path / "t_nullblock.db")
-    data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
-                  [1, 1, 0, "q", "", "", "", b"\x00" * 32])
-    agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
-    log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=9)
-    store.upsert_feedback([b.decode_log(log)])
+    with Store(tmp_path / "t_nullblock.db") as store:
+        data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                      [1, 1, 0, "q", "", "", "", b"\x00" * 32])
+        agent = "0x" + (1).to_bytes(32, "big").hex(); client = "0x" + "00" * 12 + "ab" * 20
+        log = _log(b.TOPIC_NEW_FEEDBACK, [agent, client, "0x" + "00" * 32], data, block=9)
+        store.upsert_feedback([b.decode_log(log)])
 
-    class NullBlockRpc(FakeRpc):
-        def batch(self, calls):
-            self.batch_calls += 1
-            return [None for _ in calls]
+        class NullBlockRpc(FakeRpc):
+            def batch(self, calls):
+                self.batch_calls += 1
+                return [None for _ in calls]
 
-    rpc = NullBlockRpc({})
-    with pytest.raises(RpcError, match="9"):
-        b.fill_block_timestamps(store, rpc)
+        rpc = NullBlockRpc({})
+        with pytest.raises(RpcError, match="9"):
+            b.fill_block_timestamps(store, rpc)
 
 
 def _feedback_rows(n: int) -> list:
@@ -429,17 +429,17 @@ class _StructuralOnceRpc(FakeRpc):
 
 
 def test_fill_block_timestamps_structural_batch_error_stops_batching_for_rest_of_run(tmp_path, caplog):
-    store = Store(tmp_path / "t_structural_ts.db")
-    store.upsert_feedback([r for r in _feedback_rows(250) if r["kind"] == "feedback"])
-    rpc = _StructuralOnceRpc({})
-    with caplog.at_level(logging.WARNING, logger=b.__name__):
-        n = b.fill_block_timestamps(store, rpc)  # 250 missing -> chunks of 100, 100, 50
-    assert n == 250
-    assert rpc.batch_calls == 1  # only the first chunk ever attempted a batch call
-    assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 250
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1  # logged once, not once per remaining chunk
-    assert "base-rpc.publicnode.com" in warnings[0].message
+    with Store(tmp_path / "t_structural_ts.db") as store:
+        store.upsert_feedback([r for r in _feedback_rows(250) if r["kind"] == "feedback"])
+        rpc = _StructuralOnceRpc({})
+        with caplog.at_level(logging.WARNING, logger=b.__name__):
+            n = b.fill_block_timestamps(store, rpc)  # 250 missing -> chunks of 100, 100, 50
+        assert n == 250
+        assert rpc.batch_calls == 1  # only the first chunk ever attempted a batch call
+        assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 250
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1  # logged once, not once per remaining chunk
+        assert "base-rpc.publicnode.com" in warnings[0].message
 
 
 def test_fill_block_timestamps_batch_size_le_1_never_calls_batch(tmp_path):
@@ -453,12 +453,12 @@ def test_fill_block_timestamps_batch_size_le_1_never_calls_batch(tmp_path):
                 return {"timestamp": hex(1000 + int(params[0], 16))}
             return super().call(method, params)
 
-    store = Store(tmp_path / "t_nobatch_ts.db")
-    store.upsert_feedback([r for r in _feedback_rows(3) if r["kind"] == "feedback"])
-    rpc = NoBatchRpc({})
-    n = b.fill_block_timestamps(store, rpc, batch_size=1)
-    assert n == 3
-    assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 3
+    with Store(tmp_path / "t_nobatch_ts.db") as store:
+        store.upsert_feedback([r for r in _feedback_rows(3) if r["kind"] == "feedback"])
+        rpc = NoBatchRpc({})
+        n = b.fill_block_timestamps(store, rpc, batch_size=1)
+        assert n == 3
+        assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 3
 
 
 def test_fill_block_timestamps_batch_rate_limit_error_stops_batching_for_rest_of_run(tmp_path, caplog):
@@ -475,15 +475,15 @@ def test_fill_block_timestamps_batch_rate_limit_error_stops_batching_for_rest_of
                 return {"timestamp": hex(1000 + int(params[0], 16))}
             return super().call(method, params)
 
-    store = Store(tmp_path / "t_ratelimit_ts.db")
-    store.upsert_feedback([r for r in _feedback_rows(150) if r["kind"] == "feedback"])
-    rpc = _RateLimitedOnceRpc({})
-    with caplog.at_level(logging.WARNING, logger=b.__name__):
-        n = b.fill_block_timestamps(store, rpc)  # 150 missing -> chunks of 100, 50
-    assert n == 150
-    assert rpc.batch_calls == 1
-    assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 150
-    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+    with Store(tmp_path / "t_ratelimit_ts.db") as store:
+        store.upsert_feedback([r for r in _feedback_rows(150) if r["kind"] == "feedback"])
+        rpc = _RateLimitedOnceRpc({})
+        with caplog.at_level(logging.WARNING, logger=b.__name__):
+            n = b.fill_block_timestamps(store, rpc)  # 150 missing -> chunks of 100, 50
+        assert n == 150
+        assert rpc.batch_calls == 1
+        assert len([c for c in rpc.calls if c[0] == "eth_getBlockByNumber"]) == 150
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
 # --- owner_of: revert handling ------------------------------------------------------
@@ -852,11 +852,11 @@ def test_sync_feedback_continues_past_an_undecodable_log(tmp_path):
     bad = _log(b.TOPIC_NEW_FEEDBACK, [_agent_topic(1), _CLIENT_TOPIC, _agent_topic(0)], b"")
     good = _log(b.TOPIC_NEW_FEEDBACK, [_agent_topic(2), _CLIENT_TOPIC, _agent_topic(0)], good_data, idx=1)
     rpc = FakeRpc({(1, 10): [bad, good]}, head=10)
-    s = Store(tmp_path / "t.db")
-    n = b.sync_feedback(s, rpc, chunk=10, start_block=1, end_block=10)
-    assert n == 1  # the good log landed; the undecodable one was skipped
-    assert s.get_sync("last_block") == "10"  # checkpoint advanced, no abort
-    assert s.pop_failed_ranges() == []
+    with Store(tmp_path / "t.db") as s:
+        n = b.sync_feedback(s, rpc, chunk=10, start_block=1, end_block=10)
+        assert n == 1  # the good log landed; the undecodable one was skipped
+        assert s.get_sync("last_block") == "10"  # checkpoint advanced, no abort
+        assert s.pop_failed_ranges() == []
 
 
 # --- I3: eth_call owner results are validated before being stored -------------------
@@ -962,11 +962,11 @@ def test_sync_feedback_continues_past_a_log_with_a_bad_block_number(tmp_path):
     bad = _feedback_log(blockNumber=float("inf"))
     good = _feedback_log(agent=3, logIndex="0x1")
     rpc = FakeRpc({(1, 10): [bad, good]}, head=10)
-    s = Store(tmp_path / "t.db")
-    n = b.sync_feedback(s, rpc, chunk=10, start_block=1, end_block=10)
-    assert n == 1
-    assert s.get_sync("last_block") == "10"
-    assert s.pop_failed_ranges() == []
+    with Store(tmp_path / "t.db") as s:
+        n = b.sync_feedback(s, rpc, chunk=10, start_block=1, end_block=10)
+        assert n == 1
+        assert s.get_sync("last_block") == "10"
+        assert s.pop_failed_ranges() == []
 
 
 def test_sync_feedback_rejects_a_malformed_chain_head(tmp_path):
@@ -976,9 +976,9 @@ def test_sync_feedback_rejects_a_malformed_chain_head(tmp_path):
                 return 12345  # int, not the "0x..." wire form
             return super().call(method, params)
 
-    s = Store(tmp_path / "t.db")
-    with pytest.raises(RpcError):
-        b.sync_feedback(s, BadHeadRpc({}), chunk=10, start_block=1)
+    with Store(tmp_path / "t.db") as s:
+        with pytest.raises(RpcError):
+            b.sync_feedback(s, BadHeadRpc({}), chunk=10, start_block=1)
 
 
 def test_sync_feedback_rejects_a_non_hex_chain_head(tmp_path):
@@ -988,49 +988,49 @@ def test_sync_feedback_rejects_a_non_hex_chain_head(tmp_path):
                 return "0xZZZZ"
             return super().call(method, params)
 
-    s = Store(tmp_path / "t.db")
-    with pytest.raises(RpcError):
-        b.sync_feedback(s, BadHeadRpc({}), chunk=10, start_block=1)
+    with Store(tmp_path / "t.db") as s:
+        with pytest.raises(RpcError):
+            b.sync_feedback(s, BadHeadRpc({}), chunk=10, start_block=1)
 
 
 def test_fill_block_timestamps_skips_a_missing_timestamp_field(tmp_path):
-    store = Store(tmp_path / "t.db")
-    store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x5"))])
+    with Store(tmp_path / "t.db") as store:
+        store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x5"))])
 
-    class NoTsRpc(FakeRpc):
-        def batch(self, calls):
-            self.batch_calls += 1
-            return [{"number": "0x5"} for _ in calls]
+        class NoTsRpc(FakeRpc):
+            def batch(self, calls):
+                self.batch_calls += 1
+                return [{"number": "0x5"} for _ in calls]
 
-    assert b.fill_block_timestamps(store, NoTsRpc({})) == 0
-    assert store.missing_block_ts() == [5]
+        assert b.fill_block_timestamps(store, NoTsRpc({})) == 0
+        assert store.missing_block_ts() == [5]
 
 
 def test_fill_block_timestamps_skips_a_non_dict_block(tmp_path):
-    store = Store(tmp_path / "t.db")
-    store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x6"))])
+    with Store(tmp_path / "t.db") as store:
+        store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x6"))])
 
-    class StringBlockRpc(FakeRpc):
-        def batch(self, calls):
-            self.batch_calls += 1
-            return ["not-a-block" for _ in calls]
+        class StringBlockRpc(FakeRpc):
+            def batch(self, calls):
+                self.batch_calls += 1
+                return ["not-a-block" for _ in calls]
 
-    assert b.fill_block_timestamps(store, StringBlockRpc({})) == 0
-    assert store.missing_block_ts() == [6]
+        assert b.fill_block_timestamps(store, StringBlockRpc({})) == 0
+        assert store.missing_block_ts() == [6]
 
 
 def test_fill_block_timestamps_caches_the_good_blocks_in_a_mixed_batch(tmp_path, caplog):
-    store = Store(tmp_path / "t.db")
-    store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x7")),
-                           b.decode_log(_feedback_log(agent=3, blockNumber="0x8", logIndex="0x1"))])
+    with Store(tmp_path / "t.db") as store:
+        store.upsert_feedback([b.decode_log(_feedback_log(blockNumber="0x7")),
+                               b.decode_log(_feedback_log(agent=3, blockNumber="0x8", logIndex="0x1"))])
 
-    class MixedRpc(FakeRpc):
-        def batch(self, calls):
-            self.batch_calls += 1
-            return [{"timestamp": hex(1000 + int(p[0], 16))} if int(p[0], 16) == 7
-                    else {"timestamp": 1008} for _, p in calls]
+        class MixedRpc(FakeRpc):
+            def batch(self, calls):
+                self.batch_calls += 1
+                return [{"timestamp": hex(1000 + int(p[0], 16))} if int(p[0], 16) == 7
+                        else {"timestamp": 1008} for _, p in calls]
 
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
-        assert b.fill_block_timestamps(store, MixedRpc({})) == 1
-    assert store.missing_block_ts() == [8]
-    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+        with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+            assert b.fill_block_timestamps(store, MixedRpc({})) == 1
+        assert store.missing_block_ts() == [8]
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
