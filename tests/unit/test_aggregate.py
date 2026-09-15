@@ -293,7 +293,7 @@ def test_bootstrap_ci_rejects_non_finite_input():
 
 def test_bootstrap_ci_chunked_completes_for_many_votes():
     # 1 ratee x 20,000 votes: exercises the chunked multinomial draw path
-    # (chunk_size = max(1, 2_000_000 // 20_000) = 100 << n_boot). No memory
+    # (chunk_size = max(1, MAX_BOOT_CHUNK_CELLS // 20_000) << n_boot). No memory
     # assertion -- just confirm it completes and returns a CI bracketing a
     # sane range.
     rng = np.random.default_rng(3)

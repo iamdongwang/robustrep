@@ -111,7 +111,11 @@ def _ci(scores: np.ndarray, weights: np.ndarray, tag_codes: np.ndarray, cfg: Con
     single allocation. Chunking is numerically free: a Generator is
     consumed row-major, so the chunked draws are the same rows in the same
     order as one big draw from the same `rng` (pinned by
-    `test_multi_tag_bootstrap_matches_unchunked_draws`).
+    `test_multi_tag_bootstrap_matches_unchunked_draws`). Each chunk is
+    explicitly released before the next draw allocates: a row of it is a
+    *view*, so a loop variable still bound to one would keep the whole
+    previous chunk alive across the next `rng.integers` call and leave peak
+    memory at two chunks rather than one.
     """
     n = len(scores)
     if n == 1 or cfg.bootstrap_n == 0:
@@ -120,13 +124,16 @@ def _ci(scores: np.ndarray, weights: np.ndarray, tag_codes: np.ndarray, cfg: Con
     if len(np.unique(tag_codes)) == 1:
         return bootstrap_ci(scores, weights, cfg.bootstrap_n, rng, cfg.ci_level)
     rows_per_chunk = max(1, MAX_BOOT_CHUNK_CELLS // n)
-    boots = np.empty(cfg.bootstrap_n)
-    done = 0
-    while done < cfg.bootstrap_n:
-        take = min(rows_per_chunk, cfg.bootstrap_n - done)
-        for i in rng.integers(0, n, size=(take, n)):
-            boots[done] = _total(scores[i], weights[i], tag_codes[i])
-            done += 1
+    boots = np.empty(cfg.bootstrap_n, dtype=float)
+    for start in range(0, cfg.bootstrap_n, rows_per_chunk):
+        take = min(rows_per_chunk, cfg.bootstrap_n - start)
+        idx = rng.integers(0, n, size=(take, n))
+        for k in range(take):
+            row = idx[k]
+            boots[start + k] = _total(scores[row], weights[row], tag_codes[row])
+        # `row` is a *view* into `idx`, so both names must go for the chunk's
+        # memory to be freed before the next draw allocates the next chunk.
+        del row, idx
     a = (1 - cfg.ci_level) / 2
     lo, hi = np.quantile(boots, [a, 1 - a])
     return float(lo), float(hi)

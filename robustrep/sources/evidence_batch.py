@@ -83,8 +83,8 @@ def _lookup_budget_attempts(prior_note: Optional[str]) -> int:
 
 
 def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Callable, session,
-                   was_starved: Optional[Callable[[], bool]] = None,
-                   prior_note: Optional[str] = None) -> tuple[int, str]:
+                  was_starved: Optional[Callable[[], bool]] = None,
+                  prior_note: Optional[str] = None) -> tuple[int, str]:
     """Classify one URI, returning ``(level, note)``.
 
     ``note`` is ``"unfetchable"`` when ``fetch_text`` returned ``None`` (the

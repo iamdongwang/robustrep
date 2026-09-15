@@ -286,7 +286,7 @@ def test_multi_tag_bootstrap_is_chunked(monkeypatch):
     assert spy.sizes, "expected the multi-tag path to draw resample indices"
     assert all(size[0] <= rows_per_chunk for size in spy.sizes)
     assert sum(size[0] for size in spy.sizes) == n_boot
-    assert len(spy.sizes) == n_boot // rows_per_chunk
+    assert len(spy.sizes) == math.ceil(n_boot / rows_per_chunk)
     # Chunking must not change the numbers: same seed -> same CI.
     assert chunked == unchunked
 
