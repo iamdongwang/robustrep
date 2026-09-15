@@ -37,7 +37,7 @@ from .report.publish import (EVIDENCE_CAP_PER_URI_KEY, EVIDENCE_CAP_TOTAL_KEY, b
 from .report.sensitivity import sensitivity_table
 from .sources import base_erc8004 as base
 from .sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS, classify_all
-from .sources.rater_profile import DEFAULT_RPS, EtherscanClient, default_client, enrich_raters, estimate_seconds
+from .sources.rater_profile import DEFAULT_RPS, default_client, enrich_raters, estimate_seconds
 from .sources.rpc import RpcClient, RpcError
 from .store import Store
 from .sybil import cluster_raters_with_stats, profiles_from_records
@@ -227,11 +227,11 @@ def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
     three ways -- both *passed to ``classify_all`` explicitly* (neither left
     to a callee default that could silently drift), recorded in ``sync_state``
     under ``EVIDENCE_CAP_KEYS`` (``report.publish``), and echoed in the line.
-    Recording
-    them is what lets provenance describe *this run* rather than whatever the
-    constants are whenever ``report`` runs: the caps shaped every level this
-    run persisted, and those levels outlive the constants. Echoing them too
-    means a human watching ``fetch`` sees them without digging up a report.
+    Recording them is what lets provenance describe *this run* rather than
+    whatever the constants are whenever ``report`` runs: the caps shaped every
+    level this run persisted, and those levels outlive the constants. Echoing
+    them too means a human watching ``fetch`` sees them without digging up a
+    report.
     """
     max_lookups_per_uri = MAX_TX_LOOKUPS_PER_URI
     max_total_lookups = DEFAULT_MAX_TOTAL_LOOKUPS
@@ -552,6 +552,10 @@ def report(
         write_report(block_dir, result, records, clusters, sens, adv, block, provenance, top_n)
         publish_latest(out_dir, block_dir)
     except ValueError as e:
+        # The ERROR line is all a user needs, but a ValueError from in here can
+        # equally be a real bug in report assembly rather than a refused input
+        # -- keep the traceback reachable instead of swallowing it.
+        logger.debug("report failed", exc_info=True)
         typer.echo(f"ERROR: {e}")
         raise typer.Exit(1)
 
