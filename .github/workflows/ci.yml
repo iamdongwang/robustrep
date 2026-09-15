@@ -37,7 +37,14 @@ jobs:
       # instead would hard-fail under --strict on the editable, unpublished
       # robustrep itself ("Dependency not found on PyPI"), and --skip-editable
       # does not help: --strict fails on any skipped dependency.
-      - run: pip-audit --strict --progress-spinner off --no-deps -r constraints.txt
+      # pip-audit fetches the advisory database over the network; retry a
+      # transient fetch failure (connection reset) a few times before failing.
+      - run: |
+          for attempt in 1 2 3; do
+            pip-audit --strict --progress-spinner off --no-deps -r constraints.txt && exit 0
+            echo "pip-audit attempt $attempt failed; retrying in 15s"; sleep 15
+          done
+          exit 1
       # constraints.txt is frozen on one machine (macOS/CPython 3.10), so on its
       # own it cannot see a dependency that installs only elsewhere -- a
       # Linux-gated marker, a platform-specific wheel. Anything pip actually
