@@ -32,6 +32,22 @@ unlike a written row -- stays visible to ``Store.distinct_clients()`` so a
 permanently stuck with the approximate value. ``enrich_raters`` records which
 mode ran via ``Store.set_sync("rater_profile_mode", ...)`` so downstream
 reports can state which mode produced the profile.
+
+Both clients treat their remote as hostile, per the security review:
+
+- **M1** -- an Etherscan API key must never reach a log. The key already stays
+  out of this module's own messages, but ``urllib3`` logs the whole request
+  line (query string included) at DEBUG, so ``EtherscanClient`` installs an
+  ``http_util.install_key_redaction`` filter on urllib3's loggers.
+- **M2** -- response bodies are read through ``http_util.read_json_capped``
+  with an 8 MiB cap instead of ``requests``' unbounded ``Response.json()``.
+- **M4** -- a first-transaction timestamp that is not a plausible epoch second
+  (``<= 0`` or past ``MAX_PLAUSIBLE_TS``) is refused rather than cached: one
+  bad value written to the raters table makes ``robustrep.sybil._validate_meta``
+  raise on every later ``score``/``report`` run.
+- **L5** -- Blockscout's ``next_page_params`` are echoed back as query params
+  on the next request, so they are allowlisted (see ``_safe_next_page_params``)
+  rather than forwarded verbatim.
 """
 from __future__ import annotations
 
@@ -45,6 +61,7 @@ from typing import Callable, Optional
 import requests
 
 from ..store import Store
+from .http_util import ResponseTooLarge, install_key_redaction, read_json_capped, short_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +116,79 @@ _NOT_FOUND = object()
 # Blockscout v2 page requests always filter for incoming transactions (the
 # ``to`` side) -- we only care who funded ``address``, not what it sent.
 _BLOCKSCOUT_V2_FILTER = {"filter": "to"}
+
+
+# Largest profile-API response body ever buffered (M2). A first-transaction
+# lookup asks for one page of one address's transactions; anything past this
+# is a broken or hostile endpoint, not a bigger answer worth parsing.
+MAX_PROFILE_RESPONSE_BYTES = 8 * 1024 * 1024
+
+# Upper bound on a plausible first-transaction timestamp: 2100-01-01T00:00:00Z
+# (M4). Anything above this -- or at/below zero -- is a third-party bug or an
+# attempt to poison the raters cache, not a real epoch second.
+MAX_PLAUSIBLE_TS = 4102444800
+
+
+def _warn_bad_ts(address: str, value) -> None:
+    """One WARNING for a first-transaction timestamp this pipeline refuses to
+    cache (M4). Both the address and the offending value are attacker-influenced,
+    so both are logged with ``%r``."""
+    logger.warning("rater_profile: implausible first-tx timestamp for %r: %r - leaving address unprofiled",
+                    address, short_for_log(value))
+
+
+def _implausible(ts: Optional[int]) -> bool:
+    """True for a timestamp that must never reach ``Store.upsert_rater``: one
+    negative/zero or past ``MAX_PLAUSIBLE_TS`` wedges every later ``score``/
+    ``report`` run (``robustrep.sybil._validate_meta`` raises on it, and there
+    is no way to un-cache it short of ``fetch --reprofile-raters``)."""
+    return ts is None or ts <= 0 or ts > MAX_PLAUSIBLE_TS
+
+
+def _plausible_ts(value, address: str) -> Optional[int]:
+    """``value`` as epoch seconds, or ``None`` (with one WARNING) if it is
+    unparseable or implausible -- see ``_implausible`` (M4)."""
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        ts = None
+    if _implausible(ts):
+        _warn_bad_ts(address, value)
+        return None
+    return ts
+
+
+def _capped_json(r, address: str, label: str):
+    """Decode a streamed response body, refusing to buffer more than
+    ``MAX_PROFILE_RESPONSE_BYTES`` (M2).
+
+    An oversized body raises ``RuntimeError`` immediately -- the same
+    non-retryable, scrubbed error path both clients already use for a
+    permanent HTTP rejection, naming only the label and the target address so
+    neither the API key nor any body text can reach a log. A body that simply
+    is not JSON still raises ``ValueError``, which callers keep treating as a
+    transient failure."""
+    try:
+        return read_json_capped(r, MAX_PROFILE_RESPONSE_BYTES)
+    except ResponseTooLarge:
+        raise RuntimeError(f"{label} response for {address} exceeds the "
+                           f"{MAX_PROFILE_RESPONSE_BYTES} byte limit") from None
+
+
+def _exhausted(label: str, address: str, last_kind: str, last_status, retries: int):
+    """Raise the terminal error for an address whose every attempt failed.
+
+    ``ValueError`` when the last attempt's body never parsed as JSON,
+    ``RuntimeError`` otherwise (naming the last HTTP status, or ``n/a`` when
+    the failures never produced a response). Shared by both clients so they
+    stay identical in the one respect that matters: the message carries only
+    the source label, the address and a status code -- never the request URL
+    or params (which carry the API key) and never any body text."""
+    if last_kind == "json":
+        raise ValueError(f"non-JSON {label} response for {address}")
+    status_label = last_status if last_status is not None else "n/a"
+    raise RuntimeError(f"{label} HTTP error for {address} after {retries} attempts "
+                        f"(status {status_label})")
 
 
 def _status_code(e: requests.RequestException) -> Optional[int]:
@@ -184,6 +274,9 @@ class EtherscanClient:
                  base_url: str = ETHERSCAN_V2, session=None, rps: float = DEFAULT_RPS,
                  retries: int = 3, sleep: Callable[[float], None] = time.sleep):
         self.key, self.chain_id, self.base_url = api_key, chain_id, base_url
+        # M1: urllib3 logs the full request line (query string, hence the key)
+        # at DEBUG. Install the redaction filter before the first request.
+        install_key_redaction(api_key)
         self.session = session or requests.Session()
         self.retries, self.sleep = retries, sleep
         self.gap = 1.0 / rps
@@ -222,19 +315,16 @@ class EtherscanClient:
         (after retries) a body that never parses as JSON.
         """
         address = address.lower()
-        params = dict(module="account", action="txlist", address=address, page=1, offset=1, sort="asc")
-        if self.chain_id is not None:
-            params["chainid"] = self.chain_id
-        if self.key:
-            params["apikey"] = self.key
+        params = self._params(address)
         last_status: Optional[int] = None
         last_kind = "http"
         for attempt in range(self.retries):
             transient = False
             retry_after: Optional[float] = None
+            r = None
             try:
                 try:
-                    r = self.session.get(self.base_url, params=params, timeout=30)
+                    r = self.session.get(self.base_url, params=params, timeout=30, stream=True)
                     r.raise_for_status()
                 except requests.RequestException as e:
                     code = self._status_code(e)
@@ -245,7 +335,7 @@ class EtherscanClient:
                         retry_after = _retry_after_seconds(e)
                 else:
                     try:
-                        body = r.json()
+                        body = _capped_json(r, address, "Etherscan")
                     except ValueError:
                         transient, last_kind = True, "json"
                     else:
@@ -257,6 +347,10 @@ class EtherscanClient:
                         else:
                             return outcome
             finally:
+                # The body is streamed (M2), so the response must be closed
+                # explicitly -- on every path, including the error ones.
+                if r is not None:
+                    r.close()
                 # Rate-limit throttle: always paid, success or failure, so a
                 # string of errors can't be used to blow past the configured rps.
                 self.sleep(self.gap)
@@ -266,11 +360,19 @@ class EtherscanClient:
                 # exponential backoff, when the server told us how long to wait.
                 self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
 
-        if last_kind == "json":
-            raise ValueError(f"non-JSON Etherscan response for {address}")
-        status_label = last_status if last_status is not None else "n/a"
-        raise RuntimeError(
-            f"Etherscan HTTP error for {address} after {self.retries} attempts (status {status_label})")
+        _exhausted("Etherscan", address, last_kind, last_status, self.retries)
+
+    def _params(self, address: str) -> dict:
+        """Query params for one ``txlist`` lookup. The API key appears here and
+        nowhere else in this class -- it must never reach a log message, an
+        exception's text, or a logged URL (M1; ``http_util.install_key_redaction``
+        covers the one place we do not control, urllib3's own request line)."""
+        params = dict(module="account", action="txlist", address=address, page=1, offset=1, sort="asc")
+        if self.chain_id is not None:
+            params["chainid"] = self.chain_id
+        if self.key:
+            params["apikey"] = self.key
+        return params
 
     def _parse_body(self, body: dict, address: str):
         """Interpret one decoded JSON response body. Returns the ``first_tx``
@@ -313,14 +415,21 @@ class EtherscanClient:
         return _is_transient_http(code)
 
     @staticmethod
-    def _parse_tx(tx: dict, address: str) -> tuple[int, int, str]:
+    def _parse_tx(tx: dict, address: str) -> Optional[tuple[int, int, str]]:
+        """``(block, ts, funder)`` for one Etherscan tx entry, or ``None`` when
+        its ``timeStamp`` is unparseable or implausible (M4 -- see
+        ``_plausible_ts``: refusing the profile keeps a poisoned value out of
+        the raters cache, where it would wedge every later scoring run).
+        Still raises ``ValueError`` for an entry missing the fields every tx
+        has -- that is a malformed response, not a suspect value."""
         try:
             block = int(tx["blockNumber"])
-            ts = int(tx["timeStamp"])
+            raw_ts = tx["timeStamp"]
             frm = str(tx["from"]).lower()
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"malformed Etherscan tx entry for {address}: {e}") from e
-        return block, ts, frm
+        ts = _plausible_ts(raw_ts, address)
+        return None if ts is None else (block, ts, frm)
 
 
 class BlockscoutV2Client:
@@ -402,7 +511,13 @@ class BlockscoutV2Client:
                 if not last_items:
                     return None
                 return self._parse_tx(last_items[-1], address)
-            params = dict(next_params)
+            safe = _safe_next_page_params(next_params, address)
+            if not safe:
+                # Every pagination key the server sent was rejected (L5).
+                # Re-requesting page 1 would loop, and guessing the next page
+                # would risk recording the wrong funder -- so stop here.
+                return None
+            params = dict(safe)
             params.update(_BLOCKSCOUT_V2_FILTER)
 
         logger.debug(
@@ -420,9 +535,10 @@ class BlockscoutV2Client:
         for attempt in range(self.retries):
             transient = False
             retry_after: Optional[float] = None
+            r = None
             try:
                 try:
-                    r = self.session.get(url, params=params, timeout=30)
+                    r = self.session.get(url, params=params, timeout=30, stream=True)
                     r.raise_for_status()
                 except requests.RequestException as e:
                     code = _status_code(e)
@@ -435,7 +551,7 @@ class BlockscoutV2Client:
                         retry_after = _retry_after_seconds(e)
                 else:
                     try:
-                        body = r.json()
+                        body = _capped_json(r, address, "Blockscout")
                     except ValueError:
                         transient, last_kind = True, "json"
                     else:
@@ -443,6 +559,10 @@ class BlockscoutV2Client:
                             raise ValueError(f"Blockscout response is not a JSON object for {address}")
                         return body
             finally:
+                # The body is streamed (M2), so the response must be closed
+                # explicitly -- on every path, including the error ones.
+                if r is not None:
+                    r.close()
                 # Rate-limit throttle: always paid, success or failure, so a
                 # string of errors can't be used to blow past the configured rps.
                 self.sleep(self.gap)
@@ -452,35 +572,75 @@ class BlockscoutV2Client:
                 # exponential backoff, when the server told us how long to wait.
                 self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
 
-        if last_kind == "json":
-            raise ValueError(f"non-JSON Blockscout response for {address}")
-        status_label = last_status if last_status is not None else "n/a"
-        raise RuntimeError(
-            f"Blockscout HTTP error for {address} after {self.retries} attempts (status {status_label})")
+        _exhausted("Blockscout", address, last_kind, last_status, self.retries)
 
     @staticmethod
-    def _parse_tx(tx: dict, address: str) -> tuple[int, int, str]:
+    def _parse_tx(tx: dict, address: str) -> Optional[tuple[int, int, str]]:
+        """``(block, ts, funder)`` for one Blockscout tx entry, or ``None``
+        when its ``timestamp`` is unparseable or implausible (M4 -- see
+        ``_parse_blockscout_timestamp``). Still raises ``ValueError`` for an
+        entry missing the fields every tx has."""
         try:
             block = int(tx["block_number"])
-            ts = _parse_blockscout_timestamp(tx["timestamp"], address)
+            raw_ts = tx["timestamp"]
             frm = str(tx["from"]["hash"]).lower()
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"malformed Blockscout tx entry for {address}: {e}") from e
-        return block, ts, frm
+        ts = _parse_blockscout_timestamp(raw_ts, address)
+        return None if ts is None else (block, ts, frm)
 
 
-def _parse_blockscout_timestamp(ts: str, address: str) -> int:
+# Blockscout pagination keys we are willing to echo back as query parameters.
+# Every real one is a short lowercase snake_case name (``block_number``,
+# ``index``, ``items_count``, ...).
+_NEXT_PAGE_KEY_RE = re.compile(r"^[a-z_]{1,32}$")
+
+
+def _safe_next_page_params(next_params, address: str) -> dict:
+    """The subset of Blockscout's ``next_page_params`` safe to send back (L5).
+
+    The next page request is built from a value the *server* chose, so it is
+    attacker-influenced input to our own outbound request: forwarding it
+    verbatim lets the remote inject arbitrary query parameters (overriding our
+    ``filter=to``, adding keys the endpoint treats specially) and, if the shape
+    is not a flat mapping, hand ``requests`` something it will encode in
+    surprising ways. Only ``^[a-z_]{1,32}$`` keys with scalar ``str``/``int``/
+    ``bool`` values survive; anything else is dropped with a WARNING naming the
+    rejected key (``%r`` -- it is remote text). A non-mapping ``next_params``
+    yields ``{}``, which ``first_tx`` treats as "stop paging"."""
+    if not isinstance(next_params, dict):
+        logger.warning("rater_profile: Blockscout next_page_params for %r is not an object (%s) - "
+                        "not paging further", address, type(next_params).__name__)
+        return {}
+    safe = {}
+    for key, value in next_params.items():
+        if (isinstance(key, str) and _NEXT_PAGE_KEY_RE.match(key)
+                and isinstance(value, (str, int, bool))):
+            safe[key] = value
+        else:
+            logger.warning("rater_profile: dropping unsafe Blockscout pagination key %r for %r",
+                            short_for_log(key), address)
+    return safe
+
+
+def _parse_blockscout_timestamp(ts, address: str) -> Optional[int]:
     """Parse a Blockscout v2 ISO8601 timestamp (e.g.
-    ``"2026-02-22T21:16:19.000000Z"``) into epoch seconds. ``datetime.
-    fromisoformat`` doesn't accept a trailing ``Z`` (replaced with
-    ``+00:00``) and, on Python < 3.11, only accepts a 3- or 6-digit
-    fractional-second component -- so fractional seconds, if any, are
-    stripped rather than relied upon."""
+    ``"2026-02-22T21:16:19.000000Z"``) into epoch seconds, or ``None`` (with
+    one WARNING) if it is unparseable or implausible -- see ``_implausible``
+    (M4). ``datetime.fromisoformat`` doesn't accept a trailing ``Z`` (replaced
+    with ``+00:00``) and, on Python < 3.11, only accepts a 3- or 6-digit
+    fractional-second component -- so fractional seconds, if any, are stripped
+    rather than relied upon."""
     try:
-        s = re.sub(r"\.\d+", "", ts.replace("Z", "+00:00"))
-        return int(datetime.fromisoformat(s).timestamp())
-    except (ValueError, AttributeError, TypeError) as e:
-        raise ValueError(f"malformed Blockscout timestamp for {address}: {e}") from e
+        s = re.sub(r"\.\d+", "", str(ts).replace("Z", "+00:00"))
+        epoch = int(datetime.fromisoformat(s).timestamp())
+    except (ValueError, OverflowError, OSError):
+        _warn_bad_ts(address, ts)
+        return None
+    if _implausible(epoch):
+        _warn_bad_ts(address, ts)
+        return None
+    return epoch
 
 
 def client_from_env() -> Optional[EtherscanClient]:

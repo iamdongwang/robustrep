@@ -378,3 +378,43 @@ def test_stale_schema_guard(tmp_path):
     legacy.close()
     with pytest.raises(ValueError, match="stale"):
         Store(path)
+
+
+# --- M4: clearing the rater-profile cache -------------------------------------------
+
+
+def test_clear_raters_empties_the_table_and_returns_the_row_count(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([FB])
+    s.upsert_rater("0xc", 1_700_000_000, "0xf")
+    s.upsert_rater("0xd", None, None)
+    assert s.clear_raters() == 2
+    assert len(s.load_rater_meta()) == 0
+    # ...and the addresses are up for profiling again.
+    assert s.distinct_clients() == ["0xc"]
+
+
+def test_clear_raters_resets_the_profile_mode(tmp_path):
+    s = Store(tmp_path / "t.db")
+    s.upsert_rater("0xc", 1, None)
+    s.set_sync("rater_profile_mode", "blockscout-partial")
+    s.set_sync("last_block", "123")
+    s.clear_raters()
+    assert s.get_sync("rater_profile_mode") is None
+    assert s.get_sync("last_block") == "123"  # other sync state is untouched
+
+
+def test_clear_raters_on_an_empty_table_returns_zero(tmp_path):
+    s = Store(tmp_path / "t.db")
+    assert s.clear_raters() == 0
+
+
+def test_clear_raters_lets_a_wedging_timestamp_be_reprofiled(tmp_path):
+    # A single implausible cached first_seen_ts wedges score/report (sybil
+    # ._validate_meta raises on it); clear_raters is the escape hatch.
+    s = Store(tmp_path / "t.db")
+    s.upsert_feedback([FB])
+    s.upsert_rater("0xc", -1, "0xf")
+    assert s.distinct_clients() == []
+    s.clear_raters()
+    assert s.distinct_clients() == ["0xc"]

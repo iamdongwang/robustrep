@@ -233,6 +233,26 @@ class Store:
         except sqlite3.IntegrityError as e:
             raise ValueError(f"raters: {e}") from e
 
+    def clear_raters(self) -> int:
+        """Drop every cached rater profile and forget ``rater_profile_mode``;
+        returns the number of rows deleted.
+
+        The escape hatch for a poisoned cache (M4). ``raters`` rows are written
+        once and then never revisited -- ``distinct_clients`` only returns
+        addresses with no row -- so a single bad ``first_seen_ts`` cached from a
+        third-party API is permanent: ``robustrep.sybil._validate_meta`` raises
+        on it, and ``score``/``report`` exit 1 on every later run with no way to
+        recover short of deleting the whole store. Clearing the table puts every
+        address back in ``distinct_clients``, so the next ``fetch`` re-profiles
+        them from scratch. ``rater_profile_mode`` goes with it (the rows it
+        described are gone); no other sync state is touched, so the block
+        checkpoint and failed ranges survive.
+        """
+        with self.conn:
+            deleted = self.conn.execute("DELETE FROM raters").rowcount
+            self.conn.execute("DELETE FROM sync_state WHERE key='rater_profile_mode'")
+        return max(int(deleted), 0)
+
     def upsert_agent_owner(self, agent_id: str, owner: str) -> None:
         """Cache the owner address for an agent id."""
         try:

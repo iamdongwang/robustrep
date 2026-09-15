@@ -1,3 +1,4 @@
+import json as jsonlib
 import threading
 
 import pytest
@@ -6,23 +7,54 @@ import requests
 from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcClient, RpcError
 
 
+class FakeRaw:
+    """Stand-in for ``urllib3.HTTPResponse``: the streamed byte source that
+    ``read_json_capped`` consumes (bodies are capped, never ``r.json()``-ed --
+    M2)."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def read(self, amt, decode_content=True):
+        chunk, self.data = self.data[:amt], self.data[amt:]
+        return chunk
+
+
+class FakeResponse:
+    status_code = 200
+
+    def __init__(self, body: bytes, session=None):
+        self.raw, self._session, self.closed = FakeRaw(body), session, False
+
+    def raise_for_status(self):
+        pass
+
+    def close(self):
+        self.closed = True
+        if self._session is not None:
+            self._session.closes += 1
+
+
 class FakeSession:
+    """Fake ``requests.Session`` whose responses are streamed byte bodies.
+
+    ``responses`` items are decoded JSON objects (serialized here), raw
+    ``bytes`` (for a malformed/oversized body), or an ``Exception`` to raise
+    from ``post`` itself."""
+
     def __init__(self, responses):
         self.responses, self.calls, self.headers = list(responses), [], []
+        self.streams, self.closes = [], 0
 
-    def post(self, url, json=None, headers=None, timeout=None):
+    def post(self, url, json=None, headers=None, timeout=None, stream=None):
         self.calls.append((url, json))
         self.headers.append(headers)
+        self.streams.append(stream)
         r = self.responses.pop(0)
         if isinstance(r, Exception):
             raise r
-        class R:  # minimal response
-            status_code = 200
-            def json(self_inner):
-                return r
-            def raise_for_status(self_inner):
-                pass
-        return R()
+        body = r if isinstance(r, bytes) else jsonlib.dumps(r).encode()
+        return FakeResponse(body, session=self)
 
 
 def test_call_returns_result_and_sets_user_agent():
@@ -169,7 +201,7 @@ def test_gives_up_message_never_includes_raw_exception_text_or_url():
     # request URL, so surfacing str(exc) verbatim would leak it into logs,
     # CLI output, or a bug report. The RpcError message must carry only the
     # exception type and the endpoint's scheme+host -- never the raw text.
-    secret_url = "https://rpc.example.com/v2/SUPER_SECRET"
+    secret_url = "https://rpc.example.com/v2/SUPER_SECRET"  # pragma: allowlist secret
     s = FakeSession([requests.ConnectionError(f"Failed to establish a connection to {secret_url}")] * 2)
     c = RpcClient([secret_url], user_agent="ua", session=s, sleep=lambda _: None, retries=2)
     with pytest.raises(RpcError) as exc_info:
@@ -347,3 +379,81 @@ def test_injected_session_is_shared_across_all_threads():
 
     assert len(seen) == 3
     assert all(s is injected for s in seen)
+
+
+# --- M2: bounded response bodies ----------------------------------------------------
+
+
+def test_post_streams_and_closes_every_response():
+    s = FakeSession([{"result": "ok"}])
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None)
+    assert c.call("m", []) == "ok"
+    assert s.streams == [True]
+    assert s.closes == 1
+
+
+def test_default_max_response_bytes_is_64_mib():
+    c = RpcClient(["http://a"], user_agent="ua", session=FakeSession([]), sleep=lambda _: None)
+    assert c.max_response_bytes == 64 * 1024 * 1024
+
+
+def test_oversized_response_raises_rpcerror():
+    s = FakeSession([b'{"result": "' + b"x" * 5000 + b'"}'])
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None,
+                  max_response_bytes=64)
+    with pytest.raises(RpcError):
+        c.call("m", [])
+
+
+def test_oversized_response_is_not_retried_and_does_not_rotate():
+    # An oversized body is deterministic: retrying (and rotating) would only
+    # burn every configured endpoint for a guaranteed repeat failure.
+    s = FakeSession([b"x" * 5000] * 3)
+    sleeps = []
+    c = RpcClient(["http://a", "http://b"], user_agent="ua", session=s, sleep=sleeps.append,
+                  retries=3, max_response_bytes=64)
+    with pytest.raises(RpcError):
+        c.call("m", [])
+    assert len(s.calls) == 1
+    assert [u for u, _ in s.calls] == ["http://a"]
+    assert sleeps == []
+
+
+def test_oversized_response_error_names_endpoint_not_body_or_url():
+    s = FakeSession([b'{"leaked": "' + b"SUPERSECRETBODY" * 500 + b'"}'])
+    c = RpcClient(["https://user:pw@rpc.example/v2/APIKEYINPATH"], user_agent="ua", session=s,
+                  sleep=lambda _: None, max_response_bytes=64)
+    with pytest.raises(RpcError) as exc:
+        c.call("m", [])
+    msg = str(exc.value)
+    assert "SUPERSECRETBODY" not in msg
+    assert "APIKEYINPATH" not in msg and "pw" not in msg
+    assert "https://rpc.example" in msg
+
+
+def test_oversized_response_is_still_closed():
+    s = FakeSession([b"x" * 5000])
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None,
+                  max_response_bytes=64)
+    with pytest.raises(RpcError):
+        c.call("m", [])
+    assert s.closes == 1
+
+
+def test_non_json_body_is_still_retried():
+    # A truncated/garbage body stays transient (it was `r.json()` raising
+    # ValueError before the cap existed) -- only an oversized one is terminal.
+    s = FakeSession([b"<html>oops</html>", {"result": "ok"}])
+    c = RpcClient(["http://a", "http://b"], user_agent="ua", session=s, sleep=lambda _: None, retries=3)
+    assert c.call("m", []) == "ok"
+    assert len(s.calls) == 2
+
+
+def test_oversized_batch_response_raises_rpcerror_without_retry():
+    s = FakeSession([b"x" * 5000] * 3)
+    sleeps = []
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=sleeps.append, retries=3,
+                  max_response_bytes=64)
+    with pytest.raises(RpcError):
+        c.batch([("m", [1])])
+    assert len(s.calls) == 1 and sleeps == []

@@ -243,6 +243,40 @@ def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
             f"(max_lookups_per_uri={max_lookups_per_uri}, max_total_lookups={max_total_lookups})")
 
 
+def _run_raters_step(store: Store, *, skip_raters: bool, reprofile_raters: bool,
+                      etherscan_key: Optional[str], profile_source: str,
+                      profile_rps: Optional[float], profile_retries: Optional[int]) -> bool:
+    """Run (or skip) the rater-profiling step of ``fetch`` and echo its summary
+    line. Returns ``True`` when profiling partially failed -- some addresses
+    errored while every other step completed -- which ``fetch`` turns into exit
+    code 2. Raises ``typer.Exit(1)`` for a configuration error (see
+    ``_step_raters``).
+
+    ``reprofile_raters`` clears the cached profiles first, and deliberately
+    only inside the profiling branch: clearing without then re-profiling would
+    leave the store with no rater profiles at all, which is worse than the one
+    bad row it was meant to get rid of (M4, see ``Store.clear_raters``).
+    """
+    if skip_raters:
+        mode = store.get_sync("rater_profile_mode") or "unknown"
+        typer.echo(f"raters profiling skipped; rater profile mode: {mode}")
+        return False
+    if reprofile_raters:
+        n_cleared = store.clear_raters()
+        logger.info("fetch: cleared %d cached rater profile(s) before re-profiling", n_cleared)
+        typer.echo(f"rater profiles cleared: {n_cleared}")
+    try:
+        typer.echo(_step_raters(store, etherscan_key, profile_source=profile_source,
+                                profile_rps=profile_rps, profile_retries=profile_retries))
+    except ValueError as e:
+        typer.echo(f"ERROR: {e}")
+        raise typer.Exit(1)
+    except RuntimeError as e:
+        typer.echo(f"WARNING: {e}")
+        return True
+    return False
+
+
 @app.command()
 def fetch(
     db: Path = typer.Option(..., help="SQLite store path."),
@@ -262,6 +296,11 @@ def fetch(
         OWNER_BATCH_DEFAULT, "--owner-batch", min=1,
         help="Agents resolved per JSON-RPC batch call for owner resolution (1 = one call per agent)."),
     skip_raters: bool = typer.Option(False, "--skip-raters", help="Skip rater profile enrichment."),
+    reprofile_raters: bool = typer.Option(
+        False, "--reprofile-raters",
+        help="Clear every cached rater profile before profiling, so all raters are looked up again. "
+             "Use this to recover from a bad cached first-seen timestamp, which otherwise makes "
+             "score/report fail on every run. Ignored together with --skip-raters."),
     profile_source: ProfileSource = typer.Option(
         ProfileSource.auto, "--profile-source",
         help="Rater-profile HTTP source: 'auto' (default) uses Blockscout (free, no key) unless an "
@@ -285,6 +324,10 @@ def fetch(
 ) -> None:
     """Sync Base ERC-8004 feedback, block timestamps, agent owners, rater
     profiles and evidence levels into the SQLite store at --db.
+
+    --reprofile-raters clears the cached rater profiles first, so every rater
+    is looked up again -- the way out of a cached implausible first-seen
+    timestamp, which otherwise fails score/report on every run.
 
     Exits 0 on full success; 1 for a bad-input error (an invalid option
     combination that Config itself rejects, or --profile-source etherscan
@@ -313,7 +356,6 @@ def fetch(
         raise typer.Exit(1)
 
     rpc = RpcClient(cfg.rpc_urls, user_agent=cfg.user_agent)
-    partial_failure = False
     # Shared across every batch-capable step of this run: once one step's
     # batch calls are found to fail structurally (or get batch-rate-limited),
     # every later step also skips straight to per-item calls instead of
@@ -329,19 +371,10 @@ def fetch(
             else:
                 typer.echo(_step_owners(store, rpc, batch_size=owner_batch, batch_state=batch_state))
 
-        if skip_raters:
-            mode = store.get_sync("rater_profile_mode") or "unknown"
-            typer.echo(f"raters profiling skipped; rater profile mode: {mode}")
-        else:
-            try:
-                typer.echo(_step_raters(store, etherscan_key, profile_source=profile_source,
-                                        profile_rps=profile_rps, profile_retries=profile_retries))
-            except ValueError as e:
-                typer.echo(f"ERROR: {e}")
-                raise typer.Exit(1)
-            except RuntimeError as e:
-                typer.echo(f"WARNING: {e}")
-                partial_failure = True
+        partial_failure = _run_raters_step(
+            store, skip_raters=skip_raters, reprofile_raters=reprofile_raters,
+            etherscan_key=etherscan_key, profile_source=profile_source,
+            profile_rps=profile_rps, profile_retries=profile_retries)
 
         with _rpc_guard():
             if skip_evidence:

@@ -16,6 +16,17 @@ freshly-computed ranges can be processed in either order, the checkpoint is
 advanced with ``max(current, chunk_end)`` rather than a plain overwrite, so
 retrying an old failed range can never rewind the cursor.
 
+Every field of a log is attacker-influenced (anyone can emit an event from any
+contract, and a node could serve a hand-written one), so ``decode_log`` validates
+the shape of each topic and of the data blob before decoding (security review
+finding L4) and *skips* a log whose shape is wrong -- returning ``None`` with one
+WARNING, exactly like an unrecognized topic0 -- rather than raising. Raising would
+be a new crash path reachable by anyone willing to emit a malformed log: see the
+"a failure there is a *bug*" paragraph below, which would turn one hostile log
+into an aborted sync. The pre-existing structural checks (missing log fields,
+empty topics, wrong topic count for a recognized event) keep raising ``ValueError``
+-- that contract predates this and callers rely on it.
+
 Decoding/applying a fetched chunk's logs is a different story: a failure there
 (e.g. a log that doesn't match the ABI we expect) is a *bug*, not a transient
 condition, so it is logged at ERROR and re-raised rather than swallowed. To stay
@@ -29,6 +40,7 @@ no range is ever silently lost to a crash.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from eth_abi import decode
@@ -36,6 +48,7 @@ from eth_hash.auto import keccak
 
 from ..config import DEFAULT_CONFIRMATIONS
 from ..store import Store
+from .http_util import short_for_log as _short
 from .rpc import RpcBatchUnsupportedError, RpcError
 
 logger = logging.getLogger(__name__)
@@ -68,8 +81,26 @@ _EVENT_TOPIC_COUNT = {
 }
 
 
+# A 32-byte log topic, and the address derived from one (L4).
+_TOPIC_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+_ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
+# An ABI data blob: "0x" plus a whole number of hex-encoded bytes.
+_DATA_RE = re.compile(r"^0x(?:[0-9a-fA-F]{2})*$")
+
+
 def _addr(topic: str) -> str:
-    return "0x" + topic[-40:].lower()
+    """The 20-byte address encoded in the low bytes of a 32-byte ``topic``.
+
+    Raises ``ValueError`` if the result is not a canonical ``0x``-prefixed
+    lowercase hex address (L4): slicing the last 40 characters of a too-short
+    or non-hex topic would otherwise yield a plausible-looking string that is
+    not an address at all, and it would be stored as a rater/responder identity.
+    ``decode_log`` validates topics up front, so this is the second line of
+    defense -- and the first one for any other caller."""
+    addr = "0x" + str(topic)[-40:].lower()
+    if not _ADDR_RE.match(addr):
+        raise ValueError(f"not a valid address topic: {_short(topic)!r}")
+    return addr
 
 
 def _uint(topic: str) -> int:
@@ -83,6 +114,23 @@ def _hexint(v) -> int:
     return v if isinstance(v, int) else int(v, 16)
 
 
+def _valid_shape(name: str, topics: list, data_hex, tx_hash) -> bool:
+    """True when every topic is a 32-byte hex string and ``data_hex`` is a hex
+    byte string (L4). A mismatch logs one WARNING -- with every remote-chosen
+    value rendered via ``%r`` and length-bounded by ``_short`` -- and the caller
+    skips the log."""
+    for i, topic in enumerate(topics):
+        if not isinstance(topic, str) or not _TOPIC_RE.match(topic):
+            logger.warning("decode_log: skipping %s log in tx %r: topic %d is not a 32-byte hex "
+                            "string: %r", name, _short(tx_hash), i, _short(topic))
+            return False
+    if not isinstance(data_hex, str) or not _DATA_RE.match(data_hex):
+        logger.warning("decode_log: skipping %s log in tx %r: data is not a hex byte string: %r",
+                        name, _short(tx_hash), _short(data_hex))
+        return False
+    return True
+
+
 def decode_log(log: dict) -> Optional[dict]:
     """Decode one ``eth_getLogs`` entry from the ReputationRegistry.
 
@@ -90,6 +138,13 @@ def decode_log(log: dict) -> Optional[dict]:
     ``"response"`` (plus the event's fields and the base ``chain``/``block``/
     ``tx_hash``/``log_index`` fields), or ``None`` if ``log``'s ``topics[0]``
     does not match any known event.
+
+    Also returns ``None`` -- logging one WARNING -- for a recognized event whose
+    *shape* is wrong: a topic that is not ``0x`` plus 64 hex characters, or a
+    ``data`` field that is not ``0x`` plus whole hex bytes (L4). These fields
+    come from whoever emitted the event, so a malformed one must be skipped like
+    any uninteresting log, not turned into an exception that aborts the caller's
+    whole sync (see the module docstring).
 
     Raises ``ValueError`` (naming the problem, never a bare ``IndexError`` or
     ABI-decode error) if: ``log`` lacks one of the four fields every log is
@@ -103,15 +158,18 @@ def decode_log(log: dict) -> Optional[dict]:
     topics = log["topics"]
     if not topics:
         raise ValueError("decode_log: log has empty topics (expected topic0)")
-    t0 = topics[0].lower()
+    t0 = topics[0].lower() if isinstance(topics[0], str) else None
     if t0 not in _EVENT_TOPIC_COUNT:
         return None
     name, want = _EVENT_TOPIC_COUNT[t0]
     if len(topics) != want:
         raise ValueError(f"decode_log: {name} log has {len(topics)} topics, expected {want}")
+    data_hex = log.get("data", "0x")
+    if not _valid_shape(name, topics, data_hex, log.get("transactionHash")):
+        return None
     base = dict(chain=CHAIN, block=_hexint(log["blockNumber"]), tx_hash=log["transactionHash"],
                 log_index=_hexint(log["logIndex"]))
-    data = bytes.fromhex(log["data"][2:]) if log.get("data", "0x") != "0x" else b""
+    data = bytes.fromhex(data_hex[2:]) if data_hex != "0x" else b""
     if t0 == TOPIC_NEW_FEEDBACK:
         fi, val, dec, tag1, tag2, endpoint, uri, h = decode(FEEDBACK_TYPES, data)
         return {**base, "kind": "feedback", "agent_id": str(_uint(topics[1])), "client": _addr(topics[2]),
@@ -293,10 +351,49 @@ def fill_block_timestamps(store: Store, rpc, batch_size: int = 100, state: Optio
     return len(missing)
 
 
+# uint256 upper bound: an agent id at or past this cannot be ABI-encoded.
+_UINT256_LIMIT = 2 ** 256
+
+
 def _owner_call_data(agent_id: str) -> str:
     """``eth_call`` calldata for ``ownerOf(uint256 agent_id)`` on the
-    IdentityRegistry -- the 4-byte selector plus the id left-padded to 32 bytes."""
-    return _OWNER_OF_SELECTOR + int(agent_id).to_bytes(32, "big").hex()
+    IdentityRegistry -- the 4-byte selector plus the id left-padded to 32 bytes.
+
+    Raises ``ValueError`` if ``agent_id`` is not a decimal integer in
+    ``[0, 2**256)`` (L4). Agent ids reach here from the store, which is filled
+    from log topics, so a bad one is remote input: without this check
+    ``int(agent_id)`` raises ``ValueError`` on a non-decimal id and
+    ``.to_bytes(32, "big")`` raises ``OverflowError`` on an over-long one --
+    neither of which the callers below (which handle only ``RpcError``) expect.
+    """
+    try:
+        value = int(agent_id)
+    except (TypeError, ValueError):
+        raise ValueError(f"agent id is not a decimal integer: {_short(agent_id)!r}") from None
+    if not 0 <= value < _UINT256_LIMIT:
+        raise ValueError(f"agent id out of uint256 range: {_short(agent_id)!r}")
+    return _OWNER_OF_SELECTOR + value.to_bytes(32, "big").hex()
+
+
+def _owner_calls(agent_ids: list[str]) -> tuple[list[str], list, list[str]]:
+    """Split ``agent_ids`` into ``(ok_ids, batch_calls, skipped_ids)``.
+
+    An id ``_owner_call_data`` rejects is skipped with one WARNING rather than
+    raising: it would fail identically on every retry, and one unusable id in a
+    100-id chunk must not cost the other 99 their owner lookup (L4)."""
+    ok_ids: list[str] = []
+    calls: list = []
+    skipped: list[str] = []
+    for agent_id in agent_ids:
+        try:
+            data = _owner_call_data(agent_id)
+        except ValueError as e:
+            logger.warning("owners_of: skipping agent id %r: %s", _short(agent_id), e)
+            skipped.append(agent_id)
+            continue
+        ok_ids.append(agent_id)
+        calls.append(("eth_call", [{"to": IDENTITY_REGISTRY, "data": data}, "latest"]))
+    return ok_ids, calls, skipped
 
 
 def _decode_owner_result(out) -> Optional[str]:
@@ -319,8 +416,15 @@ def owner_of(rpc, agent_id: str) -> Optional[str]:
     a nonexistent token reverts rather than returning zero on most ERC-721
     implementations; logged at DEBUG). Any other ``RpcError`` (network failure,
     rate limit, ...) propagates rather than being mistaken for "no owner".
+
+    An ``agent_id`` that cannot be ABI-encoded at all (see ``_owner_call_data``)
+    is also ``None``, logged once at WARNING: no RPC call is made for it (L4).
     """
-    data = _owner_call_data(agent_id)
+    try:
+        data = _owner_call_data(agent_id)
+    except ValueError as e:
+        logger.warning("owner_of: skipping agent id %r: %s", _short(agent_id), e)
+        return None
     try:
         out = rpc.call("eth_call", [{"to": IDENTITY_REGISTRY, "data": data}, "latest"])
     except RpcError as e:
@@ -356,6 +460,10 @@ def owners_of(rpc, agent_ids: list[str], batch_size: int = 100,
     multiple calls too (e.g. one per chunk, as ``robustrep.cli._step_owners``
     does). Returns a dict covering every id in ``agent_ids``, regardless of
     which chunks needed the fallback.
+
+    An id that cannot be ABI-encoded (see ``_owner_call_data``) maps to ``None``
+    and never enters a batch, so one unusable id cannot cost its chunk-mates
+    their lookup (L4).
     """
     state = state or BatchState()
     result: dict[str, Optional[str]] = {}
@@ -366,15 +474,19 @@ def owners_of(rpc, agent_ids: list[str], batch_size: int = 100,
             for a in chunk:
                 result[a] = owner_of(rpc, a)
             continue
-        calls = [("eth_call", [{"to": IDENTITY_REGISTRY, "data": _owner_call_data(a)}, "latest"]) for a in chunk]
+        ok_ids, calls, skipped = _owner_calls(chunk)
+        for a in skipped:
+            result[a] = None
+        if not calls:
+            continue
         try:
             outs = rpc.batch(calls)
         except RpcError as e:
             _warn_batch_fallback("owners_of", e, state)
-            for a in chunk:
+            for a in ok_ids:
                 result[a] = owner_of(rpc, a)
             continue
-        for a, out in zip(chunk, outs):
+        for a, out in zip(ok_ids, outs):
             result[a] = _decode_owner_result(out)
     return result
 
