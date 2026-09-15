@@ -30,11 +30,11 @@ note ``"lookup-budget:N"`` (``N`` = how many times, including this one, it
 has been starved) instead of an ordinary result, and
 ``Store.pending_uris(include_notes=_RETRYABLE_LOOKUP_BUDGET_NOTES)`` (used by
 ``classify_all`` itself) treats it as still pending -- but only while
-``N < MAX_LOOKUP_RETRIES`` (default 3): a retry re-fetches the URI's whole
+``N < MAX_LOOKUP_ATTEMPTS`` (default 3): a retry re-fetches the URI's whole
 text, so retrying forever would let a persistently-starved backlog amplify
-every future run's fetch volume without bound. After that many starved
-attempts, the last cached (possibly false-negative) level is accepted as
-final.
+every future run's fetch volume without bound. Once a URI has been starved
+``MAX_LOOKUP_ATTEMPTS`` times, its last cached (possibly false-negative)
+level is accepted as final.
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ from typing import Callable, Optional
 
 import requests
 
-from ..evidence import classify
+from ..evidence import MAX_TX_LOOKUPS_PER_URI, classify
 from ..store import Store
 from .evidence_fetch import http_fetch_text
 
@@ -57,15 +57,22 @@ DEFAULT_MAX_TOTAL_LOOKUPS = 20_000
 # `_classify_uri`'s "lookup-budget:N" note), so it is retried -- but a retry
 # re-fetches the URI's whole text (the expensive part) to resolve at most a
 # few more lookups, so retrying forever would let one persistently-starved
-# backlog amplify every future run's fetch volume without bound. A URI is
-# retried at most `MAX_LOOKUP_RETRIES - 1` times (i.e. while its starved
-# attempt count is < this) before its last cached (possibly false-negative)
-# result is accepted as final.
-MAX_LOOKUP_RETRIES = 3
-# The exact "lookup-budget:N" note values `classify_all` treats as pending --
-# passed to `Store.pending_uris(include_notes=...)` as literal, parameterized
-# values (no SQL LIKE/prefix matching needed).
-_RETRYABLE_LOOKUP_BUDGET_NOTES = tuple(f"lookup-budget:{n}" for n in range(1, MAX_LOOKUP_RETRIES))
+# backlog amplify every future run's fetch volume without bound. This counts
+# *attempts*, not retries: a URI is classified under a starved budget at most
+# this many times (it is re-queued while its starved attempt count is below
+# it) before its last cached (possibly false-negative) result is accepted as
+# final.
+MAX_LOOKUP_ATTEMPTS = 3
+# The exact note values `classify_all` treats as pending -- passed to
+# `Store.pending_uris(include_notes=...)` as literal, parameterized values (no
+# SQL LIKE/prefix matching needed). The bare "lookup-budget" is the note
+# 7f391ef briefly wrote before the ":N" attempt counter existed; a store
+# written by that build still deserves its remaining attempts, and
+# `_lookup_budget_attempts` reads it as attempt 1.
+_LEGACY_LOOKUP_BUDGET_NOTE = "lookup-budget"
+_RETRYABLE_LOOKUP_BUDGET_NOTES = (
+    (_LEGACY_LOOKUP_BUDGET_NOTE,)
+    + tuple(f"lookup-budget:{n}" for n in range(1, MAX_LOOKUP_ATTEMPTS)))
 
 _log = logging.getLogger(__name__)
 
@@ -73,18 +80,28 @@ _log = logging.getLogger(__name__)
 def _lookup_budget_attempts(prior_note: Optional[str]) -> int:
     """The starved-attempt count ``N`` encoded in a ``"lookup-budget:N"``
     note, or 0 for anything else (never cached, a normal result, or another
-    note entirely) -- the starting point for the next attempt's count."""
+    note entirely) -- the starting point for the next attempt's count.
+
+    The bare ``"lookup-budget"`` (7f391ef, before the counter existed) reads
+    as 1: that build had already starved the URI once.
+    """
+    if prior_note == _LEGACY_LOOKUP_BUDGET_NOTE:
+        return 1
     if prior_note and prior_note.startswith("lookup-budget:"):
         try:
             return int(prior_note.split(":", 1)[1])
         except ValueError:
+            # A malformed count parses to 0 deliberately: an unreadable note
+            # gives the URI its full attempt budget back rather than pinning
+            # it at an arbitrary number (or aborting the whole batch).
             return 0
     return 0
 
 
 def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Callable, session,
                   was_starved: Optional[Callable[[], bool]] = None,
-                  prior_note: Optional[str] = None) -> tuple[int, str]:
+                  prior_note: Optional[str] = None,
+                  max_lookups: int = MAX_TX_LOOKUPS_PER_URI) -> tuple[int, str]:
     """Classify one URI, returning ``(level, note)``.
 
     ``note`` is ``"unfetchable"`` when ``fetch_text`` returned ``None`` (the
@@ -98,7 +115,7 @@ def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Call
     list -- the returned level may be a false negative (a verifying hash
     could have sat past the point the budget cut off at), so it is persisted
     as retryable rather than as an ordinary final result (see
-    ``Store.pending_uris``, ``MAX_LOOKUP_RETRIES``). ``N`` is
+    ``Store.pending_uris``, ``MAX_LOOKUP_ATTEMPTS``). ``N`` is
     ``_lookup_budget_attempts(prior_note) + 1`` -- how many times, including
     this one, the URI has now been starved; ``""`` for a normal, fully-
     checked result.
@@ -111,6 +128,10 @@ def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Call
 
     ``prior_note`` is this URI's note from its last cache entry, if any (as
     returned by ``Store.pending_uris``), used only to compute ``N`` above.
+
+    ``max_lookups`` is passed straight through to ``classify`` -- the per-URI
+    tx-hash cap, which the caller owns so that the value a run used can be
+    reported and published alongside the levels it produced.
     """
     fetched_none = False
 
@@ -125,7 +146,7 @@ def _classify_uri(uri: str, parties: set, fetch_text: Callable, tx_parties: Call
         was_starved()
 
     try:
-        level = classify(uri, _fetch, tx_parties, parties)
+        level = classify(uri, _fetch, tx_parties, parties, max_lookups=max_lookups)
     except Exception:
         _log.error("classify_all: classify failed for %r", uri, exc_info=True)
         if was_starved is not None:
@@ -244,7 +265,8 @@ class _LookupBudget:
 def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
                   tx_parties: Callable[[str], Optional[set]] = lambda h: None,
                   log_every: int = 500, workers: int = 8,
-                  max_total_lookups: int = DEFAULT_MAX_TOTAL_LOOKUPS) -> int:
+                  max_total_lookups: int = DEFAULT_MAX_TOTAL_LOOKUPS,
+                  max_lookups_per_uri: int = MAX_TX_LOOKUPS_PER_URI) -> int:
     """Classify every distinct URI referenced by ``feedback`` that is not yet in
     the evidence cache, and persist each result via ``store.upsert_evidence``.
 
@@ -286,16 +308,23 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
     budget, so a URI that was starved is not starved forever. A retry is not
     free, though: it re-fetches the URI's whole text (the actually expensive
     part; the RPC lookups it unlocks are comparatively cheap), so a URI is
-    retried at most ``MAX_LOOKUP_RETRIES - 1`` times before its last cached
-    result -- a possible false negative -- is accepted as final, bounding how
-    much a persistently-starved backlog can inflate a run's fetch volume.
+    classified under a starved budget at most ``MAX_LOOKUP_ATTEMPTS`` times
+    before its last cached result -- a possible false negative -- is accepted
+    as final, bounding how much a persistently-starved backlog can inflate a
+    run's fetch volume.
+
+    ``max_lookups_per_uri`` is ``robustrep.evidence.classify``'s per-URI
+    tx-hash cap, taken as a parameter (rather than left to ``classify``'s own
+    default) so a caller can report the value the run actually used next to
+    the levels it produced -- see ``cli._step_evidence``.
 
     Returns the number of URIs processed.
     """
-    # A "lookup-budget:N" note with N < MAX_LOOKUP_RETRIES is retried (see
-    # Store.pending_uris, MAX_LOOKUP_RETRIES); a URI cached with any other
-    # note (a normal result, "unfetchable", "fetch-error", or a
-    # "lookup-budget:N" that has hit the retry cap) is not retried here.
+    # A "lookup-budget:N" note with N < MAX_LOOKUP_ATTEMPTS (and the legacy
+    # bare "lookup-budget", read as N=1) is retried (see Store.pending_uris,
+    # MAX_LOOKUP_ATTEMPTS); a URI cached with any other note (a normal result,
+    # "unfetchable", "fetch-error", or a "lookup-budget:N" that has used up
+    # its attempts) is not retried here.
     rows = store.pending_uris(include_notes=_RETRYABLE_LOOKUP_BUDGET_NOTES)
 
     budget = _LookupBudget(max_total_lookups)
@@ -317,7 +346,7 @@ def classify_all(store: Store, fetch_text: Callable = http_fetch_text,
     def _classify_one(uri: str, parties: set, prior_note: Optional[str]):
         session = _thread_session()
         return _classify_uri(uri, parties, fetch_text, budgeted_tx_parties, session,
-                              was_starved, prior_note)
+                              was_starved, prior_note, max_lookups=max_lookups_per_uri)
 
     processed = 0
     try:

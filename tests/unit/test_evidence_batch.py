@@ -375,7 +375,7 @@ def test_classify_all_starved_uri_is_retryable_and_upgrades_on_retry(tmp_path):
 
 def test_classify_all_lookup_budget_retries_are_bounded(tmp_path):
     # A URI that is starved on every attempt must stop being retried once it
-    # has been starved MAX_LOOKUP_RETRIES times -- otherwise a persistently
+    # has been starved MAX_LOOKUP_ATTEMPTS times -- otherwise a persistently
     # starved backlog would re-fetch its (expensive) text forever for no
     # further progress.
     s = Store(tmp_path / "tretrycap.db")
@@ -390,7 +390,7 @@ def test_classify_all_lookup_budget_retries_are_bounded(tmp_path):
     s.upsert_feedback([_fb("https://always-starved")])
 
     notes = []
-    for _ in range(eb.MAX_LOOKUP_RETRIES + 2):
+    for _ in range(eb.MAX_LOOKUP_ATTEMPTS + 2):
         n = classify_all(s, fetch_text=fetch, tx_parties=tx_parties,
                           max_total_lookups=1, workers=1)
         if n == 0:
@@ -399,10 +399,11 @@ def test_classify_all_lookup_budget_retries_are_bounded(tmp_path):
             "SELECT note FROM evidence_cache WHERE uri='https://always-starved'").fetchone()[0]
         notes.append(note)
 
-    # It was retried MAX_LOOKUP_RETRIES - 1 times (attempt counts 1 through
-    # MAX_LOOKUP_RETRIES), then stopped being pending -- classify_all found
-    # nothing left to do on the attempt right after hitting the cap.
-    assert notes == [f"lookup-budget:{n}" for n in range(1, eb.MAX_LOOKUP_RETRIES + 1)]
+    # It was classified under a starved budget MAX_LOOKUP_ATTEMPTS times
+    # (attempt counts 1 through MAX_LOOKUP_ATTEMPTS), then stopped being
+    # pending -- classify_all found nothing left to do on the run right after
+    # the last attempt.
+    assert notes == [f"lookup-budget:{n}" for n in range(1, eb.MAX_LOOKUP_ATTEMPTS + 1)]
     assert classify_all(s, fetch_text=fetch, tx_parties=tx_parties, max_total_lookups=1, workers=1) == 0
 
 
@@ -430,3 +431,75 @@ def test_classify_all_each_worker_thread_gets_its_own_session(tmp_path):
     if len(by_thread) > 1:
         session_ids_by_thread = [next(iter(sids)) for sids in by_thread.values()]
         assert len(set(session_ids_by_thread)) == len(by_thread)
+
+
+# --- legacy bare "lookup-budget" note, per-URI cap threading ------------------
+
+
+def test_lookup_budget_attempts_reads_the_note_or_falls_back_to_zero():
+    assert eb._lookup_budget_attempts("lookup-budget:2") == 2
+    # 7f391ef's bare note counts as the first starved attempt.
+    assert eb._lookup_budget_attempts("lookup-budget") == 1
+    # Anything else -- never cached, an ordinary result, another note, or a
+    # malformed count -- starts the next attempt at 1.
+    assert eb._lookup_budget_attempts(None) == 0
+    assert eb._lookup_budget_attempts("") == 0
+    assert eb._lookup_budget_attempts("unfetchable") == 0
+    assert eb._lookup_budget_attempts("lookup-budget:not-a-number") == 0
+
+
+def test_classify_all_retries_a_legacy_bare_lookup_budget_note(tmp_path):
+    s = Store(tmp_path / "tlegacy.db")
+    s.upsert_feedback([_fb("https://legacy")])
+    s.upsert_evidence("https://legacy", 2, "lookup-budget")
+
+    def fetch(uri, session=None):
+        return f"see {TX}"
+
+    # Starved again (budget 0): the bare note counted as attempt 1, so this
+    # attempt is recorded as 2 rather than restarting the count.
+    n = classify_all(s, fetch_text=fetch, tx_parties=lambda h: None,
+                     max_total_lookups=0, workers=1)
+    assert n == 1
+    note = s.conn.execute(
+        "SELECT note FROM evidence_cache WHERE uri='https://legacy'").fetchone()[0]
+    assert note == "lookup-budget:2"
+
+
+def test_classify_all_max_lookups_per_uri_reaches_classify(tmp_path):
+    # The per-URI cap is a classify_all parameter, not just classify's own
+    # default, so the CLI can pass (and then publish) the value it used.
+    s = Store(tmp_path / "tperuri.db")
+    s.upsert_feedback([_fb("https://many")])
+    hashes = ["0x" + f"{i:064x}" for i in range(5)]
+    looked_up = []
+
+    def fetch(uri, session=None):
+        return " ".join(hashes)
+
+    def tx_parties(h):
+        looked_up.append(h)
+        return None
+
+    classify_all(s, fetch_text=fetch, tx_parties=tx_parties, workers=1,
+                 max_lookups_per_uri=2)
+    assert len(looked_up) == 2
+
+
+def test_classify_all_max_lookups_per_uri_defaults_to_the_module_constant(tmp_path):
+    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
+
+    s = Store(tmp_path / "tperuridef.db")
+    s.upsert_feedback([_fb("https://many")])
+    hashes = ["0x" + f"{i:064x}" for i in range(MAX_TX_LOOKUPS_PER_URI + 3)]
+    looked_up = []
+
+    def fetch(uri, session=None):
+        return " ".join(hashes)
+
+    def tx_parties(h):
+        looked_up.append(h)
+        return None
+
+    classify_all(s, fetch_text=fetch, tx_parties=tx_parties, workers=1)
+    assert len(looked_up) == MAX_TX_LOOKUPS_PER_URI

@@ -212,12 +212,16 @@ class Store:
         ``evidence_lookup_starved_uris``) so a report is auditable against
         how many of its cached evidence levels are still, as of that run,
         possibly under-checked -- whether because a later ``fetch`` run
-        hasn't retried them yet, or because they hit the retry cap
-        (``evidence_batch.MAX_LOOKUP_RETRIES``) and are no longer retried at
+        hasn't retried them yet, or because they have used up their attempts
+        (``evidence_batch.MAX_LOOKUP_ATTEMPTS``) and are no longer retried at
         all.
+
+        The pattern is ``'lookup-budget%'``, not ``'lookup-budget:%'``: commit
+        7f391ef briefly wrote the bare note ``"lookup-budget"`` with no
+        counter, and a store written by that build must not read as clean.
         """
         r = self.conn.execute(
-            "SELECT COUNT(*) FROM evidence_cache WHERE note LIKE 'lookup-budget:%'").fetchone()
+            "SELECT COUNT(*) FROM evidence_cache WHERE note LIKE 'lookup-budget%'").fetchone()
         return int(r[0])
 
     def evidence_level(self, uri: str) -> Optional[int]:
@@ -341,7 +345,7 @@ class Store:
 
         A URI is pending when it has never been cached, OR when it *is*
         cached but with a note in ``include_notes`` -- e.g. a
-        ``"lookup-budget:N"`` set (see ``evidence_batch.MAX_LOOKUP_RETRIES``,
+        ``"lookup-budget:N"`` set (see ``evidence_batch.MAX_LOOKUP_ATTEMPTS``,
         ``_RETRYABLE_LOOKUP_BUDGET_NOTES``) to retry URIs whose tx-hash
         verification was cut short by ``classify_all``'s shared per-run
         lookup budget (H3): such a cached level may be a false negative (a

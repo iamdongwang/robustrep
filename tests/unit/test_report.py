@@ -577,3 +577,65 @@ def test_export_json_cluster_stats_defaults_to_empty(tmp_path, records_factory):
     rec, sc = _data(records_factory)
     p = export_json(sc, block=1, out=tmp_path / "scores.json")
     assert json.loads(p.read_text())["cluster_stats"] == {}
+
+
+# --- published JSON: no address may ever leak; full provenance versions ------
+
+
+def test_export_json_refuses_to_publish_an_address(tmp_path, records_factory):
+    # scores.json is served publicly. Today no column carries a 0x address,
+    # but a future explain-style field could; the guard fails the export
+    # loudly rather than publishing one.
+    rec, sc = _data(records_factory)
+    sc = sc.copy()
+    sc.loc[0, "ratee"] = "0x" + "ab" * 20
+    with pytest.raises(ValueError) as e:
+        export_json(sc, block=1, out=tmp_path / "scores.json")
+    assert "address" in str(e.value)
+    # The message must not itself repeat the address it refused.
+    assert "0x" not in str(e.value)
+
+
+def test_export_json_allows_a_tx_hash_length_hex_string(tmp_path, records_factory):
+    # The guard targets 40-hex addresses specifically: a 64-hex tx hash is not
+    # an address and must not trip it.
+    rec, sc = _data(records_factory)
+    sc = sc.copy()
+    sc.loc[0, "ratee"] = "0x" + "cd" * 32
+    p = export_json(sc, block=1, out=tmp_path / "scores.json")
+    assert json.loads(p.read_text())["block"] == 1
+
+
+def test_export_json_versions_cover_every_output_affecting_dependency(tmp_path, records_factory):
+    rec, sc = _data(records_factory)
+    p = export_json(sc, block=1, out=tmp_path / "scores.json")
+    versions = json.loads(p.read_text())["versions"]
+    assert set(versions) == {"robustrep", "python", "numpy", "pandas", "matplotlib",
+                             "requests", "urllib3", "eth_abi"}
+    assert all(isinstance(v, str) and v for v in versions.values())
+
+
+# --- Limitations wording (security review) -----------------------------------
+
+
+def test_render_markdown_limitations_state_the_unique_tag_gaming_vector(records_factory):
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=pd.DataFrame(
+        [dict(variant="base", spearman_top=1.0)]))
+    bullet = next(line for line in md.splitlines() if "Unique-tag gaming" in line)
+    for phrase in ("tag1", "normalization group", "1.0", "binary", "evidence mass"):
+        assert phrase in bullet, phrase
+
+
+def test_render_markdown_ssrf_bullet_states_the_oracle_not_a_blind_request(records_factory):
+    # The old bullet claimed "no response content is ever exposed", which is
+    # wrong: classify consumes the fetched text, so a bypass is a four-state
+    # oracle. Keep this bullet consistent with evidence_fetch's docstring.
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=pd.DataFrame(
+        [dict(variant="base", spearman_top=1.0)]))
+    bullet = next(line for line in md.splitlines() if "DNS rebinding" in line)
+    for phrase in ("four-state oracle", "not a blind request", "parser", "allowlist",
+                   "rebuilt", "robustrep.sources.evidence_fetch"):
+        assert phrase in bullet, phrase
+    assert "No response content is ever exposed" not in md

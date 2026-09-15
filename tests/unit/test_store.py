@@ -418,3 +418,15 @@ def test_clear_raters_lets_a_wedging_timestamp_be_reprofiled(tmp_path):
     assert s.distinct_clients() == []
     s.clear_raters()
     assert s.distinct_clients() == ["0xc"]
+
+
+def test_n_lookup_budget_starved_counts_the_legacy_bare_note(tmp_path):
+    # 7f391ef briefly wrote the bare note "lookup-budget" (no ":N"); a store
+    # written by that build must still be counted as starved, or a report
+    # would silently under-state how many cached levels are under-checked.
+    s = Store(tmp_path / "tlegacy.db")
+    s.upsert_evidence("https://legacy", 2, "lookup-budget")
+    s.upsert_evidence("https://a", 2, "lookup-budget:1")
+    s.upsert_evidence("https://c", 3, "")
+    s.upsert_evidence("https://d", 1, "unfetchable")
+    assert s.n_lookup_budget_starved() == 2
