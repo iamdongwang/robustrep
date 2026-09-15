@@ -201,7 +201,7 @@ def test_fetch_etherscan_key_overrides_env_and_is_not_echoed(tmp_path, monkeypat
         def __init__(self, api_key):
             pass
 
-    def _fake_default_client(source, key):
+    def _fake_default_client(source, key, rps=None, retries=None):
         seen.append((source, key))
         return _FakeEtherscanClient(key)
 
@@ -232,7 +232,7 @@ def _patch_fetch_steps_except_raters(monkeypatch, capture):
         def __init__(self, key):
             pass
 
-    def _fake_default_client(source, key):
+    def _fake_default_client(source, key, rps=None, retries=None):
         capture.append((source, key))
         return _FakeClient(key) if source != "none" else None
 
@@ -319,6 +319,126 @@ def test_step_raters_profile_source_string_default_is_auto():
 
     sig = inspect.signature(cli._step_raters)
     assert sig.parameters["profile_source"].default == cli.ProfileSource.auto
+
+
+# --- --profile-rps/--profile-retries propagation ---------------------------------
+
+
+class _RpsCapturingClient:
+    source = "etherscan"
+
+    def __init__(self, key, rps=None, retries=None):
+        self.gap = 1.0 / (rps if rps is not None else 4.0)
+        self.retries = retries
+
+
+def test_fetch_profile_rps_and_retries_reach_default_client(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    seen = []
+
+    def _fake_default_client(source, key, rps=None, retries=None):
+        seen.append((source, key, rps, retries))
+        return _RpsCapturingClient(key, rps=rps, retries=retries)
+
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli, "default_client", _fake_default_client)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-rps", "0.5", "--profile-retries", "9"])
+    assert r.exit_code == 0, r.output
+    assert seen == [("auto", None, 0.5, 9)]
+
+
+def test_fetch_profile_rps_and_retries_default_to_none(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    seen = []
+
+    def _fake_default_client(source, key, rps=None, retries=None):
+        seen.append((source, key, rps, retries))
+        return _RpsCapturingClient(key, rps=rps, retries=retries)
+
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli, "default_client", _fake_default_client)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert seen == [("auto", None, None, None)]
+
+
+def test_fetch_profile_rps_rejects_below_minimum(tmp_path):
+    r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--profile-rps", "0.05", "--dry-run"])
+    assert r.exit_code != 0
+
+
+def test_fetch_profile_retries_rejects_below_minimum(tmp_path):
+    r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--profile-retries", "0", "--dry-run"])
+    assert r.exit_code != 0
+
+
+def test_fetch_eta_uses_effective_rps_from_profile_rps_flag(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        cli, "default_client",
+        lambda source, key, rps=None, retries=None: _RpsCapturingClient(key, rps=rps, retries=retries))
+
+    seen_rps = []
+    orig_estimate = cli.estimate_seconds
+
+    def _capture_estimate(n, rps):
+        seen_rps.append(rps)
+        return orig_estimate(n, rps)
+
+    monkeypatch.setattr(cli, "estimate_seconds", _capture_estimate)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-rps", "0.25"])
+    assert r.exit_code == 0, r.output
+    assert seen_rps == [0.25]
+
+
+def test_fetch_eta_uses_client_default_rps_when_flag_omitted(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        cli, "default_client",
+        lambda source, key, rps=None, retries=None: _RpsCapturingClient(key, rps=rps, retries=retries))
+
+    seen_rps = []
+    orig_estimate = cli.estimate_seconds
+
+    def _capture_estimate(n, rps):
+        seen_rps.append(rps)
+        return orig_estimate(n, rps)
+
+    monkeypatch.setattr(cli, "estimate_seconds", _capture_estimate)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    # _RpsCapturingClient's own default (matching EtherscanClient's) is 4.0.
+    assert seen_rps == [4.0]
 
 
 def test_fetch_rpc_url_and_confirmations_reach_config(tmp_path, monkeypatch):
@@ -857,10 +977,12 @@ def test_fetch_eta_branch_prints_estimate(tmp_path, monkeypatch):
     class _FakeEtherscanClient:
         source = "etherscan"
 
-        def __init__(self, api_key):
-            pass
+        def __init__(self, api_key, rps=None, retries=None):
+            self.gap = 1.0 / (rps if rps is not None else cli.DEFAULT_RPS)
 
-    monkeypatch.setattr(cli, "default_client", lambda source, key: _FakeEtherscanClient(key))
+    monkeypatch.setattr(
+        cli, "default_client",
+        lambda source, key, rps=None, retries=None: _FakeEtherscanClient(key, rps=rps, retries=retries))
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
 
     r = runner.invoke(app, ["fetch", "--db", str(db), "--etherscan-key", "k"])

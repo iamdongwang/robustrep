@@ -117,6 +117,33 @@ def _is_transient_http(code: Optional[int]) -> bool:
     return code == 429 or 500 <= code < 600
 
 
+# Longest backoff sleep honored from a 429 response's Retry-After header,
+# in seconds -- caps a misbehaving/adversarial server from stalling a run.
+_RETRY_AFTER_CAP = 60.0
+
+
+def _retry_after_seconds(e: requests.RequestException) -> Optional[float]:
+    """Seconds named by the response's ``Retry-After`` header, capped at
+    ``_RETRY_AFTER_CAP``, or ``None`` if there is no response, no such
+    header, or its value isn't a non-negative number. Only the numeric
+    (seconds) form of the header is honored -- the HTTP-date form is
+    ignored rather than trusted to `sleep()` against a possibly-skewed
+    remote clock."""
+    resp = getattr(e, "response", None)
+    if resp is None:
+        return None
+    value = resp.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, _RETRY_AFTER_CAP)
+
+
 class EtherscanPlanError(RuntimeError):
     """The configured Etherscan API plan does not cover this chain (e.g. the
     free plan does not support Base via the V2 API). Non-retryable: no
@@ -135,12 +162,13 @@ class EtherscanClient:
     Looks up the earliest transaction for an address via
     ``module=account&action=txlist&sort=asc&offset=1``. Transient failures --
     HTTP 429/5xx, connection/timeout errors, a non-JSON body, or a rate-limit
-    message -- are retried up to ``retries`` times with exponential backoff;
-    any other HTTP 4xx, an invalid API key, an unsupported plan, or a
-    malformed address raise immediately, without consuming a retry. A
-    per-request throttle sleep (``1/rps``) runs after every attempt
-    regardless of outcome, so the configured request rate is respected even
-    while retrying or erroring.
+    message -- are retried up to ``retries`` times with exponential backoff
+    (a 429 whose response carries a ``Retry-After`` header uses that instead,
+    capped at 60s -- see ``_retry_after_seconds``); any other HTTP 4xx, an
+    invalid API key, an unsupported plan, or a malformed address raise
+    immediately, without consuming a retry. A per-request throttle sleep
+    (``1/rps``) runs after every attempt regardless of outcome, so the
+    configured request rate is respected even while retrying or erroring.
 
     Never logs or interpolates the raw exception, response body, or request
     URL/params anywhere (all of those may carry the API key in the query
@@ -203,6 +231,7 @@ class EtherscanClient:
         last_kind = "http"
         for attempt in range(self.retries):
             transient = False
+            retry_after: Optional[float] = None
             try:
                 try:
                     r = self.session.get(self.base_url, params=params, timeout=30)
@@ -212,6 +241,8 @@ class EtherscanClient:
                     if not self._is_transient_http(code):
                         raise RuntimeError(f"Etherscan HTTP {code} for {address}") from None
                     transient, last_status, last_kind = True, code, "http"
+                    if code == 429:
+                        retry_after = _retry_after_seconds(e)
                 else:
                     try:
                         body = r.json()
@@ -231,7 +262,9 @@ class EtherscanClient:
                 self.sleep(self.gap)
 
             if transient and attempt < self.retries - 1:
-                self.sleep(min(2 ** attempt, 30))
+                # Honor a 429's Retry-After header (capped) over the usual
+                # exponential backoff, when the server told us how long to wait.
+                self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
 
         if last_kind == "json":
             raise ValueError(f"non-JSON Etherscan response for {address}")
@@ -297,8 +330,13 @@ class BlockscoutV2Client:
     ``?module=account&action=txlist`` endpoint), which measured 2026-09-14 is
     rate-banned: it answers HTTP 429 even at 1 request/sec after a short
     burst. This client instead pages through
-    ``GET {base_url}/addresses/{address}/transactions?filter=to``, which is
-    stable at 2 requests/sec sustained (the default ``rps``).
+    ``GET {base_url}/addresses/{address}/transactions?filter=to``. Measured
+    2026-09-14: this v2 endpoint sustains ~1 request/sec (the default
+    ``rps``); at 2 requests/sec it starts answering HTTP 429 after a few
+    hundred requests. A 429 whose response carries a ``Retry-After`` header
+    is honored (see ``first_tx``) rather than the usual exponential backoff,
+    and the default ``retries`` (5, up from ``EtherscanClient``'s 3) gives a
+    run more room to absorb occasional transient 429s at the sustained rate.
 
     Same duck-typed interface as ``EtherscanClient`` -- a ``first_tx``
     method and a ``source`` attribute -- so it's a drop-in for
@@ -318,19 +356,20 @@ class BlockscoutV2Client:
     ``next_page_params`` shape raises ``ValueError`` naming the address.
     Transient failures on a single page fetch -- HTTP 429/5xx,
     connection/timeout errors, or a non-JSON body -- are retried up to
-    ``retries`` times with exponential backoff, then raise ``RuntimeError``
-    naming the address and status; any other HTTP 4xx raises immediately,
-    without consuming a retry. A per-request throttle sleep (``1/rps``) runs
-    after every attempt regardless of outcome (in ``finally``), same as
-    ``EtherscanClient``.
+    ``retries`` times with exponential backoff (a 429 whose response carries
+    a ``Retry-After`` header uses that instead, capped at 60s), then raise
+    ``RuntimeError`` naming the address and status; any other HTTP 4xx
+    raises immediately, without consuming a retry. A per-request throttle
+    sleep (``1/rps``) runs after every attempt regardless of outcome (in
+    ``finally``), same as ``EtherscanClient``.
 
     Never logs or interpolates the raw exception or response body anywhere
     -- only a numeric HTTP status code and the target address appear in any
     error message this raises.
     """
 
-    def __init__(self, base_url: str = BLOCKSCOUT_V2_BASE, session=None, rps: float = 2.0,
-                 retries: int = 3, max_pages: int = 5, sleep: Callable[[float], None] = time.sleep):
+    def __init__(self, base_url: str = BLOCKSCOUT_V2_BASE, session=None, rps: float = 1.0,
+                 retries: int = 5, max_pages: int = 5, sleep: Callable[[float], None] = time.sleep):
         self.base_url = base_url
         self.session = session or requests.Session()
         self.retries, self.max_pages, self.sleep = retries, max_pages, sleep
@@ -380,6 +419,7 @@ class BlockscoutV2Client:
         last_kind = "http"
         for attempt in range(self.retries):
             transient = False
+            retry_after: Optional[float] = None
             try:
                 try:
                     r = self.session.get(url, params=params, timeout=30)
@@ -391,6 +431,8 @@ class BlockscoutV2Client:
                     if not _is_transient_http(code):
                         raise RuntimeError(f"Blockscout HTTP {code} for {address}") from None
                     transient, last_status, last_kind = True, code, "http"
+                    if code == 429:
+                        retry_after = _retry_after_seconds(e)
                 else:
                     try:
                         body = r.json()
@@ -406,7 +448,9 @@ class BlockscoutV2Client:
                 self.sleep(self.gap)
 
             if transient and attempt < self.retries - 1:
-                self.sleep(min(2 ** attempt, 30))
+                # Honor a 429's Retry-After header (capped) over the usual
+                # exponential backoff, when the server told us how long to wait.
+                self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
 
         if last_kind == "json":
             raise ValueError(f"non-JSON Blockscout response for {address}")
@@ -447,13 +491,15 @@ def client_from_env() -> Optional[EtherscanClient]:
     return EtherscanClient(key) if key else None
 
 
-def default_client(source: str, key: Optional[str]):
+def default_client(source: str, key: Optional[str], rps: Optional[float] = None,
+                    retries: Optional[int] = None):
     """Build the rater-profile HTTP client for ``--profile-source source``,
     given ``key`` (an explicit ``--etherscan-key``/``ETHERSCAN_API_KEY``
     value, or ``None``).
 
     - ``"none"``: no client -- ``enrich_raters`` runs its offline fallback
-      (writes no rows).
+      (writes no rows). ``rps``/``retries`` are ignored -- there is no
+      client to configure.
     - ``"blockscout"``: ``BlockscoutV2Client()`` -- Base's free, keyless
       Blockscout v2 REST API. (The legacy ``EtherscanClient.blockscout()``
       Etherscan-compatible endpoint is rate-banned -- see its docstring --
@@ -466,18 +512,32 @@ def default_client(source: str, key: Optional[str]):
       (presumably a paid plan, since the free plan doesn't cover Base -- see
       the module docstring), else ``BlockscoutV2Client()``.
 
+    ``rps``/``retries``, when given (not ``None``), are forwarded to
+    whichever client is built, overriding its own default request rate /
+    retry count (``BlockscoutV2Client``'s 1.0 rps / 5 retries, or
+    ``EtherscanClient``'s ``DEFAULT_RPS`` (4.0) / 3 retries). ``None``
+    (the default) leaves the client's own default in place -- so a caller
+    that never asks about ``rps``/``retries`` (e.g. an existing test double)
+    gets exactly the previous behavior.
+
     Raises ``ValueError`` for any other ``source`` value.
     """
+    kw: dict = {}
+    if rps is not None:
+        kw["rps"] = rps
+    if retries is not None:
+        kw["retries"] = retries
+
     if source == "none":
         return None
     if source == "blockscout":
-        return BlockscoutV2Client()
+        return BlockscoutV2Client(**kw)
     if source == "etherscan":
         if not key:
             raise ValueError("--profile-source etherscan requires --etherscan-key or ETHERSCAN_API_KEY")
-        return EtherscanClient(key)
+        return EtherscanClient(key, **kw)
     if source == "auto":
-        return EtherscanClient(key) if key else BlockscoutV2Client()
+        return EtherscanClient(key, **kw) if key else BlockscoutV2Client(**kw)
     raise ValueError(f"unknown --profile-source: {source!r}")
 
 

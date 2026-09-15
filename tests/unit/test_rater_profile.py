@@ -57,10 +57,13 @@ class FakeHttpRaisingOnGet:
 
 
 class FakeHttpRaisingOnStatus:
-    """Simulates an HTTP error surfaced via ``raise_for_status`` (e.g. 429/404)."""
+    """Simulates an HTTP error surfaced via ``raise_for_status`` (e.g. 429/404).
 
-    def __init__(self, status_code, message):
-        self.status_code, self.message, self.calls = status_code, message, []
+    ``headers``, when given, is attached to the simulated response (e.g.
+    ``{"Retry-After": "5"}``) so tests can exercise the Retry-After path."""
+
+    def __init__(self, status_code, message, headers=None):
+        self.status_code, self.message, self.headers, self.calls = status_code, message, headers or {}, []
 
     def get(self, url, params=None, timeout=None):
         self.calls.append(params)
@@ -70,6 +73,7 @@ class FakeHttpRaisingOnStatus:
                 err = requests.HTTPError(self.message)
                 resp = requests.Response()
                 resp.status_code = self.status_code
+                resp.headers.update(self.headers)
                 err.response = resp
                 raise err
 
@@ -100,8 +104,10 @@ class FakeHttpBadJson:
 
 class FakeV2Http:
     """Simulates a sequence of Blockscout v2 page responses. Each item in
-    ``responses`` is either a dict body (200 OK) or an int HTTP status code
-    (429/5xx/404) simulated via ``raise_for_status``."""
+    ``responses`` is either a dict body (200 OK), an int HTTP status code
+    (429/5xx/404) simulated via ``raise_for_status``, or a ``(status,
+    headers)`` tuple (same, with response headers attached -- e.g.
+    ``(429, {"Retry-After": "5"})``)."""
 
     def __init__(self, responses):
         self.responses, self.calls = list(responses), []
@@ -109,8 +115,8 @@ class FakeV2Http:
     def get(self, url, params=None, timeout=None):
         self.calls.append(dict(params or {}))
         item = self.responses.pop(0)
-        if isinstance(item, int):
-            status = item
+        if isinstance(item, (int, tuple)):
+            status, headers = item if isinstance(item, tuple) else (item, {})
 
             class R:
                 status_code = status
@@ -119,6 +125,7 @@ class FakeV2Http:
                     err = requests.HTTPError(f"{status} error for url: {url}?apikey=SECRET")
                     resp = requests.Response()
                     resp.status_code = status
+                    resp.headers.update(headers)
                     err.response = resp
                     raise err
 
@@ -339,6 +346,49 @@ def test_first_tx_scrubs_429_http_error_and_retries(caplog):
     assert "SECRET" not in caplog.text
     assert len(http.calls) == 3
     assert len(sleeps) > 3  # throttle sleeps (one per attempt) plus >=1 backoff sleep
+
+
+# --- 429 Retry-After header: honored (capped at 60s) instead of exponential backoff --
+
+
+def test_first_tx_429_honors_retry_after_header():
+    http = FakeHttpRaisingOnStatus(429, "429 too many requests", headers={"Retry-After": "5"})
+    sleeps = []
+    c = EtherscanClient("KEY", session=http, retries=2, sleep=sleeps.append)
+    try:
+        c.first_tx("0xA")
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    # Two throttle sleeps (one per attempt, `self.gap`) plus one backoff sleep of
+    # exactly the Retry-After value (not the exponential min(2**attempt, 30)).
+    assert sleeps.count(5.0) == 1
+
+
+def test_first_tx_429_retry_after_capped_at_60():
+    http = FakeHttpRaisingOnStatus(429, "429 too many requests", headers={"Retry-After": "600"})
+    sleeps = []
+    c = EtherscanClient("KEY", session=http, retries=2, sleep=sleeps.append)
+    try:
+        c.first_tx("0xA")
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    assert sleeps.count(60.0) == 1
+    assert 600.0 not in sleeps
+
+
+def test_first_tx_429_without_retry_after_falls_back_to_exponential_backoff():
+    http = FakeHttpRaisingOnStatus(429, "429 too many requests")
+    sleeps = []
+    c = EtherscanClient("KEY", session=http, retries=2, sleep=sleeps.append)
+    try:
+        c.first_tx("0xA")
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    # attempt 0's backoff, with no header present, is min(2**0, 30) == 1.0.
+    assert sleeps.count(1.0) == 1
 
 
 def test_first_tx_scrubs_5xx_http_error_and_retries():
@@ -794,6 +844,50 @@ def test_default_client_auto_without_key_uses_blockscout():
     assert c.source == "blockscout"
 
 
+# --- default_client: --profile-rps/--profile-retries propagation --------------------
+
+
+def test_default_client_none_rps_retries_leaves_client_defaults():
+    """``rps=None``/``retries=None`` (the default) is not forwarded at all --
+    each client built by ``default_client`` keeps its own default rate/retry
+    count."""
+    c = default_client("blockscout", None)
+    assert c.gap == 1.0  # BlockscoutV2Client's own default: rps=1.0
+    assert c.retries == 5  # BlockscoutV2Client's own default
+
+
+def test_default_client_blockscout_passes_through_rps_and_retries():
+    c = default_client("blockscout", None, rps=4.0, retries=7)
+    assert isinstance(c, BlockscoutV2Client)
+    assert c.gap == 0.25
+    assert c.retries == 7
+
+
+def test_default_client_etherscan_passes_through_rps_and_retries():
+    c = default_client("etherscan", "KEY", rps=0.5, retries=2)
+    assert isinstance(c, EtherscanClient)
+    assert c.gap == 2.0
+    assert c.retries == 2
+
+
+def test_default_client_auto_with_key_passes_through_rps_and_retries():
+    c = default_client("auto", "KEY", rps=10.0, retries=9)
+    assert isinstance(c, EtherscanClient)
+    assert c.gap == 0.1
+    assert c.retries == 9
+
+
+def test_default_client_auto_without_key_passes_through_rps_and_retries():
+    c = default_client("auto", None, rps=4.0, retries=1)
+    assert isinstance(c, BlockscoutV2Client)
+    assert c.gap == 0.25
+    assert c.retries == 1
+
+
+def test_default_client_none_ignores_rps_and_retries():
+    assert default_client("none", None, rps=5.0, retries=9) is None
+
+
 def test_default_client_unknown_source_raises_value_error():
     try:
         default_client("bogus", None)
@@ -853,7 +947,11 @@ def test_blockscout_v2_default_max_pages_and_rps():
     c = BlockscoutV2Client(sleep=lambda _: None)
     assert c.max_pages == 5
     assert c.source == "blockscout"
-    assert abs(c.gap - 0.5) < 1e-9  # rps=2.0 default -> 0.5s gap
+    # Measured 2026-09-14: Blockscout v2 sustains ~1 request/s; at 2 rps it
+    # starts answering 429 after a few hundred requests -- so the default is
+    # 1 rps (not 2), with more retries (5, not 3) to absorb transient 429s.
+    assert abs(c.gap - 1.0) < 1e-9  # rps=1.0 default -> 1.0s gap
+    assert c.retries == 5
 
 
 def test_blockscout_v2_exceeds_max_pages_returns_none():
@@ -893,6 +991,42 @@ def test_blockscout_v2_429_then_200_succeeds_after_retry():
     assert block == 5 and funder == "0xf"
     assert len(http.calls) == 2
     assert len(sleeps) >= 2  # throttle sleep(s) plus >=1 backoff sleep
+
+
+# --- 429 Retry-After header: honored (capped at 60s) instead of exponential backoff --
+
+
+def test_blockscout_v2_429_honors_retry_after_header():
+    body = {"items": [], "next_page_params": None}
+    http = FakeV2Http([(429, {"Retry-After": "10"}), body])
+    sleeps = []
+    c = BlockscoutV2Client(session=http, retries=2, sleep=sleeps.append)
+    assert c.first_tx("0xA") is None
+    # attempt 0's throttle (gap=1.0), then its backoff -- 10.0 (Retry-After),
+    # not the exponential fallback min(2**0, 30) == 1.0 -- then attempt 1's throttle.
+    assert sleeps == [1.0, 10.0, 1.0]
+
+
+def test_blockscout_v2_429_retry_after_capped_at_60():
+    body = {"items": [], "next_page_params": None}
+    http = FakeV2Http([(429, {"Retry-After": "600"}), body])
+    sleeps = []
+    c = BlockscoutV2Client(session=http, retries=2, sleep=sleeps.append)
+    c.first_tx("0xA")
+    assert sleeps.count(60.0) == 1
+    assert 600.0 not in sleeps
+
+
+def test_blockscout_v2_429_without_retry_after_falls_back_to_exponential_backoff():
+    body = {"items": [], "next_page_params": None}
+    http = FakeV2Http([429, body])
+    sleeps = []
+    c = BlockscoutV2Client(session=http, retries=2, sleep=sleeps.append)
+    c.first_tx("0xA")
+    # Two throttle sleeps (gap=1.0 default) plus one backoff of min(2**0, 30) == 1.0
+    # -- all three happen to equal 1.0 here, so just check the total count.
+    assert len(sleeps) == 3
+    assert all(s == 1.0 for s in sleeps)
 
 
 def test_blockscout_v2_exhausts_retries_then_raises_scrubbed_runtime_error(caplog):
