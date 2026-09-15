@@ -513,7 +513,9 @@ def test_classify_all_isolates_per_uri_errors_and_continues(tmp_path, caplog):
     assert s.evidence_level("https://boom") == 1
     r = s.conn.execute("SELECT note FROM evidence_cache WHERE uri='https://boom'").fetchone()
     assert r[0] == "fetch-error"
-    assert any("https://boom" in rec.message for rec in caplog.records)
+    # The URI is attacker-controlled, so it is logged with %r (quoted/escaped),
+    # never bare %s -- a URI carrying newlines must not forge log lines.
+    assert any("'https://boom'" in rec.message for rec in caplog.records)
 
 
 def test_classify_all_logs_progress(tmp_path, caplog):
@@ -815,3 +817,20 @@ def test_is_safe_url_refuses_when_urllib3_cannot_parse(monkeypatch):
 
     monkeypatch.setattr(ef, "_urllib3_parse", boom)
     assert ef._is_safe_url("http://example.com/", resolver=_public_resolver) is False
+
+
+@pytest.mark.parametrize("loc", [
+    "http://ot\rher.example/x",
+    "http://ot\ther.example/x",
+    "http://other.example/x\n",
+])
+def test_redirect_location_with_control_characters_is_refused(loc):
+    # urljoin (via urlsplit) strips TAB/CR/LF *before* the guard would ever see
+    # them, silently normalizing a hostile Location into a different, allowed
+    # URL -- so the raw header value is screened first.
+    first = FakeResp(302, headers={"location": loc})
+    sess = FakeSession({"http://example.com/a": first})
+    assert ef._fetch_url("http://example.com/a", sess, _public_resolver,
+                         ef.DEFAULT_TIMEOUT) is None
+    assert sess.calls == ["http://example.com/a"]
+    assert first.closed is True
