@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from robustrep import cli
 from robustrep.cli import app
+from robustrep.report import publish
 from robustrep.schema import RESULT_COLUMNS
 from robustrep.sources.rpc import RpcError
 from robustrep.store import Store
@@ -1209,20 +1210,6 @@ def test_report_provenance_includes_evidence_lookup_starved_uris(tmp_path):
     assert data["config"]["evidence_lookup_starved_uris"] == 2
 
 
-def test_provenance_n_lookup_budget_starved_defaults_to_zero_without_a_store():
-    # cli._provenance is also called directly (e.g. from tests) on an
-    # in-memory records frame with no store to count from -- it must not
-    # require one.
-    from robustrep import Config
-    from robustrep.schema import validate_records
-
-    records = validate_records(pd.DataFrame([dict(
-        rater="r", ratee="A", value=50, scale="d0", tag="q", ts=0,
-        evidence_uri=None, source="test", evidence_level=0)]))
-    prov = cli._provenance("onchain", Config(), records)
-    assert prov["config"]["evidence_lookup_starved_uris"] == 0
-
-
 def test_report_provenance_includes_evidence_level_shares(tmp_path):
     """`_seed` writes feedback rows with no evidence_uri -- every row classifies
     to evidence level 0 -- so the shares should read 100% level 0, and land in
@@ -1237,27 +1224,6 @@ def test_report_provenance_includes_evidence_level_shares(tmp_path):
     data = json.loads((out_dir / "latest" / "scores.json").read_text())
     shares = data["config"]["evidence_level_shares"]
     assert shares == {"0": 1.0, "1": 0.0, "2": 0.0, "3": 0.0}
-
-
-def test_provenance_evidence_level_shares_from_records(tmp_path):
-    """`cli._provenance` computes `evidence_level_shares` directly from the
-    `records` frame it's given (non-revoked rows only), independent of the
-    `report` command's wiring."""
-    from robustrep import Config
-    from robustrep.schema import validate_records
-
-    rows = []
-    for lvl, n in ((0, 2), (1, 6), (2, 1), (3, 1)):
-        for i in range(n):
-            rows.append(dict(rater=f"r{lvl}_{i}", ratee="A", value=50, scale="d0", tag="q", ts=0,
-                             evidence_uri=None, source="test", evidence_level=lvl))
-    records = validate_records(pd.DataFrame(rows))
-    prov = cli._provenance("onchain", Config(), records)
-    shares = prov["config"]["evidence_level_shares"]
-    assert shares[0] == pytest.approx(0.2)
-    assert shares[1] == pytest.approx(0.6)
-    assert shares[2] == pytest.approx(0.1)
-    assert shares[3] == pytest.approx(0.1)
 
 
 def test_report_latest_is_atomically_replaced_and_stale_files_removed(tmp_path):
@@ -1278,28 +1244,6 @@ def test_report_latest_is_atomically_replaced_and_stale_files_removed(tmp_path):
     assert (out_dir / "latest" / "report.md").exists()
     assert (out_dir / "latest" / "scores.json").exists()
     assert len(list((out_dir / "latest").glob("*.png"))) == 5
-
-
-def test_provenance_norm_rule_counts_follow_the_run_config():
-    """`norm_rule_counts` must describe the run that was actually scored, not a
-    default-config re-run: the same frame is `rank` at norm_fit_share 0.9 and
-    `percent` at 0.75."""
-    from robustrep import Config, score
-    from robustrep.schema import validate_records
-
-    honest = [10, 50, 90, 100, 0, 75, 25, 60]
-    rows = [dict(rater=f"r{i}", ratee="A", value=v, scale="d0", tag="q", ts=0,
-                 evidence_uri=None, source="test") for i, v in enumerate(honest)]
-    rows += [dict(rater="x1", ratee="Z", value=2**127 - 1, scale="d0", tag="q", ts=0,
-                  evidence_uri=None, source="test"),
-             dict(rater="x2", ratee="Z", value=-(2**127), scale="d0", tag="q", ts=0,
-                  evidence_uri=None, source="test")]
-    records = validate_records(pd.DataFrame(rows))
-    for fit_share, rule in ((0.9, "rank"), (0.75, "percent")):
-        cfg = Config(bootstrap_n=0, norm_fit_share=fit_share)
-        prov = cli._provenance("onchain", cfg, records, score(records, cfg))
-        assert prov["config"]["norm_fit_share"] == fit_share
-        assert prov["config"]["norm_rule_counts"] == {rule: 10}
 
 
 # --- sybil pair-budget options and cluster stats (H2) --------------------------
@@ -1409,16 +1353,6 @@ def test_report_scores_json_carries_cluster_stats(tmp_path):
     assert stats["truncated"] is False
 
 
-def test_provenance_cluster_stats_empty_without_a_scored_frame(tmp_path):
-    from robustrep import Config
-
-    db = tmp_path / "t.db"
-    _seed(db)
-    with Store(db) as store:
-        records = store.load_records()
-    assert cli._provenance("onchain", Config(), records)["cluster_stats"] == {}
-
-
 def test_score_summary_notes_budget_limited_clustering(tmp_path):
     db, out = tmp_path / "t.db", tmp_path / "scores.csv"
     _seed(db)
@@ -1522,68 +1456,6 @@ def test_fetch_declares_the_reprofile_raters_option():
 # --- published-file allowlist / symlink-safe latest (L1, L9) -----------------
 
 
-def test_publish_latest_copies_only_the_allowlisted_files(tmp_path):
-    # L1 (security review): `latest/` is served by GitHub Pages, so only the
-    # three artifacts the report actually consists of may be published -- a
-    # stray debug dump left in the block directory must never ride along onto
-    # a public CDN.
-    out_dir = tmp_path / "reports"
-    block_dir = out_dir / "42"
-    block_dir.mkdir(parents=True)
-    (block_dir / "report.md").write_text("# report")
-    (block_dir / "scores.json").write_text("{}")
-    (block_dir / "fig1_mean_vs_robust.png").write_bytes(b"png")
-    (block_dir / "debug.csv").write_text("rater,secret\n")
-    (block_dir / "notes.txt").write_text("scratch")
-    (block_dir / "raw").mkdir()
-
-    cli._publish_latest(out_dir, block_dir)
-
-    latest = out_dir / "latest"
-    assert {p.name for p in latest.iterdir()} == {
-        "report.md", "scores.json", "fig1_mean_vs_robust.png"}
-
-
-def test_publish_latest_replaces_a_symlinked_latest_with_a_real_directory(tmp_path):
-    # L9: `shutil.rmtree` raises OSError on a symlink, so a `latest` symlink
-    # (however it got there) used to wedge every later report run.
-    out_dir = tmp_path / "reports"
-    block_dir = out_dir / "7"
-    block_dir.mkdir(parents=True)
-    (block_dir / "report.md").write_text("# report")
-    (block_dir / "scores.json").write_text("{}")
-    (block_dir / "fig1.png").write_bytes(b"png")
-
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (elsewhere / "keep.txt").write_text("not ours")
-    (out_dir / "latest").symlink_to(elsewhere, target_is_directory=True)
-
-    cli._publish_latest(out_dir, block_dir)
-
-    latest = out_dir / "latest"
-    assert not latest.is_symlink() and latest.is_dir()
-    assert (latest / "report.md").exists()
-    # The symlink target itself is untouched -- only the link was removed.
-    assert (elsewhere / "keep.txt").exists()
-
-
-def test_publish_latest_logs_the_published_files_at_debug(tmp_path, caplog):
-    out_dir = tmp_path / "reports"
-    block_dir = out_dir / "3"
-    block_dir.mkdir(parents=True)
-    (block_dir / "report.md").write_text("# report")
-    (block_dir / "scores.json").write_text("{}")
-    (block_dir / "fig1.png").write_bytes(b"png")
-
-    with caplog.at_level(logging.DEBUG, logger="robustrep.cli"):
-        cli._publish_latest(out_dir, block_dir)
-
-    published = " ".join(r.getMessage() for r in caplog.records)
-    for name in ("report.md", "scores.json", "fig1.png"):
-        assert name in published, name
-
-
 def test_report_publishes_only_the_allowlisted_files(tmp_path):
     db = tmp_path / "t.db"
     _seed(db)
@@ -1652,24 +1524,6 @@ def test_provenance_evidence_caps_come_from_the_store_not_the_constants(tmp_path
     config = json.loads((out_dir / "latest" / "scores.json").read_text())["config"]
     assert config["evidence_max_lookups_per_uri"] == 3
     assert config["evidence_max_total_lookups"] == 77
-
-
-def test_evidence_caps_for_provenance_falls_back_to_constants(tmp_path):
-    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
-    from robustrep.sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
-
-    expected = {"evidence_max_lookups_per_uri": MAX_TX_LOOKUPS_PER_URI,
-                "evidence_max_total_lookups": DEFAULT_MAX_TOTAL_LOOKUPS}
-    # No store at all (a caller scoring an in-memory frame).
-    assert cli._evidence_caps_for_provenance(None) == expected
-    # A store that has never run an evidence step -- neither key is set.
-    with Store(tmp_path / "fresh.db") as store:
-        assert cli._evidence_caps_for_provenance(store) == expected
-    # A malformed value (hand-edited sync_state) falls back rather than
-    # crashing the whole report.
-    with Store(tmp_path / "bad.db") as store:
-        store.set_sync("evidence_max_total_lookups", "not-a-number")
-        assert cli._evidence_caps_for_provenance(store) == expected
 
 
 # --- review round 2: the export guard must land on report's error path -------
@@ -1757,103 +1611,10 @@ def test_report_markdown_and_json_agree_on_versions(tmp_path):
         assert name in line, name
 
 
-def test_provenance_versions_come_from_the_export_module(tmp_path):
-    from robustrep import Config
-    from robustrep.report.export import versions as export_versions
-    from robustrep.schema import validate_records
-
-    records = validate_records(pd.DataFrame([dict(
-        rater="r", ratee="A", value=50, scale="d0", tag="q", ts=0,
-        evidence_uri=None, source="test", evidence_level=0)]))
-    assert cli._provenance("onchain", Config(), records)["versions"] == export_versions()
-
-
 # --- publish: symlink sources, missing core files, log ordering --------------
 
 
-def test_published_files_never_follows_a_symlink(tmp_path):
-    # A figure-shaped symlink in the block directory must not publish whatever
-    # it points at -- the allowlist is about bytes leaving the machine, not
-    # about names.
-    block_dir = tmp_path / "3"
-    block_dir.mkdir()
-    (block_dir / "report.md").write_text("# report")
-    (block_dir / "scores.json").write_text("{}")
-    (block_dir / "fig1.png").write_bytes(b"png")
-    secret = tmp_path / "secret"
-    secret.write_text("private key material")
-    (block_dir / "fig3.png").symlink_to(secret)
-
-    names = {p.name for p in cli._published_files(block_dir)}
-    assert names == {"report.md", "scores.json", "fig1.png"}
-
-    out_dir = tmp_path / "reports"
-    cli._publish_latest(out_dir, block_dir)
-    assert not (out_dir / "latest" / "fig3.png").exists()
-
-
-@pytest.mark.parametrize("missing", ["report.md", "scores.json"])
-def test_publish_latest_refuses_when_a_core_file_is_missing(tmp_path, missing):
-    # Publishing an empty (or figure-only) `latest/` would take the live
-    # report offline; refuse and let report() turn it into an ERROR line.
-    out_dir = tmp_path / "reports"
-    block_dir = out_dir / "9"
-    block_dir.mkdir(parents=True)
-    for name in ("report.md", "scores.json"):
-        if name != missing:
-            (block_dir / name).write_text("x")
-    (block_dir / "fig1.png").write_bytes(b"png")
-
-    with pytest.raises(ValueError) as e:
-        cli._publish_latest(out_dir, block_dir)
-    assert missing in str(e.value)
-    assert not (out_dir / "latest").exists()
-
-
-def test_publish_latest_logs_only_after_latest_is_in_place(tmp_path, caplog):
-    # The DEBUG line says what *was* published, so it must not be emitted
-    # while the staged copy could still fail to move into place.
-    out_dir = tmp_path / "reports"
-    block_dir = out_dir / "3"
-    block_dir.mkdir(parents=True)
-    (block_dir / "report.md").write_text("# report")
-    (block_dir / "scores.json").write_text("{}")
-    (block_dir / "fig1.png").write_bytes(b"png")
-
-    published_at_log_time = []
-
-    class _Probe(logging.Handler):
-        def emit(self, record):
-            published_at_log_time.append((out_dir / "latest" / "report.md").exists())
-
-    probe = _Probe(level=logging.DEBUG)
-    logger = logging.getLogger("robustrep.cli")
-    logger.addHandler(probe)
-    try:
-        with caplog.at_level(logging.DEBUG, logger="robustrep.cli"):
-            cli._publish_latest(out_dir, block_dir)
-    finally:
-        logger.removeHandler(probe)
-
-    assert published_at_log_time and all(published_at_log_time)
-
-
 # --- evidence caps: a non-positive recorded value is not usable --------------
-
-
-def test_evidence_caps_for_provenance_rejects_non_positive_values(tmp_path, caplog):
-    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
-    from robustrep.sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
-
-    expected = {"evidence_max_lookups_per_uri": MAX_TX_LOOKUPS_PER_URI,
-                "evidence_max_total_lookups": DEFAULT_MAX_TOTAL_LOOKUPS}
-    with Store(tmp_path / "nonpos.db") as store:
-        store.set_sync("evidence_max_lookups_per_uri", "0")
-        store.set_sync("evidence_max_total_lookups", "-5")
-        with caplog.at_level(logging.WARNING, logger="robustrep.cli"):
-            assert cli._evidence_caps_for_provenance(store) == expected
-    warned = " ".join(r.getMessage() for r in caplog.records)
-    assert "evidence_max_lookups_per_uri" in warned and "evidence_max_total_lookups" in warned
 
 
 def test_step_evidence_uses_the_named_cap_keys(tmp_path, monkeypatch):
@@ -1861,6 +1622,6 @@ def test_step_evidence_uses_the_named_cap_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "classify_all", lambda store, **k: 0)
     with Store(tmp_path / "t.db") as store:
         cli._step_evidence(store, rpc=None, workers=1)
-        assert all(store.get_sync(key) is not None for key in cli.EVIDENCE_CAP_KEYS)
-        assert cli._evidence_caps_for_provenance(store) == {
+        assert all(store.get_sync(key) is not None for key in publish.EVIDENCE_CAP_KEYS)
+        assert publish.evidence_caps_for_provenance(store) == {
             "evidence_max_lookups_per_uri": 8, "evidence_max_total_lookups": 20000}
