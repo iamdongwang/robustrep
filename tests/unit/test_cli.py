@@ -1517,3 +1517,156 @@ def test_fetch_declares_the_reprofile_raters_option():
     assert "--reprofile-raters" in declared
     flag = next(p for p in cmd.params if "--reprofile-raters" in p.opts)
     assert flag.default is False
+
+
+# --- published-file allowlist / symlink-safe latest (L1, L9) -----------------
+
+
+def test_publish_latest_copies_only_the_allowlisted_files(tmp_path):
+    # L1 (security review): `latest/` is served by GitHub Pages, so only the
+    # three artifacts the report actually consists of may be published -- a
+    # stray debug dump left in the block directory must never ride along onto
+    # a public CDN.
+    out_dir = tmp_path / "reports"
+    block_dir = out_dir / "42"
+    block_dir.mkdir(parents=True)
+    (block_dir / "report.md").write_text("# report")
+    (block_dir / "scores.json").write_text("{}")
+    (block_dir / "fig1_mean_vs_robust.png").write_bytes(b"png")
+    (block_dir / "debug.csv").write_text("rater,secret\n")
+    (block_dir / "notes.txt").write_text("scratch")
+    (block_dir / "raw").mkdir()
+
+    cli._publish_latest(out_dir, block_dir)
+
+    latest = out_dir / "latest"
+    assert {p.name for p in latest.iterdir()} == {
+        "report.md", "scores.json", "fig1_mean_vs_robust.png"}
+
+
+def test_publish_latest_replaces_a_symlinked_latest_with_a_real_directory(tmp_path):
+    # L9: `shutil.rmtree` raises OSError on a symlink, so a `latest` symlink
+    # (however it got there) used to wedge every later report run.
+    out_dir = tmp_path / "reports"
+    block_dir = out_dir / "7"
+    block_dir.mkdir(parents=True)
+    (block_dir / "report.md").write_text("# report")
+    (block_dir / "scores.json").write_text("{}")
+    (block_dir / "fig1.png").write_bytes(b"png")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("not ours")
+    (out_dir / "latest").symlink_to(elsewhere, target_is_directory=True)
+
+    cli._publish_latest(out_dir, block_dir)
+
+    latest = out_dir / "latest"
+    assert not latest.is_symlink() and latest.is_dir()
+    assert (latest / "report.md").exists()
+    # The symlink target itself is untouched -- only the link was removed.
+    assert (elsewhere / "keep.txt").exists()
+
+
+def test_publish_latest_logs_the_published_files_at_debug(tmp_path, caplog):
+    out_dir = tmp_path / "reports"
+    block_dir = out_dir / "3"
+    block_dir.mkdir(parents=True)
+    (block_dir / "report.md").write_text("# report")
+    (block_dir / "scores.json").write_text("{}")
+    (block_dir / "fig1.png").write_bytes(b"png")
+
+    with caplog.at_level(logging.DEBUG, logger="robustrep.cli"):
+        cli._publish_latest(out_dir, block_dir)
+
+    published = " ".join(r.getMessage() for r in caplog.records)
+    for name in ("report.md", "scores.json", "fig1.png"):
+        assert name in published, name
+
+
+def test_report_publishes_only_the_allowlisted_files(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+
+    with Store(db) as store:
+        last_block = store.get_sync("last_block")
+    block = int(last_block) if last_block is not None else 0
+    stray = out_dir / str(block) / "debug_dump.csv"
+    stray.write_text("rater,note\n")
+
+    r2 = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r2.exit_code == 0, r2.output
+    names = {p.name for p in (out_dir / "latest").iterdir()}
+    assert "debug_dump.csv" not in names
+    assert {"report.md", "scores.json"} <= names
+    assert len([n for n in names if n.endswith(".png")]) == 5
+
+
+# --- evidence lookup caps: recorded by the run, read back by provenance ------
+
+
+def test_step_evidence_passes_both_caps_to_classify_all(tmp_path, monkeypatch):
+    # The per-URI cap is not classify_all's default to rediscover: _step_evidence
+    # passes both caps explicitly, so the values it reports are the values used.
+    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
+    from robustrep.sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
+
+    seen = {}
+
+    def _capture(store, tx_parties=None, workers=8, **kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "classify_all", _capture)
+    with Store(tmp_path / "t.db") as store:
+        cli._step_evidence(store, rpc=None, workers=2)
+    assert seen["max_lookups_per_uri"] == MAX_TX_LOOKUPS_PER_URI
+    assert seen["max_total_lookups"] == DEFAULT_MAX_TOTAL_LOOKUPS
+
+
+def test_step_evidence_records_the_caps_it_used_in_sync_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "classify_all", lambda store, **k: 0)
+    db = tmp_path / "t.db"
+    with Store(db) as store:
+        cli._step_evidence(store, rpc=None, workers=1)
+        assert store.get_sync("evidence_max_lookups_per_uri") == "8"
+        assert store.get_sync("evidence_max_total_lookups") == "20000"
+
+
+def test_provenance_evidence_caps_come_from_the_store_not_the_constants(tmp_path):
+    # Provenance must describe the run that produced the cached evidence
+    # levels: a store fetched under different caps reports *those*, even after
+    # the module constants have moved on.
+    db = tmp_path / "t.db"
+    _seed(db)
+    with Store(db) as store:
+        store.set_sync("evidence_max_lookups_per_uri", "3")
+        store.set_sync("evidence_max_total_lookups", "77")
+
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+    config = json.loads((out_dir / "latest" / "scores.json").read_text())["config"]
+    assert config["evidence_max_lookups_per_uri"] == 3
+    assert config["evidence_max_total_lookups"] == 77
+
+
+def test_evidence_caps_for_provenance_falls_back_to_constants(tmp_path):
+    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
+    from robustrep.sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
+
+    expected = {"evidence_max_lookups_per_uri": MAX_TX_LOOKUPS_PER_URI,
+                "evidence_max_total_lookups": DEFAULT_MAX_TOTAL_LOOKUPS}
+    # No store at all (a caller scoring an in-memory frame).
+    assert cli._evidence_caps_for_provenance(None) == expected
+    # A store that has never run an evidence step -- neither key is set.
+    with Store(tmp_path / "fresh.db") as store:
+        assert cli._evidence_caps_for_provenance(store) == expected
+    # A malformed value (hand-edited sync_state) falls back rather than
+    # crashing the whole report.
+    with Store(tmp_path / "bad.db") as store:
+        store.set_sync("evidence_max_total_lookups", "not-a-number")
+        assert cli._evidence_caps_for_provenance(store) == expected
