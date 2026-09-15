@@ -25,13 +25,21 @@ SCHEMA_VERSION = 1
 _INT_COLUMNS = ("n_clusters", "n_raw", "sybil_flag", "insufficient")
 
 
-def export_json(scores: pd.DataFrame, block: int, out: Path, config: Optional[dict] = None) -> Path:
+def export_json(scores: pd.DataFrame, block: int, out: Path, config: Optional[dict] = None,
+                cluster_stats: Optional[dict] = None) -> Path:
     """Write `scores` (RESULT_COLUMNS) to `out` as JSON: {schema_version, block,
-    generated_at, config, versions, scores}. Rows are sorted by robust_score
-    descending with NaN (insufficient ratees) last. `config` (e.g. bootstrap_n,
-    evidence_weights, the sybil_* thresholds -- the scoring parameters actually
-    used) is written verbatim next to `versions`, defaulting to `{}` when not
-    given. Parent directories are created as needed.
+    generated_at, config, cluster_stats, versions, scores}. Rows are sorted by
+    robust_score descending with NaN (insufficient ratees) last. `config` (e.g.
+    bootstrap_n, evidence_weights, the sybil_* thresholds and pair budgets --
+    the scoring parameters actually used) is written verbatim next to
+    `versions`, defaulting to `{}` when not given.
+
+    `cluster_stats` (a `robustrep.sybil.ClusterStats` as a dict) says whether
+    sybil clustering hit a pair budget on this run and what it skipped; a
+    consumer comparing two exports needs it to tell a real change from a
+    budget-limited one. Also `{}` when not given. Both are additive keys, so
+    `schema_version` stays 1: a v1 consumer that ignores them still reads
+    every field it knew about. Parent directories are created as needed.
     """
     ordered = scores.sort_values("robust_score", ascending=False, na_position="last").copy()
     for col in _INT_COLUMNS:
@@ -45,6 +53,7 @@ def export_json(scores: pd.DataFrame, block: int, out: Path, config: Optional[di
         "block": block,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "config": config or {},
+        "cluster_stats": cluster_stats or {},
         "versions": {"robustrep": __version__, "numpy": numpy.__version__, "pandas": pd.__version__},
         "scores": rows,
     }

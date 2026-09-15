@@ -1,4 +1,8 @@
+import json
 import logging
+import os
+import subprocess
+import sys
 import time
 
 import pandas as pd
@@ -6,8 +10,8 @@ import pytest
 
 from robustrep.config import Config
 from robustrep.sybil import (
-    ClusterStats, RaterProfile, _candidate_pairs, _jaccard, _ratee_group_pairs, cluster_raters,
-    cluster_raters_with_stats, profiles_from_records,
+    ClusterStats, RaterProfile, _BlockCharge, _Budget, _candidate_pairs, _jaccard, _ratee_group_pairs,
+    cluster_raters, cluster_raters_with_stats, profiles_from_records,
 )
 from robustrep.schema import validate_records
 
@@ -254,7 +258,8 @@ def test_same_funder_subbucket_mixed_window_skips_in_window_pair():
         P("b", 50_000, "F", {"1"}),
         P("c", 100_000, "F", {"1"}),
     ]
-    pairs = list(_ratee_group_pairs("1", profiles, Config(), {"1"}))
+    charge = _BlockCharge(_Budget.for_config(Config()), "1")
+    pairs = list(_ratee_group_pairs("1", profiles, Config(), {"1"}, charge))
     assert pairs == [("a", "c")]
 
 
@@ -280,7 +285,9 @@ def test_per_ratee_budget_skips_block_and_counts_it():
     assert len(clusters) == 40
     assert stats.ratees_skipped_budget == 1
     assert stats.truncated is False
-    assert stats.pairs_tested >= 50
+    # Every pair this block examines is also emitted, so the per-ratee budget
+    # is spent exactly, never overshot.
+    assert stats.pairs_tested == 50
 
 
 def test_size_skip_is_counted():
@@ -336,3 +343,109 @@ def test_global_budget_logs_one_warning_with_counts(caplog):
 def test_cluster_raters_returns_only_the_mapping():
     c = cluster_raters(_farm(4, ["a"]), Config())
     assert isinstance(c, dict) and len(c) == 4
+
+
+# --- budgets bound EXAMINED pairs, not just emitted ones (C1) ----------------
+
+
+def _same_funder_farm(n, m, spread_s):
+    """`n` same-funder raters spread over `spread_s`, each rating the same `m`
+    ratees -- the shape whose inner loops scan O(n^2) pairs per ratee block and
+    emit from only one of them (the `min(shared)` de-dup)."""
+    ratees = frozenset(f"a{k:03d}" for k in range(m))
+    return [RaterProfile(rater=f"r{i:05d}", first_seen_ts=int(i * spread_s / n), funder="F", ratees=ratees)
+            for i in range(n)]
+
+
+def test_non_emitting_scans_are_bounded_by_the_budget():
+    # 2,000 same-funder raters just over the window apart, all rating the same
+    # 50 ratees: 49 of the 50 blocks scan ~2M pairs each and emit NOTHING, so a
+    # budget charged on emitted pairs alone left the CPU cost unbounded in the
+    # number of shared ratees (measured: 33s at 25 ratees, 105s at 50, with
+    # every ClusterStats counter still reading zero).
+    profiles = _same_funder_farm(2000, 50, 2 * 24 * H)
+    start = time.perf_counter()
+    clusters, stats = cluster_raters_with_stats(profiles, Config())
+    elapsed = time.perf_counter() - start
+    assert len(clusters) == 2000
+    # Generous: ~9s here, ~20s under CI's `pytest --cov` tracing. The point is
+    # the order of magnitude -- the unbounded version took 105s untraced and
+    # grew linearly with the number of shared ratees, with nothing to stop it.
+    assert elapsed < 90.0, elapsed
+    assert stats.ratees_skipped_budget > 0 or stats.truncated
+
+
+def test_h2_farm_still_collapses_to_one_cluster_under_the_budget():
+    # The attack the budgets exist for: 2,000 distinct-funder raters rating the
+    # same 3 ratees inside one window. Bounding examinations must not cost the
+    # detection -- the first rater pairs with every other one early in the
+    # block, so the farm still collapses into a single cluster.
+    ratees = frozenset({"a", "b", "c"})
+    profiles = [RaterProfile(rater=f"r{i:05d}", first_seen_ts=1000 + i, funder=f"f{i}", ratees=ratees)
+                for i in range(2000)]
+    clusters, stats = cluster_raters_with_stats(profiles, Config())
+    assert len(set(clusters.values())) == 1
+    assert stats.ratees_skipped_budget > 0  # the block IS cut short...
+    assert stats.pairs_tested > 0  # ...and the farm is caught anyway
+
+
+def test_per_ratee_budget_is_per_block_not_cumulative():
+    # 6 independent 4-rater farms, each block spending exactly its own 6
+    # examinations: the per-block counter must reset, or the 2nd block onwards
+    # would inherit the 1st's spend and be abandoned.
+    profiles = []
+    for f in range(6):
+        profiles += [RaterProfile(rater=f"f{f}r{i}", first_seen_ts=1000 + i, funder=None,
+                                  ratees=frozenset({f"ratee{f}"})) for i in range(4)]
+    clusters, stats = cluster_raters_with_stats(profiles, Config(sybil_max_pairs_per_ratee=6))
+    assert stats.ratees_skipped_budget == 0 and stats.truncated is False
+    assert stats.pairs_tested == 36  # 6 blocks x C(4, 2)
+    assert len(set(clusters.values())) == 6
+
+
+# --- deterministic block order (I2) ------------------------------------------
+
+# `bridge` carries BOTH busy ratees, so the order in which `by_ratee` first
+# learns of them is the iteration order of a 2-element frozenset of strings --
+# i.e. PYTHONHASHSEED-dependent. The budget covers exactly one block, so
+# whichever block runs first is the only one whose raters ever merge.
+_ORDER_PROBE = """
+import json, sys
+from robustrep.config import Config
+from robustrep.sybil import RaterProfile, cluster_raters_with_stats
+
+def P(r, ts, ratees):
+    return RaterProfile(rater=r, first_seen_ts=ts, funder=None, ratees=frozenset(ratees))
+
+profiles = [P("bridge", 0, {"pa", "pb"})]
+profiles += [P(f"a{i}", 10 + i, {"pa"}) for i in range(3)]
+profiles += [P(f"b{i}", 20 + i, {"pb"}) for i in range(3)]
+clusters, stats = cluster_raters_with_stats(
+    profiles, Config(sybil_max_pairs=6, sybil_max_pairs_per_ratee=10 ** 9))
+json.dump({"clusters": clusters, "truncated": stats.truncated}, sys.stdout, sort_keys=True)
+"""
+
+
+def _run_with_hash_seed(seed):
+    env = {**os.environ, "PYTHONHASHSEED": str(seed)}
+    out = subprocess.run([sys.executable, "-c", _ORDER_PROBE], env=env, capture_output=True,
+                         text=True, check=True)
+    return json.loads(out.stdout)
+
+
+def test_block_order_is_hash_seed_independent():
+    results = [_run_with_hash_seed(seed) for seed in (1, 2, 3)]
+    assert all(r["truncated"] for r in results), results  # the probe must actually truncate
+    assert results[1:] == results[:-1], results
+
+
+def test_abandoned_block_is_counted_once_across_both_inner_loops():
+    # A block whose per-ratee budget runs out in the window loop must not be
+    # counted (or warned about) a second time when the same-funder loop then
+    # asks the same, already-stopped charge.
+    profiles = [P("n0", 0, None, {"z"}), P("n1", 1, None, {"z"})]  # mixed funders -> window loop runs
+    profiles += [P(f"f{i}", ts, "F", {"z"})  # sub-bucket spans > 1 window -> same-funder loop runs
+                 for i, ts in enumerate([0, 1, 2, 200_000, 200_001, 200_002])]
+    _, stats = cluster_raters_with_stats(profiles, Config(sybil_max_pairs_per_ratee=2))
+    assert stats.ratees_skipped_budget == 1
+    assert stats.truncated is False
