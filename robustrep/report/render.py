@@ -126,7 +126,7 @@ def _top_tie_block_lines(scored: pd.DataFrame, sensitivity: pd.DataFrame) -> lis
             f"against a base top set of {base_size}.")
     if base_size > 0 and n_tie / base_size >= _TIE_DOMINANCE_SHARE:
         text += (" The top set is essentially one tie block in which every member holds the "
-                 "same rank, so Spearman's rho is therefore uninformative on this data: any "
+                 "same rank, and Spearman's rho is therefore uninformative on this data: any "
                  "value is driven by the few agents outside the block, and a value near 0 "
                  "reflects tie order, not a ranking change. Read `top_set_jaccard`.")
     return [text]
