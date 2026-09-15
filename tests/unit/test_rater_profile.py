@@ -182,6 +182,13 @@ class FakeV2HttpBadJson:
         return _FakeResponse(body=b"<html>not json</html>")
 
 
+def _warnings(caplog, logger_name):
+    """WARNING records emitted by exactly ``logger_name``. Counting every
+    WARNING in ``caplog`` would also pick up unrelated ones (e.g. http_util
+    declining to redact a short test API key)."""
+    return [r for r in caplog.records if r.levelno == logging.WARNING and r.name == logger_name]
+
+
 def bs_tx(hash_, block, ts, from_hash, to_hash="0x6974"):
     return {"hash": hash_, "block_number": block, "timestamp": ts,
             "from": {"hash": from_hash}, "to": {"hash": to_hash}}
@@ -491,7 +498,7 @@ def test_first_tx_unparseable_timestamp_returns_none_with_one_warning(caplog):
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
         assert c.first_tx("0xA") is None
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
     assert len(warnings) == 1
     assert "not-a-number" in warnings[0].getMessage() and "0xa" in warnings[0].getMessage()
 
@@ -1256,7 +1263,7 @@ def test_etherscan_negative_timestamp_returns_none_with_one_warning(caplog):
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
         assert c.first_tx("0xA") is None
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
     assert len(warnings) == 1 and "'-1'" in warnings[0].getMessage()
 
 
@@ -1282,7 +1289,7 @@ def test_blockscout_pre_1970_timestamp_returns_none_with_one_warning(caplog):
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
         assert c.first_tx("0xA") is None
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
     assert len(warnings) == 1 and "1900-01-01" in warnings[0].getMessage()
 
 
@@ -1291,7 +1298,7 @@ def test_blockscout_far_future_timestamp_returns_none_with_one_warning(caplog):
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
         assert c.first_tx("0xA") is None
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
     assert len(warnings) == 1 and "2200-01-01" in warnings[0].getMessage()
 
 
@@ -1300,7 +1307,7 @@ def test_blockscout_garbage_timestamp_returns_none_with_one_warning(caplog):
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
         assert c.first_tx("0xA") is None
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
     assert len(warnings) == 1 and "garbage" in warnings[0].getMessage()
 
 
@@ -1338,10 +1345,10 @@ def test_next_page_params_with_nothing_safe_stops_paging(caplog):
              "next_page_params": {"BAD/KEY": "x"}}
     http = FakeV2Http([page1])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.blockscout_util"):
         assert c.first_tx("0xA") is None
     assert len(http.calls) == 1
-    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert _warnings(caplog, "robustrep.sources.blockscout_util")
 
 
 def test_next_page_params_non_dict_stops_paging():
@@ -1362,3 +1369,91 @@ def test_next_page_params_key_length_is_bounded():
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
     c.first_tx("0xA")
     assert set(http.calls[1]) == {"index", "filter"}
+
+
+# --- I2: non-finite JSON numbers never reach the raters cache -----------------------
+
+
+def test_etherscan_overflowing_timestamp_returns_none_with_one_warning(caplog):
+    # 1e400 is standards-conformant JSON that float() renders as inf, and
+    # int(inf) raises OverflowError -- outside first_tx's documented contract.
+    http = FakeHttp([b'{"status": "1", "result": [{"blockNumber": "3", "timeStamp": 1e400, '
+                     b'"from": "0xF"}]}'])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+        assert c.first_tx("0xA") is None
+    assert len(_warnings(caplog, "robustrep.sources.rater_profile")) == 1
+
+
+def test_etherscan_infinity_string_timestamp_returns_none_with_one_warning(caplog):
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "Infinity",
+                                                  "from": "0xF"}]}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+        assert c.first_tx("0xA") is None
+    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
+    assert len(warnings) == 1 and "Infinity" in warnings[0].getMessage()
+
+
+def test_etherscan_overflowing_block_number_raises_value_error():
+    http = FakeHttp([b'{"status": "1", "result": [{"blockNumber": 1e400, "timeStamp": "99", '
+                     b'"from": "0xF"}]}'])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    with pytest.raises(ValueError) as exc:
+        c.first_tx("0xA")
+    assert "0xa" in str(exc.value).lower()
+
+
+def test_blockscout_overflowing_block_number_raises_value_error():
+    body = b'{"items": [{"hash": "0x1", "block_number": 1e400, "timestamp": "2026-01-01T00:00:00Z", ' \
+           b'"from": {"hash": "0xf"}}], "next_page_params": null}'
+    c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
+    with pytest.raises(ValueError):
+        c.first_tx("0xA")
+
+
+def test_infinity_json_constant_is_refused_before_parsing(caplog):
+    # The literal (non-standard) constant is rejected by read_json_capped, so
+    # it reads as an unparseable body and retries out as a ValueError.
+    http = FakeHttp([b'{"status": "1", "result": [{"timeStamp": Infinity}]}'] * 2)
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None, retries=2)
+    with pytest.raises(ValueError):
+        c.first_tx("0xA")
+
+
+# --- naive Blockscout timestamps are UTC, like the Z-suffixed ones ------------------
+
+
+def test_blockscout_naive_timestamp_is_read_as_utc():
+    naive = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19", "0xf")], "next_page_params": None}
+    zulu = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19Z", "0xf")], "next_page_params": None}
+    c1 = BlockscoutV2Client(session=FakeV2Http([naive]), sleep=lambda _: None)
+    c2 = BlockscoutV2Client(session=FakeV2Http([zulu]), sleep=lambda _: None)
+    assert c1.first_tx("0xA") == c2.first_tx("0xA")
+
+
+# --- L5: pagination echoes are bounded in size and count ----------------------------
+
+
+def test_next_page_params_drops_an_over_long_value():
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+             "next_page_params": {"block_number": 100, "index": "x" * 129}}
+    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+             "next_page_params": None}
+    http = FakeV2Http([page1, page2])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    c.first_tx("0xA")
+    assert set(http.calls[1]) == {"block_number", "filter"}
+
+
+def test_next_page_params_caps_the_number_of_keys():
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+             "next_page_params": {f"k{chr(ord('a') + i)}": i for i in range(12)}}
+    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+             "next_page_params": None}
+    http = FakeV2Http([page1, page2])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    c.first_tx("0xA")
+    sent = dict(http.calls[1])
+    sent.pop("filter")
+    assert len(sent) == 8

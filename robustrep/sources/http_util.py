@@ -38,16 +38,35 @@ import logging
 import threading
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 # Bytes pulled from the socket per read. Large enough that a normal body costs
 # only a handful of reads, small enough that overshooting the cap costs at most
 # this much extra memory.
 CHUNK_BYTES = 64 * 1024
+
+# Shortest API key worth installing a redaction filter for. A short key is a
+# substring of ordinary log text ("GET", "api"), so redacting it would corrupt
+# every urllib3 record without protecting a real secret -- real provider keys
+# are 32+ characters.
+MIN_REDACTABLE_KEY_CHARS = 8
 
 
 class ResponseTooLarge(ValueError):
     """A response body exceeded the caller's byte cap and was abandoned
     unparsed. Its message names only the limit -- never the URL or the body --
     so it is safe to log verbatim."""
+
+
+def _reject_non_finite(name: str):
+    """``json.loads`` calls this for the non-standard ``NaN``/``Infinity``/
+    ``-Infinity`` literals, which it would otherwise decode into float values
+    no caller expects: ``int(inf)`` raises ``OverflowError`` -- outside every
+    documented error contract downstream -- and an ``inf`` that survives gets
+    stored as a timestamp or a block number. Refusing them here means a body
+    containing one reads as "not valid JSON", which every caller already
+    handles."""
+    raise ValueError(f"non-finite JSON constant in response body: {name}")
 
 
 def read_json_capped(response, max_bytes: int) -> object:
@@ -61,7 +80,8 @@ def read_json_capped(response, max_bytes: int) -> object:
 
     Raises ``ResponseTooLarge`` (a ``ValueError``) as soon as the accumulated
     body passes ``max_bytes``, without parsing anything; ``ValueError`` if the
-    body is not valid UTF-8 or not valid JSON; and ``ValueError`` if
+    body is not valid UTF-8, not valid JSON, or contains a non-finite numeric
+    constant (see ``_reject_non_finite``); and ``ValueError`` if
     ``max_bytes`` is not positive or the response carries no ``raw`` stream
     (i.e. the caller forgot ``stream=True``). Closing the response is the
     caller's job.
@@ -81,18 +101,21 @@ def read_json_capped(response, max_bytes: int) -> object:
         if total > max_bytes:
             raise ResponseTooLarge(f"response body exceeds the {max_bytes} byte limit")
         chunks.append(chunk)
-    return json.loads(b"".join(chunks).decode("utf-8", errors="strict"))
+    text = b"".join(chunks).decode("utf-8", errors="strict")
+    return json.loads(text, parse_constant=_reject_non_finite)
 
 
 # What an API key is replaced with in a redacted log record (M1).
 REDACTED = "[redacted]"
 
-# Loggers urllib3 writes request lines to. A ``logging.Filter`` installed on a
-# logger only sees records logged *on that logger* (filters, unlike handlers,
-# are not consulted up the hierarchy), so both the package logger and the
-# connectionpool logger that actually emits `GET /api?...&apikey=... HTTP/1.1`
-# need their own copy.
-_URLLIB3_LOGGERS = ("urllib3", "urllib3.connectionpool")
+# Loggers urllib3 writes URLs to. A ``logging.Filter`` installed on a logger
+# only sees records logged *on that logger* (filters, unlike handlers, are not
+# consulted up the hierarchy), so every logger that can echo a request URL --
+# the connectionpool one that emits `GET /api?...&apikey=... HTTP/1.1`, plus
+# the retry and poolmanager loggers that name the URL when retrying or
+# redirecting -- needs its own copy.
+_URLLIB3_LOGGERS = ("urllib3", "urllib3.connectionpool", "urllib3.util.retry",
+                     "urllib3.poolmanager")
 
 # Installed redactors, keyed by the API key they scrub, so constructing many
 # clients with the same key does not stack duplicate filters on a process-wide
@@ -113,6 +136,13 @@ class ApiKeyRedactor(logging.Filter):
     substituted in place in both ``record.msg`` and every string in
     ``record.args``, so every handler downstream sees the redacted form; the
     record is always allowed through (this filter redacts, it never drops).
+
+    Only ``str`` values are scrubbed: a key reachable solely through some
+    object's ``repr`` (an exception instance carrying the URL, say) is not
+    rewritten, because mutating arbitrary objects to sanitize them is not
+    something a log filter can do safely. Keep secrets out of the objects you
+    log, and treat this as the backstop for library code that formats a URL
+    into a record.
     """
 
     def __init__(self, key: str):
@@ -148,14 +178,27 @@ def short_for_log(value, limit: int = 40) -> str:
 
 
 def install_key_redaction(key: Optional[str]) -> None:
-    """Install an ``ApiKeyRedactor`` for ``key`` on urllib3's loggers, once
-    per distinct key (M1). A falsy key (Blockscout, or an unconfigured
-    Etherscan client) installs nothing -- there is no secret to hide, and an
-    empty-string match would redact every record."""
+    """Install an ``ApiKeyRedactor`` for ``key`` on urllib3's loggers, once per
+    distinct key (M1).
+
+    A falsy key (Blockscout, or an unconfigured Etherscan client) installs
+    nothing -- there is no secret to hide, and an empty-string match would
+    redact every record. A key shorter than ``MIN_REDACTABLE_KEY_CHARS`` also
+    installs nothing but logs one WARNING (naming its length, never the key):
+    such a value is likely to occur inside unrelated log text, so redacting it
+    would mangle every urllib3 record while protecting nothing real -- but the
+    operator should know their key is going unredacted."""
     if not key:
         return
     with _redactor_lock:
         if key in _installed_redactors:
+            return
+        if len(key) < MIN_REDACTABLE_KEY_CHARS:
+            # Remembered (as None) so this warns once per key, not per client.
+            _installed_redactors[key] = None
+            logger.warning("http_util: not redacting a %d-character API key from urllib3 logs "
+                            "(under the %d-character minimum) - it would match unrelated log text",
+                            len(key), MIN_REDACTABLE_KEY_CHARS)
             return
         redactor = ApiKeyRedactor(key)
         for name in _URLLIB3_LOGGERS:

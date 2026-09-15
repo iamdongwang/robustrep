@@ -799,3 +799,96 @@ def test_owners_of_all_ids_malformed_never_batches():
 
     assert b.owners_of(NeverRpc(), ["0xzz", str(2 ** 256)], batch_size=10) == {"0xzz": None,
                                                                                str(2 ** 256): None}
+
+
+# --- I1: a log whose data does not ABI-decode is skipped, not fatal -----------------
+
+
+def test_new_feedback_with_empty_data_returns_none_with_one_warning(caplog):
+    # eth_abi raises InsufficientDataBytes (not ValueError) here, and
+    # sync_feedback treats a decode exception as a bug worth aborting the whole
+    # run for -- so anyone able to emit a 2-byte log could stop the pipeline.
+    log = _log(b.TOPIC_NEW_FEEDBACK, [_agent_topic(), _CLIENT_TOPIC, _agent_topic(0)], b"")
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(log) is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "0xt" in warnings[0].getMessage()
+
+
+def test_response_with_empty_data_returns_none_with_one_warning(caplog):
+    log = _log(b.TOPIC_RESPONSE, [_agent_topic(), _CLIENT_TOPIC, _CLIENT_TOPIC], b"")
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(log) is None
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_new_feedback_with_truncated_data_returns_none(caplog):
+    log = _log(b.TOPIC_NEW_FEEDBACK, [_agent_topic(), _CLIENT_TOPIC, _agent_topic(0)], b"\x00" * 32)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b.decode_log(log) is None
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_revoked_with_empty_data_still_decodes():
+    # FeedbackRevoked carries no ABI data at all (every field is an indexed
+    # topic), so "0x" is its normal shape -- it must not be skipped.
+    log = _log(b.TOPIC_REVOKED, [_agent_topic(), _CLIENT_TOPIC, _agent_topic(9)], b"")
+    assert b.decode_log(log)["feedback_index"] == 9
+
+
+def test_decode_log_never_raises_the_eth_abi_error():
+    log = _log(b.TOPIC_NEW_FEEDBACK, [_agent_topic(), _CLIENT_TOPIC, _agent_topic(0)], b"\x01")
+    assert b.decode_log(log) is None
+
+
+def test_sync_feedback_continues_past_an_undecodable_log(tmp_path):
+    good_data = encode(["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"],
+                       [1, 5, 0, "q", "", "", "", b"\x00" * 32])
+    bad = _log(b.TOPIC_NEW_FEEDBACK, [_agent_topic(1), _CLIENT_TOPIC, _agent_topic(0)], b"")
+    good = _log(b.TOPIC_NEW_FEEDBACK, [_agent_topic(2), _CLIENT_TOPIC, _agent_topic(0)], good_data, idx=1)
+    rpc = FakeRpc({(1, 10): [bad, good]}, head=10)
+    s = Store(tmp_path / "t.db")
+    n = b.sync_feedback(s, rpc, chunk=10, start_block=1, end_block=10)
+    assert n == 1  # the good log landed; the undecodable one was skipped
+    assert s.get_sync("last_block") == "10"  # checkpoint advanced, no abort
+    assert s.pop_failed_ranges() == []
+
+
+# --- I3: eth_call owner results are validated before being stored -------------------
+
+
+def test_decode_owner_result_accepts_a_padded_word():
+    assert b._decode_owner_result("0x" + "00" * 12 + "ee" * 20) == "0x" + "ee" * 20
+
+
+def test_decode_owner_result_rejects_a_garbage_string(caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b._decode_owner_result("garbage-from-a-hostile-node-xxxxxxxxxxxxxxxxxxx") is None
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_decode_owner_result_rejects_a_non_string(caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b._decode_owner_result(12345) is None
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_decode_owner_result_keeps_none_and_empty_result_silent(caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        assert b._decode_owner_result(None) is None
+        assert b._decode_owner_result("0x") is None
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_owners_of_never_stores_a_garbage_owner():
+    class GarbageRpc:
+        def batch(self, calls):
+            return ["not-an-address"] * len(calls)
+
+    assert b.owners_of(GarbageRpc(), ["1", "2"], batch_size=10) == {"1": None, "2": None}
+
+
+def test_owner_call_data_rejects_padded_or_separated_digits():
+    for bad in (" 12 ", "1_0", "+7", "12.0", "0b11"):
+        with pytest.raises(ValueError):
+            b._owner_call_data(bad)
