@@ -147,7 +147,11 @@ def _group_scores(real: pd.Series, decimals: int, fit_share: float) -> tuple[np.
        all. It sits below "unit" and spans a 100x wider range, so it demands
        positive evidence of percent shape before it may claim a group: without
        the "above 1" test, two records of real 1.01 would carry a d2 unit group
-       of 0.20..0.95 onto this rung and collapse it to 0.002..0.0095.
+       of 0.20..0.95 onto this rung and collapse it to 0.002..0.0095. The cost is
+       a false negative: a genuine decimal percent group whose values are mostly
+       sub-1% (error rates, say) has no evidence of percent shape either and
+       falls to `rank`, keeping its order but losing absolute meaning -- which
+       beats the alternative, a 100x squash of every honest unit group.
     5. constant - all values identical, within the same outlier tolerance: a
        neutral 0.5. Tolerance matters here too, or one record would move an
        otherwise-constant group onto the group-relative "rank" rung. The test is

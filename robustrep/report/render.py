@@ -190,7 +190,7 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     lines += ["## Sensitivity",
               "Rank stability of the top-N robust-score ranking under reasonable parameter "
               "perturbations (evidence-weight shape, sybil Jaccard threshold, sybil time "
-              "window), each vs the base configuration. Top sets are tie-inclusive (every "
+              "window, normalization fit share), each vs the base configuration. Top sets are tie-inclusive (every "
               "agent scoring >= the N-th highest score). `top_set_jaccard` is the primary "
               "stability measure: the overlap of the base and variant top sets. Spearman's "
               "rho (Pearson correlation of average ranks over the union of the two top sets, "

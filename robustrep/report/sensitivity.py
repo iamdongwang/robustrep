@@ -26,9 +26,11 @@ from ..config import Config  # noqa: E402
 from ..pipeline import score  # noqa: E402
 from ..sybil import cluster_raters, profiles_from_records  # noqa: E402
 
-# The 7 variants required by the report (spec Sec 5.5b): base plus three axes
-# (evidence-weight shape, sybil Jaccard threshold, sybil time window), each
-# perturbed in both directions.
+# The 9 variants required by the report (spec Sec 5.5b): base plus four axes
+# (evidence-weight shape, sybil Jaccard threshold, sybil time window,
+# normalization fit share), each perturbed in both directions. The fit share's
+# upper end is 1.0, which is strictly all-or-nothing -- no small-group outlier
+# tolerance -- so `fit_1.0` also measures what that tolerance is worth.
 VARIANTS = {
     "base": {},
     "weights_flatter": {"evidence_weights": (0.3, 0.5, 0.8, 1.0)},
@@ -37,6 +39,8 @@ VARIANTS = {
     "jaccard_0.9": {"sybil_jaccard": 0.9},
     "window_6h": {"sybil_window_s": 6 * 3600},
     "window_72h": {"sybil_window_s": 72 * 3600},
+    "fit_0.8": {"norm_fit_share": 0.8},
+    "fit_1.0": {"norm_fit_share": 1.0},
 }
 
 

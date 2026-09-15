@@ -390,3 +390,15 @@ def test_randomized_groups_always_produce_valid_scores():
     assert np.isfinite(scores).all()
     assert ((scores >= 0.0) & (scores <= 1.0)).all()
     assert set(out["norm_rule"]) <= {RULE_BINARY, RULE_PERCENT, RULE_UNIT, RULE_CONSTANT, RULE_RANK}
+
+
+def test_percent_gate_rejects_a_group_whose_only_high_values_are_the_outliers():
+    # M-1: the "> 1" half of the rung-4 gate is load-bearing. Nine real 1.0 plus
+    # two real 50.0 all sit in [0, 100], so `percent_fits` alone would claim the
+    # group and squash the honest 1.0s to 0.01. Only the two outliers are above 1,
+    # which is nowhere near the fit share, so the rung is refused and the group
+    # falls to "rank" -- where the honest majority holds the average rank 5 of 11.
+    out = normalize(_frame([100] * 9 + [5000, 5000], scale="d2"))   # real: nine 1.0, two 50.0
+    assert set(out["norm_rule"]) == {RULE_RANK}
+    assert (out["score"].iloc[:9] >= 0.4).all()
+    assert out["score"].iloc[0] == 0.4
