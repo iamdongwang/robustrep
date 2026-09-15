@@ -896,6 +896,10 @@ def test_vetted_host_is_the_host_requests_would_connect_to(url):
     "ipfs:///etc/passwd",
     "ipfs://Qm1/../../api/v0/id",
     "ipfs://",
+    # requests' requote_uri decodes %2e back into "." on the wire, so a raw
+    # ".." check alone is not enough -- any % in the tail is refused.
+    "ipfs://%2e%2e/%2e%2e/api/v0/id",
+    "ipfs://a/%2E%2E/x",
 ])
 def test_ipfs_uri_with_traversal_or_absolute_tail_is_refused(uri):
     sess = NeverCalledSession()
