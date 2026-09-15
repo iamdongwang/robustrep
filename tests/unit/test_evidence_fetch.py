@@ -834,3 +834,126 @@ def test_redirect_location_with_control_characters_is_refused(loc):
                          ef.DEFAULT_TIMEOUT) is None
     assert sess.calls == ["http://example.com/a"]
     assert first.closed is True
+
+
+# --- host allowlist: the vetted host must survive requests' requoting --------------
+
+@pytest.mark.parametrize("url", [
+    # requests' prepare_url runs requote_uri(), which percent-DECODES unreserved
+    # characters in the authority: these vet as one host and connect to another.
+    "http://169.254.169.25%34/x",
+    "http://127.0.0.%31/",
+    "http://ev%69l.example/",
+    # ...and percent-ENCODES others, again changing the connected host.
+    'http://exa"mple.com/',
+    "http://ex`ample.com/",
+    "http://exa^mple.com/",
+    "http://host_name.example/",  # underscore is not an LDH label character
+    "http://-lead.example/",
+    "http://.example.com/",
+])
+def test_is_safe_url_refuses_host_outside_ldh_allowlist(url):
+    assert ef._is_safe_url(url, resolver=_public_resolver) is False
+
+
+def test_redirect_location_with_percent_encoded_host_is_refused():
+    first = FakeResp(302, headers={"location": "http://169.254.169.25%34/"})
+    sess = FakeSession({"http://example.com/a": first})
+    assert ef._fetch_url("http://example.com/a", sess, _public_resolver,
+                         ef.DEFAULT_TIMEOUT) is None
+    assert sess.calls == ["http://example.com/a"]
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/path?x=1",
+    "http://sub.domain.example/a/b%20c?q=%2F#frag",
+    "https://xn--bcher-kva.example./x",  # punycode label + trailing root dot
+    "http://a-b-c.example/p@th",  # an @ in the *path* is not userinfo
+    "https://example.com/ünicode",  # non-ASCII path, ASCII host
+    "http://example.com:80/a?b=c%20d&e=f",
+])
+def test_vetted_host_is_the_host_requests_would_connect_to(url):
+    """The invariant the whole guard rests on: whatever transforms the URL
+    between here and the socket (``requests.PreparedRequest.prepare_url`` ->
+    ``requote_uri`` -> urllib3), the host/port actually connected to is the
+    host/port ``_is_safe_url`` vetted and resolved."""
+    import requests
+    from urllib3.util import parse_url
+
+    assert ef._is_safe_url(url, resolver=_public_resolver) is True
+    parts = urlsplit(url)
+    prepared = requests.Request("GET", ef._canonical_url(url)).prepare()
+    connected = parse_url(prepared.url)
+    default_port = 443 if parts.scheme == "https" else 80
+    assert connected.host == parts.hostname.rstrip(".").lower()
+    assert (connected.port or default_port) == (parts.port or default_port)
+
+
+# --- ipfs tails must stay under the gateway's /ipfs/ prefix -------------------------
+
+@pytest.mark.parametrize("uri", [
+    "ipfs://../api/v0/id",  # would address an arbitrary gateway API path
+    "ipfs:///etc/passwd",
+    "ipfs://Qm1/../../api/v0/id",
+    "ipfs://",
+])
+def test_ipfs_uri_with_traversal_or_absolute_tail_is_refused(uri):
+    sess = NeverCalledSession()
+    assert resolve_uri(uri) is None
+    assert http_fetch_text(uri, session=sess) is None
+    assert sess.calls == []
+
+
+# --- session lifetime ----------------------------------------------------------------
+
+def test_fetch_url_closes_a_session_it_created(monkeypatch):
+    created = []
+
+    class OwnedSession:
+        def __init__(self):
+            self.closed = False
+            self.calls = []
+            created.append(self)
+
+        def get(self, url, **kwargs):
+            self.calls.append(url)
+            return FakeResp(200, body=b"hi")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(ef.requests, "Session", OwnedSession)
+    assert ef._fetch_url("http://example.com/x", None, _public_resolver,
+                         ef.DEFAULT_TIMEOUT) == "hi"
+    assert len(created) == 1 and created[0].closed is True
+
+
+def test_fetch_url_closes_its_own_session_when_the_request_raises(monkeypatch):
+    created = []
+
+    class ExplodingSession:
+        def __init__(self):
+            self.closed = False
+            created.append(self)
+
+        def get(self, url, **kwargs):
+            raise ConnectionError("network unreachable")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(ef.requests, "Session", ExplodingSession)
+    assert ef._fetch_url("http://example.com/x", None, _public_resolver,
+                         ef.DEFAULT_TIMEOUT) is None
+    assert len(created) == 1 and created[0].closed is True
+
+
+def test_fetch_url_does_not_close_a_caller_supplied_session():
+    # classify_all reuses one thread-local session across many URIs; closing a
+    # session this function did not create would break that reuse.
+    sess = FakeSession({"http://example.com/x": FakeResp(200, body=b"hi")})
+    sess.closed = False
+    sess.close = lambda: setattr(sess, "closed", True)
+    assert ef._fetch_url("http://example.com/x", sess, _public_resolver,
+                         ef.DEFAULT_TIMEOUT) == "hi"
+    assert sess.closed is False
