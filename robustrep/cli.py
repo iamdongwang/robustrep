@@ -174,7 +174,8 @@ def _step_owners(store: Store, rpc: RpcClient, log_every: int = OWNER_LOG_EVERY,
     return f"agent owners resolved: {resolved}/{len(agents)}"
 
 
-def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str = ProfileSource.auto) -> str:
+def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str = ProfileSource.auto,
+                  profile_rps: Optional[float] = None, profile_retries: Optional[int] = None) -> str:
     """Profile not-yet-profiled raters via ``profile_source``, or fall back
     offline (``profile_source="none"``).
 
@@ -188,6 +189,13 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
     plan-configuration error; the caller decides how to handle it. Raises
     ``ValueError`` when ``profile_source="etherscan"`` but no key is
     available.
+
+    ``profile_rps``/``profile_retries``, when given (not ``None``), override
+    the chosen client's own default request rate / retry count -- see
+    ``rater_profile.default_client``. The ETA estimate printed before
+    profiling starts uses the *effective* rps -- the client's actual
+    configured rate (``1 / client.gap``), which is ``profile_rps`` when
+    given, else whatever the client itself defaulted to.
     """
     key = etherscan_key if etherscan_key is not None else os.environ.get("ETHERSCAN_API_KEY")
     # `profile_source` may be a ProfileSource (from the `fetch` CLI option) or
@@ -195,13 +203,14 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
     # than `str(...)`, which on a `(str, Enum)` member yields "ProfileSource.
     # auto" rather than "auto".
     source = profile_source.value if isinstance(profile_source, ProfileSource) else profile_source
-    client = default_client(source, key)
+    client = default_client(source, key, rps=profile_rps, retries=profile_retries)
     # store.distinct_clients() computed exactly once here and handed to
     # enrich_raters(addresses=...) below, instead of letting it re-query the
     # store itself.
     targets = store.distinct_clients()
     if client is not None and targets:
-        eta_h = estimate_seconds(len(targets), DEFAULT_RPS) / 3600
+        effective_rps = 1.0 / client.gap
+        eta_h = estimate_seconds(len(targets), effective_rps) / 3600
         source_label = getattr(client, "source", "etherscan").capitalize()
         typer.echo(f"profiling {len(targets)} rater(s) via {source_label}, ETA ~{eta_h:.1f}h")
     n = enrich_raters(store, client, addresses=targets)
@@ -242,6 +251,14 @@ def fetch(
              "Etherscan key is available, in which case Etherscan V2; 'blockscout' always uses Base's "
              "free Blockscout instance; 'etherscan' always uses Etherscan V2 (requires a key -- note "
              "Etherscan's free plan does not cover Base); 'none' skips profiling (offline fallback)."),
+    profile_rps: Optional[float] = typer.Option(
+        None, "--profile-rps", min=0.1,
+        help="Requests/sec against the rater-profile HTTP source (default: the chosen client's own "
+             "default -- 1.0 for Blockscout, 4.0 for Etherscan)."),
+    profile_retries: Optional[int] = typer.Option(
+        None, "--profile-retries", min=1,
+        help="Retry attempts for a transient rater-profile HTTP failure, per address (default: the "
+             "chosen client's own default -- 5 for Blockscout, 3 for Etherscan)."),
     skip_evidence: bool = typer.Option(False, "--skip-evidence", help="Skip evidence URI classification."),
     evidence_workers: int = typer.Option(
         8, "--evidence-workers", min=1,
@@ -300,7 +317,8 @@ def fetch(
             typer.echo(f"raters profiling skipped; rater profile mode: {mode}")
         else:
             try:
-                typer.echo(_step_raters(store, etherscan_key, profile_source=profile_source))
+                typer.echo(_step_raters(store, etherscan_key, profile_source=profile_source,
+                                        profile_rps=profile_rps, profile_retries=profile_retries))
             except ValueError as e:
                 typer.echo(f"ERROR: {e}")
                 raise typer.Exit(1)
