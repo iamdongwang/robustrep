@@ -18,8 +18,10 @@ retrying an old failed range can never rewind the cursor.
 
 Every field of a log is attacker-influenced (anyone can emit an event from any
 contract, and a node could serve a hand-written one), so ``decode_log`` validates
-the shape of each topic and of the data blob before decoding (security review
-finding L4) and *skips* a log whose shape is wrong -- returning ``None`` with one
+the shape of each topic, of the data blob, and of the numeric fields the node
+supplies (``blockNumber``, ``logIndex`` -- accepted only as ``0x``-prefixed hex
+quantities, see ``_hexint``) before decoding (security review finding L4) and
+*skips* a log whose shape is wrong -- returning ``None`` with one
 WARNING, exactly like an unrecognized topic0 -- rather than raising. Raising would
 be a new crash path reachable by anyone willing to emit a malformed log: see the
 "a failure there is a *bug*" paragraph below, which would turn one hostile log
@@ -107,11 +109,28 @@ def _uint(topic: str) -> int:
     return int(topic, 16)
 
 
+# A JSON-RPC "quantity": "0x" plus 1-64 hex digits (a uint256 at most).
+_HEX_QUANTITY_RE = re.compile(r"^0x[0-9a-fA-F]{1,64}$")
+
+
 def _hexint(v) -> int:
-    """Coerce a block number / log index field to ``int``, accepting either a
-    already-decoded ``int`` or a ``0x``-prefixed hex string (different RPC
-    clients/fixtures represent these differently)."""
-    return v if isinstance(v, int) else int(v, 16)
+    """One JSON-RPC *quantity* field (block number, log index, block timestamp)
+    as an ``int``, accepting only the wire form the spec defines.
+
+    Raises ``ValueError`` for anything else -- a bare ``int``, a decimal
+    string, a float, ``None``, a list. Every value passed here came from a node
+    we do not control, and the permissive version of this function ended one
+    step from a crash: JSON's ``1e400`` decodes to ``float("inf")``, and
+    ``int(inf, 16)`` raises ``TypeError``, an exception type no caller here
+    catches -- so one malformed field in one log aborted the whole sync through
+    ``sync_feedback``'s "a decode failure is a bug" path. An already-decoded
+    ``int`` is refused too, even though it is harmless: distinguishing "a
+    client decoded this for us" from "a node sent a number where the spec says
+    string" is guesswork, and callers have a cheap skip path either way.
+    """
+    if not isinstance(v, str) or not _HEX_QUANTITY_RE.match(v):
+        raise ValueError(f"not a 0x-prefixed hex quantity: {_short(v)!r}")
+    return int(v, 16)
 
 
 def _valid_shape(name: str, topics: list, data_hex, tx_hash) -> bool:
@@ -129,6 +148,19 @@ def _valid_shape(name: str, topics: list, data_hex, tx_hash) -> bool:
                         name, _short(tx_hash), _short(data_hex))
         return False
     return True
+
+
+def _log_numbers(log: dict, name: str) -> Optional[dict]:
+    """``{"block": int, "log_index": int}`` for one log, or ``None`` (one
+    WARNING) if either field is not a hex quantity -- see ``_hexint``. Skipping
+    keeps a node's malformed number out of ``sync_feedback``'s fatal path, the
+    same way a malformed topic or an undecodable data blob is skipped."""
+    try:
+        return {"block": _hexint(log["blockNumber"]), "log_index": _hexint(log["logIndex"])}
+    except ValueError as e:
+        logger.warning("decode_log: skipping %s log in tx %r: %s",
+                        name, _short(log.get("transactionHash")), e)
+        return None
 
 
 def _abi_decode(types: list, data: bytes, name: str, tx_hash):
@@ -163,10 +195,12 @@ def decode_log(log: dict) -> Optional[dict]:
 
     Also returns ``None`` -- logging one WARNING -- for a recognized event whose
     *shape* is wrong: a topic that is not ``0x`` plus 64 hex characters, a
-    ``data`` field that is not ``0x`` plus whole hex bytes (L4), or a data blob
-    that does not ABI-decode for its event (I1, see ``_abi_decode``). These fields
-    come from whoever emitted the event, so a malformed one must be skipped like
-    any uninteresting log, not turned into an exception that aborts the caller's
+    ``data`` field that is not ``0x`` plus whole hex bytes (L4), a data blob
+    that does not ABI-decode for its event (I1, see ``_abi_decode``), or a
+    ``blockNumber``/``logIndex`` that is not a ``0x``-prefixed hex quantity
+    (see ``_hexint``). All of these come from whoever emitted the event, or
+    from the node that served it, so a malformed one must be skipped like any
+    uninteresting log -- not turned into an exception that aborts the caller's
     whole sync (see the module docstring).
 
     Raises ``ValueError`` (naming the problem, never a bare ``IndexError`` or
@@ -190,8 +224,11 @@ def decode_log(log: dict) -> Optional[dict]:
     data_hex = log.get("data", "0x")
     if not _valid_shape(name, topics, data_hex, log.get("transactionHash")):
         return None
-    base = dict(chain=CHAIN, block=_hexint(log["blockNumber"]), tx_hash=log["transactionHash"],
-                log_index=_hexint(log["logIndex"]))
+    numbers = _log_numbers(log, name)
+    if numbers is None:
+        return None
+    base = dict(chain=CHAIN, block=numbers["block"], tx_hash=log["transactionHash"],
+                log_index=numbers["log_index"])
     data = bytes.fromhex(data_hex[2:]) if data_hex != "0x" else b""
     if t0 == TOPIC_REVOKED:
         # Every FeedbackRevoked field is an indexed topic, so there is no data
@@ -233,6 +270,20 @@ def _advance_checkpoint(store: Store, chunk_end: int) -> None:
     store.set_sync("last_block", str(new_val))
 
 
+def _chain_head(rpc, confirmations: int) -> int:
+    """The chain head reported by ``eth_blockNumber``, less ``confirmations``.
+
+    Raises ``RpcError`` if the node's answer is not a hex quantity. There is no
+    chunk to skip when the head itself is unusable, so this fails the run the
+    way every other RPC problem does -- an ``RpcError`` the CLI turns into a
+    clean exit code -- rather than with a ``TypeError`` traceback."""
+    raw = rpc.call("eth_blockNumber", [])
+    try:
+        return _hexint(raw) - confirmations
+    except ValueError as e:
+        raise RpcError(f"eth_blockNumber returned a malformed head: {e}") from None
+
+
 def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLOY_BLOCK,
                    end_block: Optional[int] = None, confirmations: int = DEFAULT_CONFIRMATIONS) -> int:
     """Pull NewFeedback/FeedbackRevoked/ResponseAppended from the last checkpoint
@@ -259,7 +310,7 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
     exception propagates. If the checkpoint is already at or past ``end_block``,
     no RPC calls are made and 0 is returned.
     """
-    head = end_block if end_block is not None else int(rpc.call("eth_blockNumber", []), 16) - confirmations
+    head = end_block if end_block is not None else _chain_head(rpc, confirmations)
     last = store.get_sync("last_block")
     frm = int(last) + 1 if last is not None else start_block
     pending = store.pop_failed_ranges() + [(a, min(a + chunk - 1, head)) for a in range(frm, head + 1, chunk)]
@@ -354,13 +405,18 @@ def fill_block_timestamps(store: Store, rpc, batch_size: int = 100, state: Optio
     ``state`` to carry that knowledge across multiple calls too. Raises
     ``RpcError`` naming the block if any resolved block comes back ``null``
     (should not happen for an already-mined block; treated as a hard error
-    rather than silently caching a missing timestamp). Returns the number of
-    blocks that were missing (and are now cached), 0 if none were missing (in
-    which case no RPC calls are made at all).
+    rather than silently caching a missing timestamp). A block whose timestamp
+    is *present but unusable* -- not a ``0x``-prefixed hex quantity, see
+    ``_hexint`` -- is skipped with one WARNING instead: it stays uncached (and
+    therefore still listed by ``Store.missing_block_ts``, so a later run
+    retries it) while every other block in its batch is cached normally.
+    Returns the number of blocks whose timestamp is now cached, 0 if none were
+    missing (in which case no RPC calls are made at all).
     """
     state = state or BatchState()
     missing = store.missing_block_ts()
     step = max(batch_size, 1)
+    cached = 0
     for i in range(0, len(missing), step):
         block_nums = missing[i:i + step]
         if batch_size <= 1 or state.batch_unsupported:
@@ -375,9 +431,18 @@ def fill_block_timestamps(store: Store, rpc, batch_size: int = 100, state: Optio
         for block_num, blk in zip(block_nums, blocks):
             if blk is None:
                 raise RpcError(f"fill_block_timestamps: block {block_num} not found (null result)")
-            pairs.append((block_num, _hexint(blk["timestamp"])))
+            try:
+                pairs.append((block_num, _hexint(blk["timestamp"])))
+            except (KeyError, TypeError, ValueError) as e:
+                # A node-supplied timestamp that isn't a hex quantity is
+                # skipped, not fatal: the block simply stays uncached (and so
+                # stays in `missing_block_ts` for a later run to retry), while
+                # every other block in this batch is still cached.
+                logger.warning("fill_block_timestamps: skipping block %d: unusable timestamp (%s)",
+                                block_num, e)
         store.upsert_block_ts(pairs)
-    return len(missing)
+        cached += len(pairs)
+    return cached
 
 
 # uint256 upper bound: an agent id at or past this cannot be ABI-encoded, and
