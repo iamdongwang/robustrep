@@ -29,12 +29,35 @@ FIX = json.loads((Path(__file__).parent / "fixtures/base_logs_2000.json").read_t
 # swallows the underlying ``requests`` exception and re-raises a *redacted*
 # ``RpcError`` (see ``rpc._redact``: exception type, HTTP status, scheme+host
 # only), so the transport names below are what a connection failure or timeout
-# actually looks like by the time it reaches a test. The rate-limit entries
-# mirror ``rpc.BATCH_RATE_LIMIT`` plus the HTTP-level 429.
-RPC_UNAVAILABLE_MARKERS = (
-    "429", "too many requests", "over rate limit", "rate limit", "rate-limited",
-    "-32016", "-32005",
-    "connectionerror", "connecttimeout", "readtimeout", "timeout",
+# actually looks like by the time it reaches a test.
+#
+# Every marker is anchored enough not to fire on ordinary chain data: ``429``
+# alone would match a block number, so the HTTP statuses are matched as
+# ``"http <code>"``, which is exactly how ``_redact`` renders them.
+RATE_LIMIT_MARKERS = (
+    "http 429", "too many requests", "over rate limit", "rate limit",
+    "rate-limited", "-32016", "-32005",
+)
+
+# Transport-level failures and the server-side 5xx family: the endpoint is
+# broken or overloaded, which says nothing about the chain.
+TRANSPORT_MARKERS = (
+    "connectionerror", "connecttimeout", "readtimeout", "timeout", "sslerror",
+    "chunkedencodingerror", "toomanyredirects",
+    "http 500", "http 502", "http 503", "http 504",
+)
+
+# HTTP statuses that mean "try again later" rather than "the data is wrong".
+SKIPPABLE_STATUSES = (429, 500, 502, 503, 504)
+
+# Raised straight out of ``requests`` when a call bypasses ``RpcClient``'s
+# wrapping. ``SSLError`` is a ``ConnectionError`` subclass, so it is covered.
+SKIPPABLE_REQUESTS_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.TooManyRedirects,
+    requests.exceptions.ChunkedEncodingError,
+    TimeoutError,
 )
 
 
@@ -43,24 +66,32 @@ def rpc_unavailable_reason(exc: BaseException) -> Optional[str]:
     unusable*, or ``None`` when it is a genuine failure that must not be
     papered over.
 
-    Skippable: a transport-level ``requests`` connection error or timeout, and
-    an ``RpcError`` whose message names a transport failure or a rate limit /
-    HTTP 429. Everything else -- above all an ``AssertionError`` from live data
-    disagreeing with the recorded fixture, but equally a malformed response or
-    a non-retryable protocol error -- returns ``None`` and is left to fail.
+    Skippable: a transport-level ``requests`` failure (connection, timeout,
+    TLS, chunked-encoding, redirect loop), an HTTP 429/5xx, and an ``RpcError``
+    whose message names any of those. Everything else -- above all an
+    ``AssertionError`` from live data disagreeing with the recorded fixture,
+    but equally a malformed/structurally-wrong response, a JSON decode failure
+    or a non-retryable protocol error -- returns ``None`` and is left to fail.
 
-    A raw ``requests`` exception is reported by type name only: its ``str()``
-    echoes the full request URL, which may embed a provider API key (the same
-    reason ``rpc._redact`` exists). ``RpcError`` messages are already redacted
-    upstream, so they are passed through in full.
+    The reason string is **only ever our own classification label**. No part of
+    the exception message reaches it, because that message is in part
+    server-supplied: a hostile or merely sloppy provider that echoes a keyed
+    request URL back in an error body would otherwise land it in a public CI
+    log. (``rpc._redact`` already scrubs what it can; this is the second
+    layer, on the consuming side.)
     """
-    if isinstance(exc, (requests.ConnectionError, requests.Timeout, TimeoutError)):
-        return f"{type(exc).__name__} contacting the endpoint"
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(exc, requests.HTTPError) and status in SKIPPABLE_STATUSES:
+        return "rate limited" if status == 429 else f"transport failure: HTTP {status}"
+    if isinstance(exc, SKIPPABLE_REQUESTS_ERRORS):
+        return f"transport failure: {type(exc).__name__}"
     if isinstance(exc, RpcError):
-        message = str(exc)
-        low = message.lower()
-        if any(marker in low for marker in RPC_UNAVAILABLE_MARKERS):
-            return message
+        low = str(exc).lower()
+        if any(marker in low for marker in RATE_LIMIT_MARKERS):
+            return "rate limited"
+        for marker in TRANSPORT_MARKERS:
+            if marker in low:
+                return f"transport failure: {marker}"
     return None
 
 

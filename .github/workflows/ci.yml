@@ -1,5 +1,11 @@
 name: ci
-on: [push, pull_request]
+on:
+  # Branch-scoped push + pull_request: a PR branch in this repo would otherwise
+  # run the whole matrix twice. Tags are deliberately absent -- publish.yml owns
+  # `v*` and runs this same gate itself before building.
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
 concurrency:
@@ -22,10 +28,35 @@ jobs:
           cache-dependency-path: |
             pyproject.toml
             constraints.txt
+      # pip is pinned in constraints.txt, but a constraint never upgrades pip
+      # itself -- without this the runner image's own pip stays in place (and
+      # then trips the equivalence check below).
+      - run: python -m pip install -c constraints.txt --upgrade pip
       - run: pip install -e ".[dev]" -c constraints.txt
       # Audit the pinned set CI just installed. Auditing the *environment*
       # instead would hard-fail under --strict on the editable, unpublished
       # robustrep itself ("Dependency not found on PyPI"), and --skip-editable
       # does not help: --strict fails on any skipped dependency.
       - run: pip-audit --strict --progress-spinner off --no-deps -r constraints.txt
+      # constraints.txt is frozen on one machine (macOS/CPython 3.10), so on its
+      # own it cannot see a dependency that installs only elsewhere -- a
+      # Linux-gated marker, a platform-specific wheel. Anything pip actually
+      # installed that is absent from constraints.txt is unpinned *and* outside
+      # the audit above, which is exactly the hole this closes.
+      # setuptools/wheel are exempt: bootstrap packages at whatever version the
+      # runner image ships, and PEP 517 build envs get their own copies anyway.
+      - name: constraints cover every installed package
+        run: |
+          missing=$(comm -23 \
+            <(pip list --format=freeze --exclude-editable \
+                | grep -viE '^(setuptools|wheel)==' \
+                | tr '[:upper:]' '[:lower:]' | sort) \
+            <(grep -vE '^#|^[[:space:]]*$' constraints.txt \
+                | tr '[:upper:]' '[:lower:]' | sort))
+          if [ -n "$missing" ]; then
+            echo "::error::installed but absent from constraints.txt -- unpinned and unaudited."
+            echo "Add these pins to constraints.txt:"
+            echo "$missing"
+            exit 1
+          fi
       - run: pytest --cov --cov-report=term-missing

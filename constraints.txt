@@ -11,7 +11,15 @@
 # dependency metadata: `pyproject.toml` keeps open lower bounds so installing
 # `robustrep` never forces these exact versions on a downstream user.
 #
-# Refresh by re-running the command above after upgrading the dev venv.
+# Two things `pip freeze` does not emit are appended by hand:
+#   * `pip` itself (freeze omits it), pinned so the runner image's own pip does
+#     not drift -- CI installs it explicitly, a constraint alone won't upgrade pip;
+#   * dependencies that only install on Linux (keyring's secret-storage backend
+#     and its crypto chain), which a macOS freeze can never see. They are
+#     marker-gated, so they stay uninstalled here and pinned in CI.
+#
+# Refresh by re-running the command above after upgrading the dev venv, keeping
+# the hand-added block below.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 backports.tarfile==1.2.0
@@ -92,3 +100,19 @@ typing_extensions==4.16.0
 tzdata==2026.4
 urllib3==2.7.0
 zipp==4.1.0
+# -- hand-added (not emitted by `pip freeze` on the dev box) -----------------
+# pip itself: freeze omits it. CI installs this version explicitly before the
+# project, since a constraint alone never upgrades the runner image's pip.
+pip==26.2.1
+# Linux-only: twine -> keyring pulls the secret-storage backend and its crypto
+# chain under `sys_platform == "linux"`, so a macOS freeze can never see them
+# while CI installs them on every job. Versions resolved with
+#     pip install --dry-run --platform manylinux2014_x86_64 \
+#         --only-binary=:all: SecretStorage jeepney
+# (identical for 3.10 and 3.13). Marker-gated, so pinning them here is inert
+# off Linux -- but it keeps them inside pip-audit's view.
+SecretStorage==3.5.0
+jeepney==0.9.0
+cryptography==50.0.1
+cffi==2.1.1
+pycparser==3.0
