@@ -4,6 +4,12 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # constraints.txt is a full freeze; bumping one pin in isolation produces
+    # pip resolution conflicts (e.g. pydantic-core without pydantic, parsimonious
+    # past eth-abi's upper bound). Version-update PRs are therefore disabled;
+    # security updates still open PRs. Refresh the freeze manually with
+    # `pip install -U ... && pip freeze` and let the CI equivalence check verify it.
+    open-pull-requests-limit: 0
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
