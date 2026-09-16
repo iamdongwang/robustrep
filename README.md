@@ -7,6 +7,7 @@ robust score per ratee that resists Sybil raters and evidence-free ratings. Ship
 ERC-8004 adapter and a reproducible report.
 
 Status: v0.1.1 released on PyPI. Design spec and plan live in the parent workspace; a summary is in `reports/latest/report.md`.
+Release notes, including the security fixes in 0.1.1: [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 

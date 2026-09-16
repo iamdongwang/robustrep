@@ -1,6 +1,7 @@
 graft tests
 include constraints.txt
 include SECURITY.md
+include CHANGELOG.md
 global-exclude __pycache__ *.pyc .DS_Store
 # Local run artifacts that can sit in a dirty working tree at build time --
 # a scratch sqlite db next to the e2e fixtures, a log, a .env. None of it
