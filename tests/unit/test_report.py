@@ -8,7 +8,7 @@ import pytest
 from robustrep import Config, score
 from robustrep.report import export as export_mod
 from robustrep.report.adversarial import scenario_table
-from robustrep.report.export import export_json
+from robustrep.report.export import export_json, versions as export_versions
 from robustrep.report.figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
 from robustrep.report.render import render_markdown
 from robustrep.report.sensitivity import fig_sensitivity, sensitivity_table, tie_aware_sensitivity
@@ -333,7 +333,7 @@ def test_render_markdown_wording_constraints(records_factory):
         rater_profile_mode="onchain", confirmations=20,
         config=dict(bootstrap_n=0, bootstrap_seed=0, min_clusters=3, evidence_weights=[0.1, 0.3, 0.7, 1.0],
                    sybil_jaccard=0.8, sybil_window_s=86400, sybil_max_group=2000, sybil_flag_share=0.5),
-        versions={"robustrep": "0.1.0"}))
+        versions=export_versions()))
     for phrase in ["largest single cluster", "lower weighted median", "evidence mass",
                    "zero_evidence_ratio", "bootstrap_n=0", "Limitations", "Provenance",
                    "arXiv 2606.26028", "revoked", "bootstrap_n`: 0"]:
@@ -390,8 +390,10 @@ def test_render_markdown_tag_hygiene_headline_and_limitations(records_factory):
     sentence = ("tag1 is free text on ERC-8004; many values are sentences rather than "
                "categories. v0.1 keeps every tag as its own group; a rare-tag merge is a "
                "v0.2 item.")
-    assert md.count(sentence) == 2  # once in Headline numbers, once in Limitations
-    assert "- **Tag hygiene.** " + sentence in md
+    # Once only, in Headline numbers: the Limitations copy said nothing the
+    # headline bullet (which carries the measured numbers) did not already say.
+    assert md.count(sentence) == 1
+    assert "- **Tag hygiene.** " not in md
 
 
 def test_export_json_nan_to_null_and_sorted(tmp_path, records_factory):
@@ -624,8 +626,13 @@ def test_render_markdown_limitations_state_the_unique_tag_gaming_vector(records_
     md = render_markdown(sc, rec, block=1, figures={}, sensitivity=pd.DataFrame(
         [dict(variant="base", spearman_top=1.0)]))
     bullet = next(line for line in md.splitlines() if "Unique-tag gaming" in line)
-    for phrase in ("tag1", "normalization group", "1.0", "binary", "evidence mass"):
+    for phrase in ("tag1", "normalization group", "1.0", "binary", "evidence mass",
+                   # The `binary` shortcut is a d0 statement, and the weight a tag
+                   # carries is per collapsed vote, not per rating -- both were
+                   # overstated before.
+                   "d0", "(ratee, tag, cluster) vote"):
         assert phrase in bullet, phrase
+    assert "per rating," not in bullet
 
 
 def test_render_markdown_ssrf_bullet_states_the_oracle_not_a_blind_request(records_factory):
@@ -636,15 +643,21 @@ def test_render_markdown_ssrf_bullet_states_the_oracle_not_a_blind_request(recor
     md = render_markdown(sc, rec, block=1, figures={}, sensitivity=pd.DataFrame(
         [dict(variant="base", spearman_top=1.0)]))
     bullet = next(line for line in md.splitlines() if "DNS rebinding" in line)
-    for phrase in ("four-state oracle", "not a blind request", "parser", "allowlist",
-                   "rebuilt", "robustrep.sources.evidence_fetch"):
+    for phrase in ("at least a four-state oracle", "not a blind request", "parser",
+                   "allowlist", "rebuilt", "robustrep.sources.evidence_fetch",
+                   # The rejected foil has to be the strongest true version of
+                   # itself, and "never returned to the caller" was not it: the
+                   # notes ARE reported, which is what makes the oracle.
+                   "nothing of the response is persisted or reported"):
         assert phrase in bullet, phrase
     assert "No response content is ever exposed" not in md
+    assert "never returned to the caller" not in md
 
 
 def test_versions_is_public_and_is_what_export_writes(tmp_path, records_factory):
-    # cli._provenance renders the same mapping into report.md, so the two
-    # published artifacts can never disagree about the stack that made them.
+    # report.publish.build_provenance renders the same mapping into report.md,
+    # so the two published artifacts can never disagree about the stack that
+    # made them.
     from robustrep.report.export import versions
 
     rec, sc = _data(records_factory)
@@ -668,3 +681,90 @@ def test_address_guard_scope_is_exactly_the_documented_one(tmp_path, records_fac
     caught.loc[0, "ratee"] = "0x" + "ab" * 20
     with pytest.raises(ValueError):
         export_json(caught, block=1, out=tmp_path / "scores.json")
+
+
+# --- 0.1.1 cross-cutting review: provenance rendering and two new limits ------
+
+
+def test_render_markdown_provenance_renders_every_config_key(records_factory):
+    """The Provenance section used to walk a hardcoded 15-key tuple, which
+    silently dropped `evidence_level_shares` -- and would drop every key added
+    after it. Nothing in the config dict may go unrendered."""
+    rec, sc = _data(records_factory)
+    config = dict(bootstrap_n=0, evidence_level_shares={0: 0.5, 3: 0.5},
+                  some_future_key="future-value")
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS,
+                         provenance=dict(config=config))
+    assert "- `evidence_level_shares`: " in md
+    assert "- `some_future_key`: future-value" in md
+
+
+def test_render_markdown_provenance_keeps_report_order_then_sorts_the_rest(records_factory):
+    """Known keys render in `PROVENANCE_KEYS` order; anything the renderer does
+    not know about follows, sorted, so the output stays stable run to run."""
+    rec, sc = _data(records_factory)
+    config = {"zeta_unknown": 1, "alpha_unknown": 2, "min_clusters": 3, "bootstrap_n": 0}
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS,
+                         provenance=dict(config=config))
+    rendered = [line.split("`")[1] for line in md.splitlines() if line.startswith("  - `")]
+    assert rendered == ["bootstrap_n", "min_clusters", "alpha_unknown", "zeta_unknown"]
+
+
+def test_render_markdown_budget_bullet_reads_cluster_stats_from_provenance(records_factory):
+    """`report` already passes the run's ClusterStats in `provenance`; reading
+    it from there means a scores frame whose `attrs` were lost on the way (a
+    copy, a concat) still gets the Limitations bullet."""
+    rec, sc = _data(records_factory)
+    assert "cluster_stats" not in sc.attrs
+    stats = dict(pairs_tested=5, pairs_examined=8, ratees_skipped_size=0,
+                 ratees_skipped_budget=2, truncated=True)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS,
+                         provenance=dict(cluster_stats=stats))
+    assert ("Sybil clustering was budget-limited: 0 ratee block(s) skipped for size "
+            "(> sybil_max_group), 2 for the per-ratee pair budget, global pair budget "
+            "reached: yes (8 candidate pairs examined, 5 tested).") in md
+
+
+def test_render_markdown_budget_bullet_falls_back_to_scores_attrs(records_factory):
+    """A provenance dict without `cluster_stats` (an older caller) still finds
+    the stats on the frame."""
+    rec, sc = _data(records_factory)
+    sc = _with_cluster_stats(sc, pairs_tested=1, pairs_examined=2, ratees_skipped_size=4)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS,
+                         provenance=dict(config={}))
+    assert "4 ratee block(s) skipped for size" in md
+
+
+def test_render_markdown_limitations_state_the_evidence_lookup_budget(records_factory):
+    """The evidence lookup budget biases the level-3 share downward, and the
+    per-URI cap truncates with no counter at all -- both are standing limits, so
+    the bullet renders whether or not this run starved anything."""
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
+    bullet = next(line for line in md.splitlines() if "Evidence lookup budget" in line)
+    for phrase in ("evidence_lookup_starved_uris", "false negative", "level-3", "downward",
+                   "MAX_LOOKUP_ATTEMPTS", "silently"):
+        assert phrase in bullet, phrase
+
+
+def test_render_markdown_evidence_lookup_budget_reports_the_starved_count(records_factory):
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS,
+                         provenance=dict(config=dict(evidence_lookup_starved_uris=7)))
+    bullet = next(line for line in md.splitlines() if "Evidence lookup budget" in line)
+    assert "7" in bullet
+    zero = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS,
+                           provenance=dict(config=dict(evidence_lookup_starved_uris=0)))
+    zero_bullet = next(line for line in zero.splitlines() if "Evidence lookup budget" in line)
+    assert "this run" not in zero_bullet
+
+
+def test_render_markdown_limitations_state_normalization_precedes_sybil_collapse(records_factory):
+    """A perfectly collapsed farm still chose its group's normalization rung on
+    the way in: collapse cannot undo a rung flip."""
+    rec, sc = _data(records_factory)
+    md = render_markdown(sc, rec, block=1, figures={}, sensitivity=_BASE_SENS)
+    bullet = next(line for line in md.splitlines()
+                  if "Normalization precedes sybil collapse" in line)
+    for phrase in ("raw records", "one vote", "norm_fit_share", "norm_rule_counts", "rank"):
+        assert phrase in bullet, phrase

@@ -27,7 +27,11 @@ dependencies = [
   "eth-abi>=5.0",
   "eth-hash[pycryptodome]>=0.5",
   "requests>=2.31",
-  "urllib3>=2",
+  # >=2.6, not >=2: the decoded-read cap `evidence_fetch` relies on to bound a
+  # decompression bomb (`max_length` on urllib3's decoders) first exists in
+  # 2.6.0. On 2.0-2.5 the same call decompresses the whole body before
+  # truncating -- measured at a 455 MB peak against 0.8 MB on 2.7.
+  "urllib3>=2.6",
   "tabulate>=0.9",
   "matplotlib>=3.7",
   "typer>=0.12",

@@ -208,7 +208,8 @@ class Store:
         """Count of ``evidence_cache`` rows still marked ``"lookup-budget:N"``
         (H3, see ``evidence_batch``) -- a URI whose tx-hash verification was
         cut short by a shared per-run lookup budget, and so may hold a false
-        negative. Published in report provenance (``cli._provenance``'s
+        negative. Published in report provenance
+        (``report.publish.build_provenance``'s
         ``evidence_lookup_starved_uris``) so a report is auditable against
         how many of its cached evidence levels are still, as of that run,
         possibly under-checked -- whether because a later ``fetch`` run

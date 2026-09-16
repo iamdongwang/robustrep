@@ -37,6 +37,7 @@ from ..sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
 from ..store import Store
 from .export import export_json, versions
 from .figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
+from .provenance_keys import PROVENANCE_KEYS
 from .render import evidence_level_shares, render_markdown
 from .sensitivity import fig_sensitivity
 
@@ -58,6 +59,11 @@ PUBLISHED_FIGURE_GLOB = "fig*.png"
 EVIDENCE_CAP_PER_URI_KEY = "evidence_max_lookups_per_uri"
 EVIDENCE_CAP_TOTAL_KEY = "evidence_max_total_lookups"
 EVIDENCE_CAP_KEYS = (EVIDENCE_CAP_PER_URI_KEY, EVIDENCE_CAP_TOTAL_KEY)
+
+# What a provenance field says when the run did not record it. A distinct value
+# rather than an empty container, so a consumer (and a human diffing two
+# reports) can tell "not measured" from "measured, and it was empty".
+UNAVAILABLE = "unavailable"
 
 
 # Figure titles (heading text) -> file names, in report order. Titles are what
@@ -81,7 +87,7 @@ def _evidence_shares_for_provenance(records: pandas.DataFrame) -> dict:
     return {int(level): float(share) for level, share in shares.items()}
 
 
-def _norm_rule_counts_for_provenance(result: Optional[pandas.DataFrame]) -> dict:
+def _norm_rule_counts_for_provenance(result: Optional[pandas.DataFrame]) -> dict | str:
     """Records per normalization rule, read off the scored frame's ``attrs``.
 
     ``pipeline.score`` stamps these from the frame it already prepared, so they
@@ -90,12 +96,25 @@ def _norm_rule_counts_for_provenance(result: Optional[pandas.DataFrame]) -> dict
     re-run validate/normalize over the whole dataset. Normalization picks a rule
     per (tag, scale) group from the group's own contents, so a rung flip is the
     visible symptom of a value-poisoning attempt: publishing the counts makes one
-    show up as a plain diff between two runs' reports. ``{}`` when no scored
-    frame is supplied.
+    show up as a plain diff between two runs' reports.
+
+    ``UNAVAILABLE`` -- not ``{}`` -- when there is no scored frame, or when the
+    frame carries no ``norm_rule_counts`` at all. An empty mapping is a real
+    answer ("normalization ran and matched no records"), and publishing it for
+    "nobody recorded it" would quietly turn a missing measurement into a
+    measured zero: the diff that is supposed to expose a rung flip would show
+    an empty dict both runs and nothing to see. A frame that reached here
+    without the attr is an anomaly (``score`` always stamps it), so it is
+    logged rather than absorbed.
     """
     if result is None:
-        return {}
-    return {str(rule): int(n) for rule, n in result.attrs.get("norm_rule_counts", {}).items()}
+        return UNAVAILABLE
+    counts = result.attrs.get("norm_rule_counts")
+    if counts is None:
+        logger.warning("provenance: scored frame carries no norm_rule_counts; "
+                       "publishing it as %r", UNAVAILABLE)
+        return UNAVAILABLE
+    return {str(rule): int(n) for rule, n in counts.items()}
 
 
 def _cluster_stats_for_provenance(result: Optional[pandas.DataFrame]) -> dict:
@@ -135,6 +154,13 @@ def evidence_caps_for_provenance(store: Optional[Store]) -> dict:
     for key in EVIDENCE_CAP_KEYS:
         raw = store.get_sync(key)
         if raw is None:
+            # The fallback publishes THIS build's constant as though the fetch
+            # run had used it, which is a claim about a run we cannot see. Say
+            # so: a store predating this recording, or one whose evidence step
+            # was skipped, is exactly the case where the published cap may be
+            # wrong.
+            logger.warning("provenance: %s not recorded in sync_state; falling back to "
+                           "this build's constant %r", key, caps[key])
             continue
         try:
             value = int(raw)
@@ -179,6 +205,13 @@ def build_provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         # directly on an in-memory `records` frame, as several tests do).
         evidence_lookup_starved_uris=n_lookup_budget_starved,
     )
+    # PROVENANCE_KEYS is the published order, shared with `report.render` so the
+    # two artifacts cannot drift (a test pins them equal). Ordering through it
+    # here rather than trusting the literal above to stay in step; a key not
+    # listed there still rides along at the end, and `render` sorts it in.
+    ordered = {key: config[key] for key in PROVENANCE_KEYS if key in config}
+    ordered.update({key: value for key, value in config.items() if key not in ordered})
+    config = ordered
     return dict(
         rater_profile_mode=mode,
         confirmations=cfg.confirmations,
@@ -193,6 +226,11 @@ def write_report(target: Path, result, records, clusters, sens, adv, block: int,
     """Write scores.json, then draw all 5 figures and write report.md, into
     `target`.
 
+    Both artifacts are handed the SAME `provenance["versions"]` mapping (built
+    once by `build_provenance` from `export.versions()`) rather than each
+    calling for its own: two files published from one run must not be able to
+    disagree about the stack that produced them.
+
     scores.json goes FIRST because `export_json` is the only step here that
     can refuse its input (the L1 address guard raises `ValueError`, which
     `cli.report` turns into an ERROR line) and it writes nothing when it does.
@@ -202,7 +240,8 @@ def write_report(target: Path, result, records, clusters, sens, adv, block: int,
     """
     target.mkdir(parents=True, exist_ok=True)
     export_json(result, block=block, out=target / "scores.json", config=provenance.get("config"),
-                cluster_stats=provenance.get("cluster_stats"))
+                cluster_stats=provenance.get("cluster_stats"),
+                versions=provenance.get("versions"))
     fig_mean_vs_robust(result, out=target / _FIGURES["Fig 1. Mean vs robust score"])
     fig_rank_shift(result, out=target / _FIGURES["Fig 2. Biggest rank drops"], top_n=top_n)
     fig_evidence(records, out=target / _FIGURES["Fig 3. Evidence levels"])

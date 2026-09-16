@@ -6,7 +6,7 @@ Feed it any table of `(rater, ratee, value, scale, tag, ts, evidence_uri, source
 robust score per ratee that resists Sybil raters and evidence-free ratings. Ships with a Base-chain
 ERC-8004 adapter and a reproducible report.
 
-Status: v0.1.0 released on PyPI. Design spec and plan live in the parent workspace; a summary is in `reports/latest/report.md`.
+Status: v0.1.1 released on PyPI. Design spec and plan live in the parent workspace; a summary is in `reports/latest/report.md`.
 
 ## Install
 
@@ -41,8 +41,10 @@ addresses, plus whatever the RPC/Blockscout endpoints and evidence hosts return.
 
 `robustrep fetch` makes outbound HTTP from *your* machine to evidence URIs chosen by the rated party.
 Those go through an SSRF guard (scheme/host allowlist, parser cross-check, canonical rebuild, refusal
-of private/reserved addresses, manual redirects, size/time caps), whose one known gap is DNS
-rebinding — so run `fetch` on a host with no privileged reach into an internal network. API keys come
-from environment variables only, never the source tree.
+of private/reserved addresses, manual redirects, a size cap and per-socket-operation timeouts — not a
+wall-clock bound). Its one known SSRF bypass, DNS rebinding, is unmitigated in v0.1 — so run `fetch`
+on a host with no privileged reach into an internal network. API keys should come from the
+environment (`ETHERSCAN_API_KEY`), never the source tree; `--etherscan-key` is an escape hatch that
+takes precedence over the environment and is visible to anyone who can run `ps`.
 
 Full threat model and private reporting instructions: [SECURITY.md](SECURITY.md).

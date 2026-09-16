@@ -75,9 +75,11 @@ def versions() -> dict:
     in `_VERSIONED_MODULES` -- see the module docstring for why the list is
     wider than the scorer's own imports.
 
-    Public because `cli._provenance` renders the same mapping into report.md:
-    two artifacts published from one run must not disagree about the stack
-    that produced them, which they did while each built its own dict.
+    Public because `report.publish.build_provenance` puts the same mapping in
+    provenance, which `report.render` writes into report.md and `write_report`
+    hands straight back to `export_json` below: two artifacts published from
+    one run must not disagree about the stack that produced them, which they
+    did while each built its own dict.
     """
     versions = {"robustrep": __version__, "python": platform.python_version()}
     for name in _VERSIONED_MODULES:
@@ -85,8 +87,13 @@ def versions() -> dict:
     return versions
 
 
+# Module-level alias so `export_json` can take a `versions` parameter (the name
+# its caller wants) without shadowing the function it falls back to.
+_default_versions = versions
+
+
 def export_json(scores: pd.DataFrame, block: int, out: Path, config: Optional[dict] = None,
-                cluster_stats: Optional[dict] = None) -> Path:
+                cluster_stats: Optional[dict] = None, versions: Optional[dict] = None) -> Path:
     """Write `scores` (RESULT_COLUMNS) to `out` as JSON: {schema_version, block,
     generated_at, config, cluster_stats, versions, scores}. Rows are sorted by
     robust_score descending with NaN (insufficient ratees) last. `config` (e.g.
@@ -98,6 +105,12 @@ def export_json(scores: pd.DataFrame, block: int, out: Path, config: Optional[di
     like an EVM address (`_ADDRESS_RE`): this file is published, and no
     published field is allowed to carry one. The message never repeats the
     address it found -- the point is to keep it out of the logs too.
+
+    `versions`, when given, is written as-is instead of calling `versions()`
+    here: `write_report` passes the very mapping it also renders into
+    report.md, so one run's two artifacts cannot disagree about the stack (a
+    dependency upgraded between the two calls, an import that resolves
+    differently). `None` means "compute it", for a caller exporting on its own.
 
     `cluster_stats` (a `robustrep.sybil.ClusterStats` as a dict) says whether
     sybil clustering hit a pair budget on this run and what it skipped; a
@@ -118,7 +131,7 @@ def export_json(scores: pd.DataFrame, block: int, out: Path, config: Optional[di
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "config": config or {},
         "cluster_stats": cluster_stats or {},
-        "versions": versions(),
+        "versions": _default_versions() if versions is None else versions,
         "scores": rows,
     }
     text = json.dumps(payload, indent=None)
