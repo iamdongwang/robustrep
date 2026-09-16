@@ -185,7 +185,8 @@ def score(records: pd.DataFrame, cfg: Config = Config(), clusters: Optional[dict
     The returned frame carries `attrs["norm_rule_counts"]`: `{norm_rule: record
     count}` over the prepared rows. Normalization picks a rule per (tag, scale)
     group from that group's own contents, so which rules fired is part of how a
-    run was computed -- the report records it (see `robustrep.cli._provenance`),
+    run was computed -- the report records it (see
+    `robustrep.report.publish.build_provenance`),
     and it costs nothing here because `prepare` already built the frame.
     """
     if aggregator is not None:

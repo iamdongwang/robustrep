@@ -270,3 +270,92 @@ def test_published_files_never_follows_a_symlink(tmp_path):
     out_dir = tmp_path / "reports"
     publish.publish_latest(out_dir, block_dir)
     assert not (out_dir / "latest" / "fig3.png").exists()
+
+
+# --- 0.1.1 cross-cutting review ------------------------------------------------
+
+
+def test_provenance_keys_are_exactly_what_build_provenance_publishes():
+    """`PROVENANCE_KEYS` is the single ordered list of provenance config keys:
+    `build_provenance` builds the dict in that order and `report.render`
+    renders it in that order. Drift between the two is what dropped
+    `evidence_level_shares` out of report.md entirely."""
+    from robustrep import Config
+    from robustrep.report.provenance_keys import PROVENANCE_KEYS
+    from robustrep.schema import validate_records
+
+    records = validate_records(pd.DataFrame([dict(
+        rater="r", ratee="A", value=50, scale="d0", tag="q", ts=0,
+        evidence_uri=None, source="test", evidence_level=0)]))
+    config = publish.build_provenance("onchain", Config(), records)["config"]
+    assert tuple(config) == PROVENANCE_KEYS
+
+
+def test_provenance_norm_rule_counts_say_unavailable_without_a_scored_frame():
+    """`{}` would read as "normalization ran and chose no rule at all", which is
+    a different -- and false -- claim than "nobody told us"."""
+    from robustrep import Config
+    from robustrep.schema import validate_records
+
+    records = validate_records(pd.DataFrame([dict(
+        rater="r", ratee="A", value=50, scale="d0", tag="q", ts=0,
+        evidence_uri=None, source="test", evidence_level=0)]))
+    prov = publish.build_provenance("onchain", Config(), records)
+    assert prov["config"]["norm_rule_counts"] == "unavailable"
+
+
+def test_provenance_norm_rule_counts_warn_when_a_scored_frame_lost_its_attrs(caplog):
+    """A scored frame that reached here without `norm_rule_counts` is an
+    anomaly (pipeline.score always stamps it), so it is logged, not swallowed."""
+    from robustrep import Config, score
+    from robustrep.schema import validate_records
+
+    records = validate_records(pd.DataFrame([dict(
+        rater=f"r{i}", ratee="A", value=50, scale="d0", tag="q", ts=0,
+        evidence_uri=None, source="test", evidence_level=0) for i in range(4)]))
+    cfg = Config(bootstrap_n=0)
+    result = score(records, cfg)
+    result.attrs.pop("norm_rule_counts")
+    with caplog.at_level(logging.WARNING, logger="robustrep.report.publish"):
+        prov = publish.build_provenance("onchain", cfg, records, result)
+    assert prov["config"]["norm_rule_counts"] == "unavailable"
+    assert "norm_rule_counts" in " ".join(r.getMessage() for r in caplog.records)
+
+
+def test_evidence_caps_for_provenance_warns_when_the_store_recorded_none(tmp_path, caplog):
+    """Falling back to this build's constants is a claim about a *fetch* run
+    that may have used different ones -- silent is the one thing it must not
+    be."""
+    from robustrep.evidence import MAX_TX_LOOKUPS_PER_URI
+    from robustrep.sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
+
+    with Store(tmp_path / "fresh.db") as store:
+        with caplog.at_level(logging.WARNING, logger="robustrep.report.publish"):
+            caps = publish.evidence_caps_for_provenance(store)
+    assert caps == {"evidence_max_lookups_per_uri": MAX_TX_LOOKUPS_PER_URI,
+                    "evidence_max_total_lookups": DEFAULT_MAX_TOTAL_LOOKUPS}
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert "evidence_max_lookups_per_uri" in warned
+    assert "evidence_max_total_lookups" in warned
+
+
+def test_write_report_gives_both_artifacts_the_same_versions_dict(tmp_path, records_factory):
+    """`versions()` is the single source of truth and `build_provenance` already
+    called it: `write_report` hands that dict to `export_json` instead of
+    recomputing one, so scores.json and report.md cannot disagree about the
+    stack that produced them."""
+    import json
+
+    from robustrep import Config, score
+
+    rec = records_factory([dict(rater=f"r{i}", ratee="A", value=50 + i, evidence_level=2)
+                           for i in range(4)])
+    result = score(rec, Config(bootstrap_n=0))
+    sentinel = {"robustrep": "1.2.3-sentinel", "python": "9.9.9"}
+    provenance = dict(rater_profile_mode="onchain", confirmations=20, config={},
+                      cluster_stats={}, versions=sentinel)
+    publish.write_report(tmp_path, result, rec, {},
+                         pd.DataFrame(columns=["variant", "spearman_top"]), None,
+                         block=1, provenance=provenance, top_n=5)
+    assert json.loads((tmp_path / "scores.json").read_text())["versions"] == sentinel
+    assert "robustrep 1.2.3-sentinel" in (tmp_path / "report.md").read_text()

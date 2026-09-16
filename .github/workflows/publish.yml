@@ -15,6 +15,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with: { python-version: "3.12" }
+      # The tag names the release; pyproject names what gets built. A mismatch
+      # publishes a version nobody tagged (or tags one nobody can reproduce),
+      # and a release is the one build that cannot be re-done -- so fail here,
+      # before anything is built or uploaded. Runs after setup-python because
+      # it needs tomllib (3.11+).
+      - name: tag matches pyproject version
+        run: |
+          test "v$(python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')" = "${GITHUB_REF_NAME}"
       - run: python -m pip install -c constraints.txt --upgrade pip
       - run: pip install -e ".[dev]" -c constraints.txt
       # pip-audit fetches the advisory database over the network; retry a
@@ -33,6 +41,10 @@ jobs:
       # `--no-isolation` with a pinned backend, which is a separate change.
       - run: pip install -c constraints.txt build
       - run: python -m build
+      # The metadata PyPI will render, checked before upload rather than after
+      # a rejected (or silently mangled) release page. twine comes from the dev
+      # extra installed above, pinned by constraints.txt.
+      - run: twine check dist/*
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with: { name: dist, path: dist/ }
   publish:

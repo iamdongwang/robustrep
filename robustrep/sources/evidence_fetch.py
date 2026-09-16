@@ -73,12 +73,17 @@ the fetcher here is a security boundary, not just an HTTP client:
   (regardless of any ``Content-Length`` claim -- we just want the beginning),
   clamped a second time after the read as a belt-and-suspenders check against a
   non-conforming stream, and every request uses a ``(connect, read)`` timeout.
-  A decompression bomb is bounded by that read itself: urllib3 2.x caps the
-  *decoded* output of ``raw.read(amt, decode_content=True)`` at ``amt``, so no
-  more than ``MAX_BYTES`` decompressed bytes are ever materialized. Requests
-  additionally ask for ``accept-encoding: identity`` as belt-and-braces -- a
-  hostile server is free to ignore that header and gzip anyway, which is why it
-  is not the control the bound rests on.
+  A decompression bomb is bounded by that read itself, but only on a new enough
+  urllib3: **>= 2.6** caps the *decoded* output of ``raw.read(amt,
+  decode_content=True)`` at ``amt`` (the ``max_length`` its decoders gained in
+  2.6.0), so no more than ``MAX_BYTES`` decompressed bytes are ever
+  materialized. On 2.0-2.5 that same call decompresses the entire body before
+  truncating -- a 455 MB peak against 0.8 MB on 2.7 for one measured bomb -- so
+  the bound is enforced by the ``urllib3>=2.6`` floor in ``pyproject.toml``,
+  not by this module. Requests additionally ask for ``accept-encoding:
+  identity`` as belt-and-braces -- a hostile server is free to ignore that
+  header and gzip anyway, which is why it is not the control the bound rests
+  on.
 
 
 **Known limitation -- DNS rebinding (the residual unmitigated gap in v0.1):**
@@ -91,15 +96,19 @@ resolutions) can pass the guard and cause a GET to a private address.
 The blast radius is *not* nil: the fetched text is consumed by
 ``robustrep.evidence.classify``, which scans it for a transaction hash and for
 task-id JSON keys, and the outcome is persisted per URI as ``(level, note)``.
-A bypass is therefore a four-state oracle about the target --
+A bypass is therefore at least a four-state oracle about the target --
 ``(1, "unfetchable")`` (no response), ``(1, "")`` (responded, no markers),
 ``(2, "")`` (response contained a 0x-hash or task-id key) and ``(3, "")``
-(a hash in the response involves the rater/owner addresses) -- not a blind
-request. That is precisely why the parser cross-check and canonical rebuild
-above exist: "the response body is never returned to the caller" is not a
-sufficient reason to tolerate a reachable bypass. Proper mitigation of the
-remaining DNS gap (resolve once, then fetch via a pinned-IP transport adapter
-with the original hostname kept for TLS SNI/Host) is scheduled for v0.2; see
+(a hash in the response involves the rater/owner addresses) -- and more than
+four as other notes reach the cache (``"fetch-error"``, ``"lookup-budget:N"``),
+each of which says something further about how the target answered. Not a
+blind request, in any case. That is precisely why the parser cross-check and
+canonical rebuild above exist: "nothing of the response is persisted or
+reported" is not a sufficient reason to tolerate a reachable bypass -- and
+here it is not even true, since the ``(level, note)`` pair is both.
+Proper mitigation of the remaining DNS gap (resolve once, then fetch via a
+pinned-IP transport adapter with the original hostname kept for TLS SNI/Host)
+is scheduled for v0.2; see
 ``test_dns_rebinding_not_mitigated_in_v0_1`` in the test suite, which documents
 this with a ``strict=True`` xfail so it starts failing (as a reminder to update
 docs/tests) the moment it's actually fixed.

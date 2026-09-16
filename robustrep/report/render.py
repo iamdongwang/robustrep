@@ -6,6 +6,9 @@ from typing import Optional
 
 import pandas as pd
 
+from ..evidence import MAX_TX_LOOKUPS_PER_URI
+from .provenance_keys import PROVENANCE_KEYS
+
 # The ERC-8004 study's own headline finding, for scale: even the paper that
 # introduced this feedback scheme found the overwhelming majority of ratings
 # carried no interaction evidence at all.
@@ -148,17 +151,24 @@ def _budget_limited_variant_lines(sensitivity: pd.DataFrame) -> list:
             "varied; compare it against the base row's own `budget_limited`."]
 
 
-def _budget_limit_lines(scores: pd.DataFrame) -> list:
+def _budget_limit_lines(scores: pd.DataFrame, provenance: dict) -> list:
     """The budget-limited-clustering bullet, or [] when nothing was skipped (or
-    the caller attached no stats at all).
+    the caller supplied no stats at all).
 
-    Read off `scores.attrs["cluster_stats"]` -- a `robustrep.sybil.ClusterStats`
-    as a dict, stamped by the CLI. Pair budgets degrade the clustering instead
-    of aborting the run, and degrading can only UNDER-merge, so a budget-limited
-    run has to say so and say which way its error points: never the flattering
-    direction left unsaid.
+    Read from `provenance["cluster_stats"]` first -- a
+    `robustrep.sybil.ClusterStats` as a dict, which `build_provenance` already
+    carries -- and only then from `scores.attrs["cluster_stats"]`. `attrs` is
+    not preserved across most pandas operations, so a caller that copied,
+    concatenated or re-indexed the frame between scoring and rendering silently
+    lost the stats and published a report that read as unlimited. Provenance is
+    passed by value and survives that; attrs stays as the fallback for callers
+    that pass no provenance.
+
+    Pair budgets degrade the clustering instead of aborting the run, and
+    degrading can only UNDER-merge, so a budget-limited run has to say so and
+    say which way its error points: never the flattering direction left unsaid.
     """
-    stats = scores.attrs.get("cluster_stats") or {}
+    stats = provenance.get("cluster_stats") or scores.attrs.get("cluster_stats") or {}
     size = int(stats.get("ratees_skipped_size", 0))
     per_ratee = int(stats.get("ratees_skipped_budget", 0))
     truncated = bool(stats.get("truncated", False))
@@ -174,6 +184,65 @@ def _budget_limit_lines(scores: pd.DataFrame) -> list:
     ]
 
 
+def _evidence_budget_lines(config: dict) -> list:
+    """The evidence-lookup-budget bullet (a one-element list, so it composes
+    with the other `*_lines` helpers). Always rendered: it documents a
+    standing limit of every run, not an incident, and a reader has no way to
+    learn from a clean report that the limit exists. The starved count is named
+    only when there is one.
+    """
+    starved = int(config.get("evidence_lookup_starved_uris") or 0)
+    per_uri = config.get("evidence_max_lookups_per_uri", MAX_TX_LOOKUPS_PER_URI)
+    counted = f" ({starved} in this run)" if starved > 0 else ""
+    return [
+        "- **Evidence lookup budget.** Verifying an evidence URI's transaction hashes is "
+        "bounded twice, and both bounds can only hide a real level 3, never invent one. A "
+        "run-wide budget (`evidence_max_total_lookups`) cuts verification short once it is "
+        "spent: each URI it caught is cached with a `lookup-budget:N` note and counted as "
+        f"`evidence_lookup_starved_uris` in Provenance{counted}, its level is a possible "
+        "**false negative**, and the level-3 share reported above is therefore biased "
+        "downward, never upward. A later `fetch` retries those URIs, up to "
+        "`MAX_LOOKUP_ATTEMPTS` attempts each (see `robustrep.sources.evidence_batch`), "
+        "after which the starved level stands. The second bound is per URI: only the first "
+        f"{per_uri} distinct hashes in a document are ever looked up, and that truncation "
+        "happens silently -- no note, no counter -- so a document carrying more hashes than "
+        "that can be under-levelled without ever appearing in the count above."
+    ]
+
+
+# Static Limitations bullet: the pipeline's own step order is a limitation, and
+# not one any run-specific number can express.
+_NORMALIZATION_ORDER_BULLET = (
+    "- **Normalization precedes sybil collapse.** Rule selection runs per (tag, scale) "
+    "group over the raw records, before clustering collapses a farm into one vote (see the "
+    "Method order above). So a farm the clusterer handles perfectly -- every member merged, "
+    "a single vote between them -- can still have forced a rung change on the way in "
+    "(percent -> `rank`, say) by pushing its group past the outlier tolerance, re-levelling "
+    "every honest record in that group; the collapse happens afterwards and cannot undo a "
+    "rung already chosen. The tolerance (`max(1, floor(n * (1 - norm_fit_share)))` records "
+    "allowed outside a rule's range -- see `robustrep.normalize`) is the only defense at "
+    "that stage. `norm_rule_counts` in Provenance is the signal it leaves: diff it run over "
+    "run and a rung flip shows up as a plain diff."
+)
+
+
+def _provenance_config_lines(config: dict) -> list:
+    """The "Scoring configuration used" block: every key of `config`,
+    `PROVENANCE_KEYS` first (the published order, shared with
+    `report.publish.build_provenance`) and anything else after it, sorted.
+
+    Nothing is dropped. The previous hardcoded key tuple silently omitted
+    `evidence_level_shares` -- published in scores.json, absent from report.md
+    -- and would have omitted every key added after it in the same way.
+    """
+    if not config:
+        return []
+    known = [key for key in PROVENANCE_KEYS if key in config]
+    extra = sorted(key for key in config if key not in set(PROVENANCE_KEYS))
+    return ["- Scoring configuration used:"] + [f"  - `{key}`: {config[key]}"
+                                                for key in known + extra]
+
+
 def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, figures: dict,
                     sensitivity: pd.DataFrame, adversarial: Optional[pd.DataFrame] = None,
                     provenance: Optional[dict] = None) -> str:
@@ -182,15 +251,17 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     `figures` maps a human figure title (e.g. "Fig 4. Largest rater clusters") ->
     relative file path (e.g. "fig4_sybil_clusters.png") for the Markdown image
     link -- the title is the heading text, never the raw filename. `provenance`,
-    when given, may carry `rater_profile_mode`, `confirmations`, `config` (a dict
-    of the scoring parameters actually used: bootstrap_n, bootstrap_seed,
-    min_clusters, evidence_weights, and the sybil_* thresholds and pair budgets),
-    and `versions`.
+    when given, may carry `rater_profile_mode`, `confirmations`, `config` (the
+    scoring parameters actually used -- see `PROVENANCE_KEYS`; EVERY key of it
+    is rendered, known ones in that order and the rest sorted after them),
+    `cluster_stats` and `versions`.
 
-    `scores.attrs["cluster_stats"]`, when present (the CLI stamps it -- see
-    `robustrep.sybil.ClusterStats`), adds a Limitations bullet whenever a sybil
-    pair budget cut the clustering short.
+    `provenance["cluster_stats"]` (see `robustrep.sybil.ClusterStats`), falling
+    back to `scores.attrs["cluster_stats"]`, adds a Limitations bullet whenever
+    a sybil pair budget cut the clustering short.
     """
+    prov = provenance or {}
+    config = prov.get("config") or {}
     non_revoked, n_revoked = _non_revoked(records)
     scored = scores[scores["insufficient"] == 0]
     insufficient = scores[scores["insufficient"] == 1]
@@ -291,20 +362,23 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
         "skipped entirely for ratee-based blocking (see `robustrep.sybil`), so a farm "
         "concentrated on one very popular ratee can evade the ratee-sharing signal by sheer "
         "volume, independent of the evasion technique above.",
-        *_budget_limit_lines(scores),
+        *_budget_limit_lines(scores, prov),
         "- **DNS rebinding in the evidence fetcher (the residual unmitigated gap in v0.1).** "
         "The SSRF guard resolves an evidence URI's host and checks *those* addresses, but "
         "`requests`/`urllib3` resolve the host again independently; a rebinding attacker "
         "answering a public address on the first lookup and a private one on the second can "
         "pass the guard and cause a GET to a private address. The blast radius is not nil: the "
         "fetched text is consumed by the tx-hash scan and the per-URI outcome is persisted, so "
-        "a bypass is a four-state oracle about the target (no response; a response with no "
-        "markers; a 0x-hash or task-id key present; a hash involving the rater/owner "
-        "addresses) -- not a blind request. That is precisely why the URL is "
+        "a bypass is at least a four-state oracle about the target (no response; a response "
+        "with no markers; a 0x-hash or task-id key present; a hash involving the rater/owner "
+        "addresses -- and further states as other notes are recorded, e.g. `fetch-error` or "
+        "`lookup-budget:N`) -- not a blind request. That is precisely why the URL is "
         "parser-cross-checked (`urlsplit` against `urllib3`), host-allowlisted to LDH labels, "
-        "and rebuilt canonically from the vetted components before it is fetched: \"the body "
-        "is never returned to the caller\" would not be reason enough to tolerate a reachable "
-        "bypass. Closing the remaining DNS gap (resolve once, then fetch through a pinned-IP "
+        "and rebuilt canonically from the vetted components before it is fetched: \"nothing of "
+        "the response is persisted or reported\" would not be reason enough to tolerate a "
+        "reachable bypass -- and here it is not even true, since the `(level, note)` pair is "
+        "both. Closing the remaining "
+        "DNS gap (resolve once, then fetch through a pinned-IP "
         "transport adapter) is a v0.2 item. See `robustrep.sources.evidence_fetch` for the "
         "full writeup and its xfail regression test.",
         "- **Two-tag lower-median bias.** With exactly two tags, cross-tag combination is a "
@@ -315,35 +389,28 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
         "two tag medians and is downward only at the tie.",
         "- **Unique-tag gaming.** `tag1` is attacker-chosen free text and v0.1 keeps every "
         "distinct value as its own normalization group, so a rater who invents a tag nobody "
-        "else uses gets a group of one: a posted `1` fits the absolute `binary` rule and "
-        "normalizes straight to 1.0, with no honest record in the group to normalize against. "
+        "else uses gets a group of one: at `d0` a posted `1` fits the absolute `binary` rule "
+        "and normalizes straight to 1.0, with no honest record in the group to normalize "
+        "against (the scale buys nothing either -- the attacker picks that too, and a `100` "
+        "at `d2` is the same 1.0). "
         "What that buys is bounded, not free. A tag reaches the reported score only through "
         "the cross-tag weighted median, and a tag's weight there is the SUM of its votes' "
         "evidence weights, not their count -- so an evidence-free invented tag carries ~0.1 "
-        "per rating, and a top-scoring one can take over the ratee's score only once the "
+        "per (ratee, tag, cluster) vote, not per rating: collapse gives each cluster one vote "
+        "carrying its records' mean weight, so a hundred ratings from one cluster are still "
+        "~0.1. A top-scoring invented tag can take over the ratee's score only once the "
         "honest tags together hold less than half the ratee's total evidence mass. The cost "
         "is paid in evidence mass, which is the quantity the whole aggregator is built to "
         "make expensive; a rare-tag merge is a v0.2 item.",
-        "- **Tag hygiene.** tag1 is free text on ERC-8004; many values are sentences rather "
-        "than categories. v0.1 keeps every tag as its own group; a rare-tag merge is a v0.2 "
-        "item.",
+        *_evidence_budget_lines(config),
+        _NORMALIZATION_ORDER_BULLET,
         "",
         "## Provenance",
     ]
-    prov = provenance or {}
     lines.append(f"- Rater profile mode: {prov.get('rater_profile_mode', 'unknown')}")
     lines.append(f"- Confirmations lag (data cut is final as of this block): "
                  f"{prov.get('confirmations', 'unknown')}")
-    config = prov.get("config") or {}
-    if config:
-        lines.append("- Scoring configuration used:")
-        for key in ("bootstrap_n", "bootstrap_seed", "min_clusters", "evidence_weights",
-                    "sybil_jaccard", "sybil_window_s", "sybil_max_group", "sybil_max_pairs",
-                    "sybil_max_pairs_per_ratee", "sybil_flag_share", "norm_fit_share",
-                    "norm_rule_counts", "evidence_max_lookups_per_uri", "evidence_max_total_lookups",
-                    "evidence_lookup_starved_uris"):
-            if key in config:
-                lines.append(f"  - `{key}`: {config[key]}")
+    lines += _provenance_config_lines(config)
     versions = prov.get("versions") or {}
     if versions:
         v_str = ", ".join(f"{k} {v}" for k, v in versions.items())

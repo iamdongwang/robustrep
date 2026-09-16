@@ -32,7 +32,8 @@ What this does NOT buy, stated plainly because it is security-load-bearing:
   value 1; under a bare share test one added record of value 50 turned those
   honest 1.0s into 0.01), and unit <-> percent at any decimal scale (a d2 group
   of 0.20..0.95 would collapse to 0.002..0.0095). The count-based tolerance
-  raises the floor to at least two records at every group size >= 2, and the
+  raises the floor to at least two records at every group size >= 2 (at any
+  norm_fit_share < 1.0; at exactly 1.0 nothing is tolerated, by design), and the
   percent rung additionally demands positive evidence of percent shape before it
   can take a unit-shaped group, but neither removes the effect.
 * `value` is float64 by the time it reaches here (validate_records coerces it),
@@ -156,7 +157,9 @@ def _group_scores(real: pd.Series, decimals: int, fit_share: float) -> tuple[np.
        neutral 0.5. Tolerance matters here too, or one record would move an
        otherwise-constant group onto the group-relative "rank" rung. The test is
        against the group's MEDIAN, which is an honest value whenever
-       allowed_outside < n/2 -- guaranteed by the `fit_share > 0.5` validator.
+       allowed_outside < n/2 -- guaranteed by the `fit_share > 0.5` validator
+       for every n >= 3 (at n <= 2 the small-group floor of 1 is not below
+       n/2, and a 2-record group has no majority to appeal to anyway).
        After "percent" so a constant all-100 d0 group scores 1.0 there, while a
        constant all-500 d0 group has no natural anchor.
     6. rank     - fallback: percentile rank, `(rank - 1) / (n - 1)` over
