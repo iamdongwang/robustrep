@@ -132,14 +132,14 @@ def rpc_available():
 def test_live_recent_blocks(tmp_path):
     cfg = Config()
     rpc = RpcClient(cfg.rpc_urls, user_agent=cfg.user_agent)
-    store = Store(tmp_path / "live.db")
-    with rpc_available():
-        head = int(rpc.call("eth_blockNumber", []), 16)
-        base.sync_feedback(store, rpc, chunk=2000, start_block=head - 3999, end_block=head)
-    assert store.get_sync("last_block") == str(head)
-    with rpc_available():
-        base.fill_block_timestamps(store, rpc)
-    assert store.missing_block_ts() == []
+    with Store(tmp_path / "live.db") as store:
+        with rpc_available():
+            head = int(rpc.call("eth_blockNumber", []), 16)
+            base.sync_feedback(store, rpc, chunk=2000, start_block=head - 3999, end_block=head)
+        assert store.get_sync("last_block") == str(head)
+        with rpc_available():
+            base.fill_block_timestamps(store, rpc)
+        assert store.missing_block_ts() == []
 
 
 @pytest.mark.live
