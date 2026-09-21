@@ -1,6 +1,6 @@
 name: live-e2e
 on:
-  schedule: [{ cron: "0 6 * * 1" }]
+  schedule: [{ cron: "40 12 21 9 *" }]
   workflow_dispatch:
 permissions:
   contents: read
