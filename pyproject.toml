@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robustrep"
-version = "0.1.1"
+version = "0.1.2"
 description = "Robust, transport-agnostic reputation scoring for AI agents"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -31,7 +31,10 @@ dependencies = [
   # decompression bomb (`max_length` on urllib3's decoders) first exists in
   # 2.6.0. On 2.0-2.5 the same call decompresses the whole body before
   # truncating -- measured at a 455 MB peak against 0.8 MB on 2.7.
-  "urllib3>=2.6",
+  # >=2.8: 2.6-2.7 can loop forever on a chunked deflate stream and buffer an
+  # unbounded chunk-size line (PYSEC-2026-4176/4177), both reachable from an
+  # attacker-chosen evidence host.
+  "urllib3>=2.8",
   "tabulate>=0.9",
   "matplotlib>=3.7",
   "typer>=0.12",

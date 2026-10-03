@@ -4,6 +4,19 @@ All notable changes to robustrep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0,
 so a `0.x` bump may change published numbers without changing the API.
 
+## [0.1.2] — 2026-10-03
+
+A dependency security release. No API, CLI or scoring changes.
+
+### Security — Fixed
+
+- **urllib3 floor raised to 2.8.** urllib3 2.6–2.7 can enter an infinite loop
+  on a chunked deflate stream (PYSEC-2026-4176) and buffer an unbounded
+  chunk-size line into memory (PYSEC-2026-4177). Both are reachable from
+  `fetch`, which reads responses from attacker-chosen evidence hosts, so a
+  hostile URI could hang or exhaust the fetcher. 2.8 also fixes HTTPS-proxy TLS
+  settings being ignored (PYSEC-2026-4175). The CI pin moves to 2.8.0 as well.
+
 ## [0.1.1] — 2026-09-15
 
 A security release: it closes every finding of an external security review of
@@ -114,5 +127,6 @@ no longer rescales a group by its own extremes.
 Initial release on PyPI: the scoring library, the Base ERC-8004 adapter, and the
 reproducible report.
 
+[0.1.2]: https://github.com/iamdongwang/robustrep/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/iamdongwang/robustrep/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/iamdongwang/robustrep/releases/tag/v0.1.0
