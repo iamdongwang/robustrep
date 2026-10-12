@@ -4,7 +4,9 @@ import threading
 import pytest
 import requests
 
-from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcClient, RpcError
+from robustrep.sources import rpc as rpc_mod
+from robustrep.sources.rpc import (RpcBatchRateLimitError, RpcBatchStructureError, RpcClient, RpcError,
+                                   RpcRangeTooLargeError)
 
 
 class FakeRaw:
@@ -457,3 +459,59 @@ def test_oversized_batch_response_raises_rpcerror_without_retry():
     with pytest.raises(RpcError):
         c.batch([("m", [1])])
     assert len(s.calls) == 1 and sleeps == []
+
+
+@pytest.mark.parametrize("message", [
+    "[-32001] Block range too large: maximum allowed is 50 blocks on your current plan. Upgrade at https://nodies.app",
+    "[-32602] eth_getLogs is limited to 0 - 50 blocks range",
+    "[35] ranges over 10000 blocks are not supported on free plan",
+    "[-32600] You can make eth_getLogs requests with up to a 10 block range. Based on your parameters, this block range should work: [0x1, 0xa]",
+    "[-32614] eth_getLogs is limited to a 2,000 range",
+])
+def test_range_too_large_messages_are_recognised(message):
+    assert rpc_mod._is_range_too_large(message)
+
+
+@pytest.mark.parametrize("message", [
+    "[-32602] invalid params", "[-32602] Invalid variadic value or array type",
+    "[-32000] header not found", "[-32602] block 429000 is out of range", "rate limit exceeded",
+])
+def test_other_messages_are_not_range_errors(message):
+    assert not rpc_mod._is_range_too_large(message)
+
+
+def test_numbers_in_strips_thousands_separators_and_caps_count():
+    assert rpc_mod._numbers_in("limited to a 2,000 range; 0 - 50; 10000") == (2000, 0, 50, 10000)
+    assert len(rpc_mod._numbers_in(" ".join(str(i) for i in range(20)))) == 8
+
+
+def test_range_error_raises_immediately_with_endpoint_and_numbers_no_rotation_no_sleep():
+    s = FakeSession([{"error": {"code": -32001, "message": "Block range too large: maximum allowed is 50 blocks https://h/v2/KEY"}}])
+    slept = []
+    c = RpcClient(["https://a.example/v2/KEY", "https://b.example"], user_agent="ua", session=s, sleep=slept.append)
+    with pytest.raises(RpcRangeTooLargeError) as info:
+        c.call("eth_getLogs", [{}])
+    assert info.value.endpoint == "https://a.example"
+    assert info.value.numbers == (32001, 50, 2)   # code, 50, the 2 of "v2"; LogFetcher filters by [min_window, w)
+    assert "KEY" not in str(info.value) and "[" not in str(info.value)
+    assert str(info.value) == "range too large for https://a.example"
+    assert len(s.calls) == 1 and slept == [] and c.current_url == "https://a.example/v2/KEY"
+
+
+def test_range_check_precedes_non_retryable():
+    s = FakeSession([{"error": {"code": -32602, "message": "eth_getLogs is limited to 0 - 50 blocks range"}}])
+    c = RpcClient(["http://a"], user_agent="ua", session=s, sleep=lambda _: None)
+    with pytest.raises(RpcRangeTooLargeError):
+        c.call("eth_getLogs", [{}])
+
+
+def test_current_url_points_at_the_server_after_success_following_rotation():
+    s = FakeSession([requests.ConnectionError(), {"result": "ok"}])
+    c = RpcClient(["http://a", "http://b"], user_agent="ua", session=s, sleep=lambda _: None)
+    assert c.call("m", []) == "ok" and c.current_url == "http://b"
+
+
+def test_rotate_advances_and_wraps():
+    c = RpcClient(["http://a", "http://b"], user_agent="ua", session=FakeSession([]), sleep=lambda _: None)
+    c.rotate(); assert c.current_url == "http://b"
+    c.rotate(); assert c.current_url == "http://a"

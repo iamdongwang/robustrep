@@ -16,6 +16,7 @@ memory.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -75,6 +76,19 @@ class RpcBatchRateLimitError(RpcBatchUnsupportedError):
     batching entirely, not to keep re-attempting the same doomed batch."""
 
 
+class RpcRangeTooLargeError(RpcError):
+    """The endpoint rejected an ``eth_getLogs`` block range as too large.
+    Raised immediately (no retry, rotation or sleep) so the caller can shrink
+    its window. Only integers leave this module: ``numbers`` holds the integers
+    found in the server's message (in order of appearance) and the exception
+    text is fixed -- never server text, which may echo a provider API key."""
+
+    def __init__(self, endpoint: str, numbers: tuple[int, ...] = ()):
+        super().__init__(f"range too large for {endpoint}")
+        self.endpoint = endpoint
+        self.numbers = numbers
+
+
 def _endpoint(url: str) -> str:
     """``url`` reduced to ``scheme://host`` -- strips path, query string,
     port and userinfo, any of which may embed a provider API key (many paid
@@ -127,8 +141,28 @@ def _is_non_retryable(message: str) -> bool:
     return any(s.lower() in low for s in NON_RETRYABLE)
 
 
-def _raise_if_fatal(err: str) -> None:
-    """Raise ``RpcError`` (no further retries) if ``err`` names a ``NON_RETRYABLE`` error."""
+def _is_range_too_large(message: str) -> bool:
+    """True if ``message`` is a provider's "eth_getLogs block range too large" rejection."""
+    low = message.lower()
+    return ("block range too large" in low
+            or "blocks range" in low
+            or "ranges over" in low
+            or ("limited to a" in low and "range" in low)
+            or ("up to a" in low and "block range" in low)
+            or ("block range" in low and any(k in low for k in ("limited", "maximum", "up to"))))
+
+
+def _numbers_in(message: str, limit: int = 8) -> tuple[int, ...]:
+    """The first ``limit`` unsigned integers in ``message``, in order, thousands separators removed."""
+    return tuple(int(m.replace(",", "")) for m in re.findall(r"\d[\d,]*", message)[:limit])
+
+
+def _raise_if_fatal(err: str, url: str) -> None:
+    """Raise (no further retries) if ``err`` is a range-too-large rejection
+    (``RpcRangeTooLargeError``) or names a ``NON_RETRYABLE`` error (``RpcError``)."""
+    if _is_range_too_large(err):
+        logger.debug("rpc: range too large from %s: %s", _endpoint(url), err)
+        raise RpcRangeTooLargeError(_endpoint(url), _numbers_in(err))
     if _is_non_retryable(err):
         raise RpcError(f"non-retryable error: {err}")
 
@@ -169,6 +203,15 @@ class RpcClient:
         self._local = threading.local()
         self.retries, self.timeout, self.sleep = retries, timeout, sleep
         self.max_response_bytes = max_response_bytes
+
+    @property
+    def current_url(self) -> str:
+        """The URL the next request will go to."""
+        return self.urls[self.i % len(self.urls)]
+
+    def rotate(self) -> None:
+        """Advance to the next configured URL (wraps around)."""
+        self.i += 1
 
     @property
     def session(self):
@@ -219,7 +262,8 @@ class RpcClient:
         ``check(body)`` returns a non-``None`` error message. Raises ``RpcError``
         naming the last failure once ``retries`` attempts are exhausted, or
         immediately (no rotation, no sleep, no further attempts) if ``check``
-        reports a ``NON_RETRYABLE`` error, or if ``check`` itself raises (as
+        reports a ``NON_RETRYABLE`` error (or a range-too-large one, which
+        raises ``RpcRangeTooLargeError``), or if ``check`` itself raises (as
         ``_check_batch`` does for ``RpcBatchStructureError``/``RpcBatchRateLimitError``
         -- neither of these is caught here, so they propagate straight through
         on the very first attempt). The final failed attempt is never followed
@@ -239,7 +283,7 @@ class RpcClient:
                 err = check(body)
                 if err is None:
                     return body
-                _raise_if_fatal(err)
+                _raise_if_fatal(err, last_url)
                 last = RpcError(err)
             except (requests.RequestException, ValueError) as e:
                 last = e
