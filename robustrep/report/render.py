@@ -241,14 +241,14 @@ _LOG_SOURCE_LIMITATION = (
 _RPC_SOURCES_KEY = "rpc_sources"
 
 
-def _log_source_lines(config: dict) -> list:
+def _log_source_lines(config: dict) -> list[str]:
     """The "Log sources" lines of the Provenance block, from
     `config["rpc_sources"]` (see `report.publish._rpc_sources_for_provenance`)."""
     rpc = config.get(_RPC_SOURCES_KEY)
     if not isinstance(rpc, dict):
         return ["- Log sources: not recorded (fetched before source recording existed)."]
     parts = [
-        f"{urlsplit(src['host']).hostname} (blocks {src['blocks_min']:,}\u2013{src['blocks_max']:,}, "
+        f"{urlsplit(src['host']).hostname or 'unknown host'} (blocks {src['blocks_min']:,}\u2013{src['blocks_max']:,}, "
         f"{src['n_ranges']:,} ranges, {src['n_blocks']:,} blocks, {src['n_logs']:,} logs)"
         for src in rpc["sources"]
     ]
@@ -278,27 +278,10 @@ def _provenance_config_lines(config: dict) -> list:
                                                 for key in known + extra]
 
 
-def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, figures: dict,
-                    sensitivity: pd.DataFrame, adversarial: Optional[pd.DataFrame] = None,
-                    provenance: Optional[dict] = None) -> str:
-    """Render the full Markdown report.
-
-    `figures` maps a human figure title (e.g. "Fig 4. Largest rater clusters") ->
-    relative file path (e.g. "fig4_sybil_clusters.png") for the Markdown image
-    link -- the title is the heading text, never the raw filename. `provenance`,
-    when given, may carry `rater_profile_mode`, `confirmations`, `config` (the
-    scoring parameters actually used -- see `PROVENANCE_KEYS`; EVERY key of it
-    is rendered, known ones in that order and the rest sorted after them),
-    `cluster_stats` and `versions`.
-
-    `provenance["cluster_stats"]` (see `robustrep.sybil.ClusterStats`), falling
-    back to `scores.attrs["cluster_stats"]`, adds a Limitations bullet whenever
-    a sybil pair budget cut the clustering short.
-    """
-    prov = provenance or {}
-    config = prov.get("config") or {}
+def _headline_lines(scores: pd.DataFrame, records: pd.DataFrame, block: int,
+                    scored: pd.DataFrame) -> list[str]:
+    """Title, data-cut summary and the "Headline numbers" bullets."""
     non_revoked, n_revoked = _non_revoked(records)
-    scored = scores[scores["insufficient"] == 0]
     insufficient = scores[scores["insufficient"] == 1]
     n_flagged, flag_rate = _flag_rate(scored)
     ev_shares = evidence_level_shares(non_revoked)
@@ -336,113 +319,159 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     if len(scored):
         med_gap = (scored["naive_mean"] - scored["robust_score"]).abs().median()
         lines.append(f"- Median |mean - robust| among scored agents: {med_gap:.3f}")
-    lines += ["", "## Figures"]
+    return lines
+
+
+def _figure_lines(figures: dict) -> list[str]:
+    lines = ["", "## Figures"]
     for title, path in figures.items():
         lines += [f"### {title}", f"![{title}]({path})", ""]
+    return lines
 
-    lines += ["## Sensitivity",
-              "Rank stability of the top-N robust-score ranking under reasonable parameter "
-              "perturbations (evidence-weight shape, sybil Jaccard threshold, sybil time "
-              "window, normalization fit share), each vs the base configuration. Top sets are tie-inclusive (every "
-              "agent scoring >= the N-th highest score). `top_set_jaccard` is the primary "
-              "stability measure: the overlap of the base and variant top sets. Spearman's "
-              "rho (Pearson correlation of average ranks over the union of the two top sets, "
-              "no scipy dependency) is reported for completeness; a blank cell means one run "
-              "ranked the whole union as a single tie while the other did not (zero variance "
-              "on one side, so no correlation is defined).",
-              *_top_tie_block_lines(scored, sensitivity),
-              *_budget_limited_variant_lines(sensitivity),
-              "", _markdown_table(sensitivity), ""]
 
-    lines += ["## Adversarial evidence",
-              "Known-answer attack scenarios (see `robustrep.report.adversarial.scenario_table`), "
-              "each computed with **bootstrap_n=0**: point estimates only -- no confidence-interval "
-              "claims are made from this table.", ""]
+def _sensitivity_lines(scored: pd.DataFrame, sensitivity: pd.DataFrame) -> list[str]:
+    return ["## Sensitivity",
+            "Rank stability of the top-N robust-score ranking under reasonable parameter "
+            "perturbations (evidence-weight shape, sybil Jaccard threshold, sybil time "
+            "window, normalization fit share), each vs the base configuration. Top sets are tie-inclusive (every "
+            "agent scoring >= the N-th highest score). `top_set_jaccard` is the primary "
+            "stability measure: the overlap of the base and variant top sets. Spearman's "
+            "rho (Pearson correlation of average ranks over the union of the two top sets, "
+            "no scipy dependency) is reported for completeness; a blank cell means one run "
+            "ranked the whole union as a single tie while the other did not (zero variance "
+            "on one side, so no correlation is defined).",
+            *_top_tie_block_lines(scored, sensitivity),
+            *_budget_limited_variant_lines(sensitivity),
+            "", _markdown_table(sensitivity), ""]
+
+
+def _adversarial_lines(adversarial: Optional[pd.DataFrame]) -> list[str]:
+    lines = ["## Adversarial evidence",
+             "Known-answer attack scenarios (see `robustrep.report.adversarial.scenario_table`), "
+             "each computed with **bootstrap_n=0**: point estimates only -- no confidence-interval "
+             "claims are made from this table.", ""]
     if adversarial is not None:
         lines += [_markdown_table(adversarial), ""]
         boundaries = _measured_boundaries_paragraph(adversarial)
         if boundaries:
             lines += [boundaries, ""]
+    return lines
 
-    lines += [
-        "## Method",
-        "normalize per (tag, scale) -> evidence weights -> sybil collapse (2-of-3 signals: "
-        "shared funder, first-seen within the sybil time window, Jaccard-similar ratee sets) "
-        "-> one vote per (ratee, tag, cluster) -> per-tag weighted median, weighted across tags "
-        "by summed evidence mass -> bootstrap CI. See the design spec in the parent repo.",
-        "",
-        "**Attacker break-even.** An attacker needs to command roughly half of the evidence "
-        "mass behind a ratee's votes to move the weighted median at all -- not half the vote "
-        "count. Exact ties resolve **downward**, toward the lower of the two tied values: a "
-        "smearing attack that reaches exactly half the evidence mass succeeds at that tie, "
-        "while a boosting attack needs to strictly exceed half (one more unit of mass) to flip "
-        "the score, since at the tie the lower (honest) value is the one selected.",
-        "",
-        "**Flat-weight fallback.** With flat (all-equal) evidence weights, the aggregator "
-        "reduces to the **lower weighted median** of the votes, not numpy's mean-of-two-middles "
-        "convention: for an even split of evidence mass on either side, the smaller of the two "
-        "middle values is reported, never their average.",
-        "",
+
+# Static "Method" section, ending with the blank line before "Limitations".
+_METHOD_LINES = (
+    "## Method",
+    "normalize per (tag, scale) -> evidence weights -> sybil collapse (2-of-3 signals: "
+    "shared funder, first-seen within the sybil time window, Jaccard-similar ratee sets) "
+    "-> one vote per (ratee, tag, cluster) -> per-tag weighted median, weighted across tags "
+    "by summed evidence mass -> bootstrap CI. See the design spec in the parent repo.",
+    "",
+    "**Attacker break-even.** An attacker needs to command roughly half of the evidence "
+    "mass behind a ratee's votes to move the weighted median at all -- not half the vote "
+    "count. Exact ties resolve **downward**, toward the lower of the two tied values: a "
+    "smearing attack that reaches exactly half the evidence mass succeeds at that tie, "
+    "while a boosting attack needs to strictly exceed half (one more unit of mass) to flip "
+    "the score, since at the tie the lower (honest) value is the one selected.",
+    "",
+    "**Flat-weight fallback.** With flat (all-equal) evidence weights, the aggregator "
+    "reduces to the **lower weighted median** of the votes, not numpy's mean-of-two-middles "
+    "convention: for an even split of evidence mass on either side, the smaller of the two "
+    "middle values is reported, never their average.",
+    "",
+)
+
+
+# Static Limitations bullets, in report order (see `_limitations_lines`).
+_CLUSTERING_EVASION_BULLET = (
+    "- **Clustering evasion.** An attacker using a distinct funder per rater, spacing "
+    "first-seen timestamps more than the sybil time window apart, and rating decoy ratees "
+    "can still reach a Jaccard of 1.0 with another attacker who shares the same decoy -- "
+    "but that pair still evades detection, because it fails both of the other two signals "
+    "(distinct funders, and outside the time window), so no pair ever reaches 2 of the 3 "
+    "required signals. Every attacker rater lands in its own singleton cluster. The "
+    "residual defense is evidence weighting (an evasive farm is almost always "
+    "evidence-free): `zero_evidence_ratio` is the signal that survives this evasion even "
+    "when `sybil_flag` reads 0 and rater clustering sees nothing unusual."
+)
+
+
+_LARGE_RATEE_GROUP_BULLET = (
+    "- **Large-ratee-group blind spot.** A ratee with more raters than `sybil_max_group` is "
+    "skipped entirely for ratee-based blocking (see `robustrep.sybil`), so a farm "
+    "concentrated on one very popular ratee can evade the ratee-sharing signal by sheer "
+    "volume, independent of the evasion technique above."
+)
+
+
+_DNS_REBINDING_BULLET = (
+    "- **DNS rebinding in the evidence fetcher (the residual unmitigated gap in v0.1).** "
+    "The SSRF guard resolves an evidence URI's host and checks *those* addresses, but "
+    "`requests`/`urllib3` resolve the host again independently; a rebinding attacker "
+    "answering a public address on the first lookup and a private one on the second can "
+    "pass the guard and cause a GET to a private address. The blast radius is not nil: the "
+    "fetched text is consumed by the tx-hash scan and the per-URI outcome is persisted, so "
+    "a bypass is at least a four-state oracle about the target (no response; a response "
+    "with no markers; a 0x-hash or task-id key present; a hash involving the rater/owner "
+    "addresses -- and further states as other notes are recorded, e.g. `fetch-error` or "
+    "`lookup-budget:N`) -- not a blind request. That is precisely why the URL is "
+    "parser-cross-checked (`urlsplit` against `urllib3`), host-allowlisted to LDH labels, "
+    "and rebuilt canonically from the vetted components before it is fetched: \"nothing of "
+    "the response is persisted or reported\" would not be reason enough to tolerate a "
+    "reachable bypass -- and here it is not even true, since the `(level, note)` pair is "
+    "both. Closing the remaining "
+    "DNS gap (resolve once, then fetch through a pinned-IP "
+    "transport adapter) is a v0.2 item. See `robustrep.sources.evidence_fetch` for the "
+    "full writeup and its xfail regression test."
+)
+
+
+_TWO_TAG_BULLET = (
+    "- **Two-tag lower-median bias.** With exactly two tags, cross-tag combination is a "
+    "step, not a blend: the reported score is whichever tag's median holds at least half "
+    "the total evidence mass; the other tag is discarded. At an exact mass tie (within a "
+    "1e-9 relative tolerance) the lower-scored tag wins by the same lower-median "
+    "convention. The deviation from a blended estimate is bounded by the gap between the "
+    "two tag medians and is downward only at the tie."
+)
+
+
+_UNIQUE_TAG_BULLET = (
+    "- **Unique-tag gaming.** `tag1` is attacker-chosen free text and v0.1 keeps every "
+    "distinct value as its own normalization group, so a rater who invents a tag nobody "
+    "else uses gets a group of one: at `d0` a posted `1` fits the absolute `binary` rule "
+    "and normalizes straight to 1.0, with no honest record in the group to normalize "
+    "against (the scale buys nothing either -- the attacker picks that too, and a `100` "
+    "at `d2` is the same 1.0). "
+    "What that buys is bounded, not free. A tag reaches the reported score only through "
+    "the cross-tag weighted median, and a tag's weight there is the SUM of its votes' "
+    "evidence weights, not their count -- so an evidence-free invented tag carries ~0.1 "
+    "per (ratee, tag, cluster) vote, not per rating: collapse gives each cluster one vote "
+    "carrying its records' mean weight, so a hundred ratings from one cluster are still "
+    "~0.1. A top-scoring invented tag can take over the ratee's score only once the "
+    "honest tags together hold less than half the ratee's total evidence mass. The cost "
+    "is paid in evidence mass, which is the quantity the whole aggregator is built to "
+    "make expensive; a rare-tag merge is a v0.2 item."
+)
+
+
+def _limitations_lines(scores: pd.DataFrame, prov: dict, config: dict) -> list[str]:
+    return [
         "## Limitations",
-        "- **Clustering evasion.** An attacker using a distinct funder per rater, spacing "
-        "first-seen timestamps more than the sybil time window apart, and rating decoy ratees "
-        "can still reach a Jaccard of 1.0 with another attacker who shares the same decoy -- "
-        "but that pair still evades detection, because it fails both of the other two signals "
-        "(distinct funders, and outside the time window), so no pair ever reaches 2 of the 3 "
-        "required signals. Every attacker rater lands in its own singleton cluster. The "
-        "residual defense is evidence weighting (an evasive farm is almost always "
-        "evidence-free): `zero_evidence_ratio` is the signal that survives this evasion even "
-        "when `sybil_flag` reads 0 and rater clustering sees nothing unusual.",
-        "- **Large-ratee-group blind spot.** A ratee with more raters than `sybil_max_group` is "
-        "skipped entirely for ratee-based blocking (see `robustrep.sybil`), so a farm "
-        "concentrated on one very popular ratee can evade the ratee-sharing signal by sheer "
-        "volume, independent of the evasion technique above.",
+        _CLUSTERING_EVASION_BULLET,
+        _LARGE_RATEE_GROUP_BULLET,
         *_budget_limit_lines(scores, prov),
-        "- **DNS rebinding in the evidence fetcher (the residual unmitigated gap in v0.1).** "
-        "The SSRF guard resolves an evidence URI's host and checks *those* addresses, but "
-        "`requests`/`urllib3` resolve the host again independently; a rebinding attacker "
-        "answering a public address on the first lookup and a private one on the second can "
-        "pass the guard and cause a GET to a private address. The blast radius is not nil: the "
-        "fetched text is consumed by the tx-hash scan and the per-URI outcome is persisted, so "
-        "a bypass is at least a four-state oracle about the target (no response; a response "
-        "with no markers; a 0x-hash or task-id key present; a hash involving the rater/owner "
-        "addresses -- and further states as other notes are recorded, e.g. `fetch-error` or "
-        "`lookup-budget:N`) -- not a blind request. That is precisely why the URL is "
-        "parser-cross-checked (`urlsplit` against `urllib3`), host-allowlisted to LDH labels, "
-        "and rebuilt canonically from the vetted components before it is fetched: \"nothing of "
-        "the response is persisted or reported\" would not be reason enough to tolerate a "
-        "reachable bypass -- and here it is not even true, since the `(level, note)` pair is "
-        "both. Closing the remaining "
-        "DNS gap (resolve once, then fetch through a pinned-IP "
-        "transport adapter) is a v0.2 item. See `robustrep.sources.evidence_fetch` for the "
-        "full writeup and its xfail regression test.",
-        "- **Two-tag lower-median bias.** With exactly two tags, cross-tag combination is a "
-        "step, not a blend: the reported score is whichever tag's median holds at least half "
-        "the total evidence mass; the other tag is discarded. At an exact mass tie (within a "
-        "1e-9 relative tolerance) the lower-scored tag wins by the same lower-median "
-        "convention. The deviation from a blended estimate is bounded by the gap between the "
-        "two tag medians and is downward only at the tie.",
-        "- **Unique-tag gaming.** `tag1` is attacker-chosen free text and v0.1 keeps every "
-        "distinct value as its own normalization group, so a rater who invents a tag nobody "
-        "else uses gets a group of one: at `d0` a posted `1` fits the absolute `binary` rule "
-        "and normalizes straight to 1.0, with no honest record in the group to normalize "
-        "against (the scale buys nothing either -- the attacker picks that too, and a `100` "
-        "at `d2` is the same 1.0). "
-        "What that buys is bounded, not free. A tag reaches the reported score only through "
-        "the cross-tag weighted median, and a tag's weight there is the SUM of its votes' "
-        "evidence weights, not their count -- so an evidence-free invented tag carries ~0.1 "
-        "per (ratee, tag, cluster) vote, not per rating: collapse gives each cluster one vote "
-        "carrying its records' mean weight, so a hundred ratings from one cluster are still "
-        "~0.1. A top-scoring invented tag can take over the ratee's score only once the "
-        "honest tags together hold less than half the ratee's total evidence mass. The cost "
-        "is paid in evidence mass, which is the quantity the whole aggregator is built to "
-        "make expensive; a rare-tag merge is a v0.2 item.",
+        _DNS_REBINDING_BULLET,
+        _TWO_TAG_BULLET,
+        _UNIQUE_TAG_BULLET,
         *_evidence_budget_lines(config),
         _NORMALIZATION_ORDER_BULLET,
         _LOG_SOURCE_LIMITATION,
         "",
-        "## Provenance",
     ]
+
+
+def _provenance_lines(prov: dict, config: dict) -> list[str]:
+    lines = ["## Provenance"]
     lines.append(f"- Rater profile mode: {prov.get('rater_profile_mode', 'unknown')}")
     lines.append(f"- Confirmations lag (data cut is final as of this block): "
                  f"{prov.get('confirmations', 'unknown')}")
@@ -452,4 +481,35 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
     if versions:
         v_str = ", ".join(f"{k} {v}" for k, v in versions.items())
         lines.append(f"- Versions: {v_str}")
-    return "\n".join(lines)
+    return lines
+
+
+def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, figures: dict,
+                    sensitivity: pd.DataFrame, adversarial: Optional[pd.DataFrame] = None,
+                    provenance: Optional[dict] = None) -> str:
+    """Render the full Markdown report.
+
+    `figures` maps a human figure title (e.g. "Fig 4. Largest rater clusters") ->
+    relative file path (e.g. "fig4_sybil_clusters.png") for the Markdown image
+    link -- the title is the heading text, never the raw filename. `provenance`,
+    when given, may carry `rater_profile_mode`, `confirmations`, `config` (the
+    scoring parameters actually used -- see `PROVENANCE_KEYS`; EVERY key of it
+    is rendered, known ones in that order and the rest sorted after them),
+    `cluster_stats` and `versions`.
+
+    `provenance["cluster_stats"]` (see `robustrep.sybil.ClusterStats`), falling
+    back to `scores.attrs["cluster_stats"]`, adds a Limitations bullet whenever
+    a sybil pair budget cut the clustering short.
+    """
+    prov = provenance or {}
+    config = prov.get("config") or {}
+    scored = scores[scores["insufficient"] == 0]
+    return "\n".join([
+        *_headline_lines(scores, records, block, scored),
+        *_figure_lines(figures),
+        *_sensitivity_lines(scored, sensitivity),
+        *_adversarial_lines(adversarial),
+        *_METHOD_LINES,
+        *_limitations_lines(scores, prov, config),
+        *_provenance_lines(prov, config),
+    ])

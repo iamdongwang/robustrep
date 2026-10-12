@@ -28,7 +28,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pandas
 
@@ -174,7 +174,7 @@ def evidence_caps_for_provenance(store: Optional[Store]) -> dict:
     return caps
 
 
-def _rpc_sources_for_provenance(sync_sources: Optional[SyncSources]):
+def _rpc_sources_for_provenance(sync_sources: Optional[SyncSources]) -> Union[str, dict]:
     """`config["rpc_sources"]`: the store's per-host sync_log summary, or
     `UNAVAILABLE` when there is no store or it recorded no source at all."""
     if sync_sources is None or sync_sources.recorded_from_block is None:
