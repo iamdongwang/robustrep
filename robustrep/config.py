@@ -66,7 +66,7 @@ class Config:
     rpc_urls: tuple[str, ...] = (
         "https://mainnet.base.org",
         "https://base-rpc.publicnode.com",
-        "https://base.api.nodies.app",
+        "https://base-pokt.nodies.app",
         "https://base.drpc.org",
     )
     # (scheme://hostname, max block window) pairs; a tuple so Config stays hashable.

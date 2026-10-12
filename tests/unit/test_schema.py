@@ -211,7 +211,7 @@ def test_default_rpc_urls_lists_four_public_endpoints_in_rotation_order():
     assert Config().rpc_urls == (
         "https://mainnet.base.org",
         "https://base-rpc.publicnode.com",
-        "https://base.api.nodies.app",
+        "https://base-pokt.nodies.app",
         "https://base.drpc.org",
     )
 
