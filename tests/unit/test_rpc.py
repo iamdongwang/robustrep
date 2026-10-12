@@ -608,3 +608,16 @@ def test_http_403_and_429_json_bodies_stay_http_errors(status):
     msg = str(info.value)
     assert f"HTTPError (HTTP {status}) from https://d" in msg
     assert "SERVER_TEXT" not in msg and "-32602" not in msg and "non-retryable" not in msg
+
+
+def test_http_400_json_error_to_a_batch_stays_an_http_error_and_rotates():
+    # A batch POST answered 400 with a single error object must not reach
+    # _check_batch (it would raise RpcBatchStructureError and disable batching).
+    body = {"error": {"code": -32000, "message": "header not found"}}
+    s = FakeSession([FakeErrorResponse(400, body), FakeErrorResponse(400, body)])
+    c = RpcClient(["https://d", "https://e"], user_agent="ua", session=s, sleep=lambda _: None, retries=2)
+    with pytest.raises(RpcError) as info:
+        c.batch([("m", [1]), ("m", [2])])
+    assert not isinstance(info.value, RpcBatchStructureError)
+    assert "HTTPError (HTTP 400) from" in str(info.value)
+    assert [u for u, _ in s.calls] == ["https://d", "https://e"]
