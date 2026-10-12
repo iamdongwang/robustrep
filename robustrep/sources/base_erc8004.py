@@ -36,8 +36,12 @@ crash-safe even then (or under an abrupt interruption such as Ctrl-C while
 waiting on a fetch), the whole per-chunk loop runs under a ``try/finally``: on
 *any* exception escaping the loop, every range that was popped off the queue but
 not yet fully processed -- the one that was in flight plus everything still
-pending -- is re-added to ``failed_ranges`` before the exception propagates, so
-no range is ever silently lost to a crash.
+pending -- and that starts at or below the checkpoint is re-added to
+``failed_ranges`` before the exception propagates. Leftovers above the
+checkpoint are not re-added: the next run regenerates them from
+``last_block + 1`` (whatever its chunk size), and re-adding them too would
+fetch each of them twice. With no checkpoint yet, every leftover is re-added.
+Either way no range is ever silently lost to a crash.
 
 Per-chunk source recording (the ``sync_log`` table) exists only when a
 ``fetcher`` (``robustrep.sources.log_fetcher.LogFetcher``) is passed -- the CLI
@@ -381,8 +385,9 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
     guarantee). A chunk that fetches fine but fails to *decode/apply* is a bug,
     not a transient condition: it is logged at ERROR and re-raised, and (per the
     module docstring's crash-safety guarantee) every not-yet-processed range,
-    including the one that failed, is re-added to ``failed_ranges`` before the
-    exception propagates. If the checkpoint is already at or past ``end_block``,
+    including the one that failed, is either re-added to ``failed_ranges``
+    before the exception propagates or, if it starts above the checkpoint,
+    left for the next run to regenerate from ``last_block + 1``. If the checkpoint is already at or past ``end_block``,
     no RPC calls are made and 0 is returned.
 
     Source recording exists only when a ``fetcher`` is passed (the CLI always
@@ -426,10 +431,21 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
             _log_chunk_done(a, z, served, len(logs), n_fb)
             current = None
     finally:
-        leftover = ([current] if current is not None else []) + pending
-        for fa, fz in leftover:
-            store.add_failed_range(fa, fz, "sync_feedback: not processed (aborted mid-run)")
+        _requeue_leftovers(store, ([current] if current is not None else []) + pending)
     return n
+
+
+def _requeue_leftovers(store: Store, leftover: list[tuple[int, int]]) -> None:
+    """Record the ranges an aborted run never finished as failed ranges.
+
+    Only ranges starting at or below the checkpoint are needed: the next run
+    regenerates everything above it from ``last_block + 1`` anyway, so
+    re-adding those too would fetch them twice. With no checkpoint at all,
+    every leftover is re-added."""
+    checkpoint = store.get_sync("last_block")
+    for fa, fz in leftover:
+        if checkpoint is None or fa <= int(checkpoint):
+            store.add_failed_range(fa, fz, "sync_feedback: not processed (aborted mid-run)")
 
 
 # Suggested in the fallback WARNING once an endpoint's batching is given up on

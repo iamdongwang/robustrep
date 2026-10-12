@@ -227,7 +227,15 @@ def test_sync_feedback_decode_failure_raises_and_records_range(tmp_path):
         with pytest.raises(ValueError):
             b.sync_feedback(store, rpc, chunk=1000, start_block=0, confirmations=0)
         assert store.get_sync("last_block") == "999"
-        assert store.pop_failed_ranges() == [(1000, 1999)]
+        # above the checkpoint: not queued in failed_ranges (F2) -- the next
+        # run regenerates it from last_block + 1, so it is retried exactly once
+        assert store.pop_failed_ranges() == []
+        rpc.logs_by_range[(1000, 1999)] = []
+        rpc.calls.clear()
+        b.sync_feedback(store, rpc, chunk=1000, start_block=0, confirmations=0)
+        assert [(int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16))
+                for m, p in rpc.calls if m == "eth_getLogs"] == [(1000, 1999)]
+        assert store.get_sync("last_block") == "1999"
 
 
 def test_sync_feedback_interrupt_during_fetch_requeues_remaining(tmp_path):
@@ -1117,3 +1125,54 @@ def test_fetch_failure_without_a_code_keeps_the_plain_message(tmp_path):
 ])
 def test_scrub_rpc_error(raw, want):
     assert b._scrub_rpc_error(RpcError(raw)) == want
+
+
+# --- F2: an aborted run's leftovers above the checkpoint are not queued twice ---
+
+class _AbortingFetcher:
+    """Fake ``LogFetcher``: records every requested range and raises
+    ``KeyboardInterrupt`` the first time ``abort_at`` is requested."""
+
+    def __init__(self, abort_at):
+        self.abort_at, self.requests = abort_at, []
+
+    def get_logs(self, a, z, filter):
+        self.requests.append((a, z))
+        if (a, z) == self.abort_at:
+            self.abort_at = None
+            raise KeyboardInterrupt()
+        return FetchResult(logs=[], served=[Served(a, z, "https://h", z - a + 1, 0)])
+
+
+def test_resume_after_abort_fetches_each_remaining_chunk_once(tmp_path):
+    f = _AbortingFetcher(abort_at=(300, 399))
+    with Store(tmp_path / "r.db") as store:
+        with pytest.raises(KeyboardInterrupt):
+            b.sync_feedback(store, None, chunk=100, start_block=0, end_block=699, fetcher=f)
+        assert store.get_sync("last_block") == "299"
+        f.requests.clear()
+        b.sync_feedback(store, None, chunk=100, start_block=0, end_block=699, fetcher=f)
+        assert f.requests == [(300, 399), (400, 499), (500, 599), (600, 699)]
+        assert store.get_sync("last_block") == "699" and store.failed_ranges() == []
+
+
+def test_abort_on_a_popped_range_below_the_checkpoint_still_requeues_it(tmp_path):
+    f = _AbortingFetcher(abort_at=(100, 199))
+    with Store(tmp_path / "r.db") as store:
+        store.set_sync("last_block", "299")
+        store.add_failed_range(100, 199, "prior failure")
+        with pytest.raises(KeyboardInterrupt):
+            b.sync_feedback(store, None, chunk=100, start_block=0, end_block=699, fetcher=f)
+        assert [(a, z) for a, z, _ in store.failed_ranges()] == [(100, 199)]
+        f.requests.clear()
+        b.sync_feedback(store, None, chunk=100, start_block=0, end_block=699, fetcher=f)
+        assert f.requests == [(100, 199), (300, 399), (400, 499), (500, 599), (600, 699)]
+        assert store.get_sync("last_block") == "699" and store.failed_ranges() == []
+
+
+def test_abort_with_no_checkpoint_requeues_every_leftover(tmp_path):
+    f = _AbortingFetcher(abort_at=(0, 99))
+    with Store(tmp_path / "r.db") as store:
+        with pytest.raises(KeyboardInterrupt):
+            b.sync_feedback(store, None, chunk=100, start_block=0, end_block=299, fetcher=f)
+        assert [(a, z) for a, z, _ in store.failed_ranges()] == [(0, 99), (100, 199), (200, 299)]
