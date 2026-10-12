@@ -541,6 +541,7 @@ def test_fetch_chunk_below_min_window_still_runs(tmp_path, monkeypatch):
 
     r = runner.invoke(app, ["fetch", "--db", str(db), "--chunk", "20"])
     assert r.exit_code == 0, r.output
+    assert isinstance(seen["fetcher"], LogFetcher)
     assert seen["fetcher"].min_window == 20 and seen["fetcher"].max_window == 20
 
 

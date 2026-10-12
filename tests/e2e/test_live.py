@@ -206,9 +206,10 @@ def test_live_fixture_window_matches_recorded_fixture():
     themselves be evidence of exactly the kind of drift this test is meant to
     catch.
 
-    Only the ``LogFetcher.get_logs`` call (the same adaptive path the CLI uses) is guarded by ``rpc_available()``: an
-    unreachable or throttling endpoint tells us nothing, but every comparison
-    below runs unguarded so drift fails loudly.
+    Only the ``LogFetcher.get_logs`` call (the same adaptive path the CLI
+    uses) is guarded by ``rpc_available()``: an unreachable or throttling
+    endpoint tells us nothing, but every comparison below runs unguarded so
+    drift fails loudly.
     """
     cfg = Config()
     rpc = RpcClient(cfg.rpc_urls, user_agent=cfg.user_agent)

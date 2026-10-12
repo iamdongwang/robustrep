@@ -27,7 +27,8 @@ from pathlib import Path
 import pytest
 import requests
 
-from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcError, RpcRangeTooLargeError
+from robustrep.sources.rpc import (RpcBatchRateLimitError, RpcBatchStructureError, RpcError,
+                                   RpcRangeTooLargeError)
 from robustrep.store import Store
 
 
