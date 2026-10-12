@@ -315,6 +315,28 @@ def _fetch_logs(rpc, a: int, z: int) -> list[dict]:
     return rpc.call("eth_getLogs", params)
 
 
+_RPC_CODE_TOKEN = re.compile(r"\[-?\d{1,10}\]")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_ERROR_TEXT_CAP = 200
+
+
+def _scrub_rpc_error(e: BaseException) -> str:
+    """The part of a fetch error that is safe to log and store.
+
+    Server text in ``RpcClient`` messages only ever follows a ``[code]``
+    token (``"gave up after 5 attempts: [-32016] <server text>"``), so keep
+    our own prefix before the first ``[`` plus that token when it is an
+    integer JSON-RPC code, and drop everything after it. Control characters
+    become spaces (no log-line or CI workflow-command injection), whitespace
+    runs collapse, and the result is capped at 200 characters."""
+    text = str(e)
+    head, bracket, rest = text.partition("[")
+    if bracket:
+        code = _RPC_CODE_TOKEN.match("[" + rest)
+        head = head + code.group(0) if code else head
+    return " ".join(_CONTROL_CHARS.sub(" ", head).split())[:_ERROR_TEXT_CAP]
+
+
 def _served_summary(served: list[Served]) -> str:
     """``host(window w)`` for each distinct (host, window) that served a chunk, sorted."""
     return ", ".join(f"{host}(window {w})" for host, w in sorted({(x.host, x.window) for x in served}))
@@ -383,8 +405,9 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
             try:
                 logs, served = _fetch_chunk(rpc, fetcher, a, z)
             except Exception as e:  # noqa: BLE001 - transient fetch failure: recorded, not swallowed
-                logger.warning("sync_feedback: range %d-%d fetch failed: %s", a, z, e)
-                store.add_failed_range(a, z, str(e)[:200])
+                err = _scrub_rpc_error(e)
+                logger.warning("sync_feedback: range %d-%d fetch failed: %s", a, z, err)
+                store.add_failed_range(a, z, err)
                 current = None
                 continue
             try:

@@ -1075,3 +1075,45 @@ def test_rerun_after_crash_between_sync_log_and_checkpoint_leaves_no_overlap(tmp
         b.sync_feedback(store, FakeRpc({}, head=99), chunk=100, start_block=0, confirmations=0, fetcher=F())
         rows = store.conn.execute("select from_block,to_block from sync_log order by 1").fetchall()
         assert rows == [(0, 99)] and store.get_sync("last_block") == "99"
+
+
+# --- F1: server text never reaches the fetch-failure WARNING or failed_ranges ---
+
+class _RaisingRpc(FakeRpc):
+    def __init__(self, exc, **kw):
+        super().__init__({}, **kw)
+        self.exc = exc
+
+    def call(self, method, params):
+        if method == "eth_getLogs":
+            self.calls.append((method, params))
+            raise self.exc
+        return super().call(method, params)
+
+
+def test_fetch_failure_stores_and_logs_only_our_prefix_and_code(tmp_path, caplog):
+    exc = RpcError("gave up after 5 attempts: [-32016] over rate limit https://h/v2/KEY\n::error::injected")
+    with Store(tmp_path / "s.db") as store, caplog.at_level(logging.WARNING):
+        b.sync_feedback(store, _RaisingRpc(exc, head=99), chunk=100, start_block=0, confirmations=0)
+        assert [err for _, _, err in store.failed_ranges()] == ["gave up after 5 attempts: [-32016]"]
+    warned = [r.getMessage() for r in caplog.records if "fetch failed" in r.getMessage()]
+    assert len(warned) == 1
+    assert "KEY" not in warned[0] and "::error::" not in warned[0] and "\n" not in warned[0]
+
+
+def test_fetch_failure_without_a_code_keeps_the_plain_message(tmp_path):
+    with Store(tmp_path / "s.db") as store:
+        b.sync_feedback(store, _RaisingRpc(RuntimeError("boom"), head=99), chunk=100,
+                        start_block=0, confirmations=0)
+        assert [err for _, _, err in store.failed_ranges()] == ["boom"]
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("non-retryable error: [-32602] invalid params\r\nx", "non-retryable error: [-32602]"),
+    ("a\tb\x00c   d", "a b c d"),
+    ("x" * 300, "x" * 200),
+    ("head [unterminated tail", "head"),
+    ("gave up after 5 attempts: [KEY-in-a-string-code] text", "gave up after 5 attempts:"),
+])
+def test_scrub_rpc_error(raw, want):
+    assert b._scrub_rpc_error(RpcError(raw)) == want

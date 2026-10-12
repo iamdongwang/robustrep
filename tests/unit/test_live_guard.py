@@ -301,3 +301,15 @@ def test_check_failed_ranges_label_carries_no_server_text(tmp_path):
         with pytest.raises(pytest.fail.Exception) as info:
             live.check_failed_ranges(store)
     assert CANARY not in str(info.value)
+
+
+@pytest.mark.parametrize("err", [
+    "gave up after 5 attempts: [-32016]",
+    "gave up after 5 attempts: HTTPError (HTTP 429) from https://mainnet.base.org",
+])
+def test_check_failed_ranges_labels_the_scrubbed_sync_error(tmp_path, err):
+    """``sync_feedback`` stores only our prefix plus the ``[code]`` token
+    (``_scrub_rpc_error``); the classifier must still label that text."""
+    with _store_with_failures(tmp_path, [err]) as store:
+        with pytest.raises(pytest.fail.Exception, match="RPC unavailable: .*rate limited"):
+            live.check_failed_ranges(store)
