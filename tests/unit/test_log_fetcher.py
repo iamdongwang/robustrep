@@ -6,7 +6,7 @@ URL to a handler, so tests can give each RPC endpoint its own behaviour.
 is not a package.
 """
 import json as jsonlib
-from typing import Callable
+from typing import Callable, Optional
 
 import pytest
 import requests
@@ -20,10 +20,10 @@ FILTER = {"address": "0x8004", "topics": [["0xaa"]]}
 class FakeRaw:
     """Stand-in for ``urllib3.HTTPResponse`` (see ``test_rpc.py``)."""
 
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes) -> None:
         self.data = data
 
-    def read(self, amt, decode_content=True):
+    def read(self, amt: int, decode_content: bool = True) -> bytes:
         chunk, self.data = self.data[:amt], self.data[amt:]
         return chunk
 
@@ -31,13 +31,13 @@ class FakeRaw:
 class FakeResponse:
     status_code = 200
 
-    def __init__(self, body: bytes):
+    def __init__(self, body: bytes) -> None:
         self.raw, self.closed = FakeRaw(body), False
 
-    def raise_for_status(self):
+    def raise_for_status(self) -> None:
         pass
 
-    def close(self):
+    def close(self) -> None:
         self.closed = True
 
 
@@ -48,11 +48,12 @@ class RoutingSession:
     as the response body) or returns/raises an ``Exception`` (raised from
     ``post``). Every call is recorded in ``calls`` as ``(url, payload)``."""
 
-    def __init__(self, handlers: dict[str, Callable[[dict], object]]):
+    def __init__(self, handlers: dict[str, Callable[[dict], object]]) -> None:
         self.handlers = handlers
         self.calls: list[tuple[str, dict]] = []
 
-    def post(self, url, json=None, headers=None, timeout=None, stream=None):
+    def post(self, url: str, json: object = None, headers: Optional[dict] = None,
+             timeout: Optional[float] = None, stream: Optional[bool] = None) -> FakeResponse:
         self.calls.append((url, json))
         r = self.handlers[url](json)
         if isinstance(r, Exception):
@@ -66,7 +67,7 @@ def getlogs_ranges(session: RoutingSession, url: str) -> list[tuple[int, int]]:
             for u, p in session.calls if u == url and p["method"] == "eth_getLogs"]
 
 
-def make_client(urls, session, retries=5) -> RpcClient:
+def make_client(urls: list[str], session: RoutingSession, retries: int = 5) -> RpcClient:
     return RpcClient(urls, user_agent="ua", session=session, sleep=lambda _: None, retries=retries)
 
 
@@ -216,6 +217,26 @@ def test_invalid_rounds_bound_terminates_when_live_host_keeps_failing():
         f.get_logs(0, 49, FILTER)
     assert len(s.calls) <= (2 + 1) * 5 + 7       # (len(urls)+1) 回合 × retries + 缩窗
 
+def test_dead_host_hit_again_is_warned_about_only_once(caplog):
+    """The client rotates back to the already-dead ``n`` inside a later call;
+    that second rejection is an invalid round but must not re-log the WARNING."""
+    def down(p): raise requests.ConnectionError()
+    s = RoutingSession({"https://d": down, "https://n": _capped(10)})
+    f = LogFetcher(make_client(["https://d", "https://n"], s), max_window=2000, min_window=50)
+    with caplog.at_level("WARNING", logger="robustrep.sources.log_fetcher"), pytest.raises(RpcError):
+        f.get_logs(0, 49, FILTER)
+    warned = [r for r in caplog.records if "rejected the minimum window" in r.getMessage()]
+    assert [r.getMessage().split()[1] for r in warned] == ["https://n"]
+
+
+def test_live_host_rotates_past_a_dead_current_host():
+    s = RoutingSession({"https://a": _capped(10), "https://b": _capped(50)})
+    f = LogFetcher(make_client(["https://a", "https://b"], s), max_window=2000, min_window=50)
+    f.dead.add("https://a")
+    res = f.get_logs(0, 49, FILTER)
+    assert getlogs_ranges(s, "https://a") == [] and [x.host for x in res.served] == ["https://b"]
+
+
 def test_hints_seed_windows_and_learned_values_override_only_downwards():
     s = RoutingSession({"https://n": _capped(50)})
     f = LogFetcher(make_client(["https://n"], s), max_window=2000, min_window=50, window_hints={"https://n": 200})
@@ -248,10 +269,8 @@ def test_non_list_result_raises_rpcerror():
     for body in ({"result": None}, {"result": {"x": 1}}):
         s = RoutingSession({"https://a": lambda p, body=body: body})
         f = LogFetcher(make_client(["https://a"], s), max_window=50, min_window=50)
-        res = None
         with pytest.raises(RpcError, match="non-list"):
-            res = f.get_logs(0, 99, FILTER)
-        assert res is None
+            f.get_logs(0, 99, FILTER)
 
 
 def test_from_config_clamps_min_window_to_chunk():

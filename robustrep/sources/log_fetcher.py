@@ -40,8 +40,9 @@ def shrink(window: int, numbers: Iterable[int], min_window: int) -> int:
 
 class Served(NamedTuple):
     """One successful ``eth_getLogs`` sub-request: the inclusive block range,
-    the endpoint host (``scheme://hostname``) that served it, the window size
-    in force for that host, and how many logs it returned."""
+    the endpoint host (``scheme://hostname``) that served it (the client's
+    current URL after the call, which may have rotated within it), the window
+    in force when the request was made, and how many logs it returned."""
 
     from_block: int
     to_block: int
@@ -77,7 +78,7 @@ class LogFetcher:
                  window_hints: Optional[Mapping[str, int]] = None,
                  min_interval: float = 0.0,
                  sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic) -> None:
         if min_window < 1:
             raise ValueError(f"min_window must be >= 1, got {min_window}")
         if max_window < min_window:
@@ -122,20 +123,8 @@ class LogFetcher:
             try:
                 sub_logs = self._call_get_logs(cursor, sub_to, filter)
             except RpcRangeTooLargeError as e:
-                # e.endpoint is the host that raised, which may differ from
-                # ``host`` if the client rotated within this call.
-                if w <= self.min_window:
-                    self.dead.add(e.endpoint)
-                    logger.warning("log_fetcher: %s rejected the minimum window (%d); skipping it for this run",
-                                   e.endpoint, self.min_window)
+                if self._on_range_too_large(e, w):
                     invalid_rounds += 1
-                    self.rpc.rotate()
-                elif e.endpoint in self.dead:
-                    invalid_rounds += 1
-                    self.rpc.rotate()
-                else:
-                    current = self.windows.get(e.endpoint, self.max_window)
-                    self.windows[e.endpoint] = min(current, shrink(w, e.numbers, self.min_window))
                 if invalid_rounds > len(self.rpc.urls):
                     raise self._no_usable_endpoint()
                 continue
@@ -143,6 +132,26 @@ class LogFetcher:
             served.append(Served(cursor, sub_to, _endpoint(self.rpc.current_url), window, len(sub_logs)))
             cursor = sub_to + 1
         return FetchResult(logs=logs, served=served)
+
+    def _on_range_too_large(self, e: RpcRangeTooLargeError, w: int) -> bool:
+        """React to ``e`` after a request of ``w`` blocks. ``e.endpoint`` is
+        the host that raised, which may differ from the round's starting host
+        if the client rotated within the call. A host already dead, or one
+        that rejects ``w <= min_window`` (it is then marked dead, logged once),
+        makes the round invalid: rotate away and return ``True``. Otherwise
+        shrink that host's window and return ``False``."""
+        if e.endpoint in self.dead:
+            self.rpc.rotate()
+            return True
+        if w <= self.min_window:
+            self.dead.add(e.endpoint)
+            logger.warning("log_fetcher: %s rejected the minimum window (%d); skipping it for this run",
+                           e.endpoint, self.min_window)
+            self.rpc.rotate()
+            return True
+        current = self.windows.get(e.endpoint, self.max_window)
+        self.windows[e.endpoint] = min(current, shrink(w, e.numbers, self.min_window))
+        return False
 
     def _live_host(self) -> str:
         """Host of ``rpc.current_url``, rotating past dead hosts first.

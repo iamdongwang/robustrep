@@ -246,7 +246,7 @@ class RpcClient:
         endpoint and the limit: never the body, never the full URL (which may
         embed a provider API key).
         """
-        url = self.urls[self.i % len(self.urls)]
+        url = self.current_url
         r = self.session.post(url, json=payload, headers=self.headers, timeout=self.timeout, stream=True)
         try:
             r.raise_for_status()
@@ -275,9 +275,9 @@ class RpcClient:
         unredacted detail (exception + traceback, against the actual URL
         attempted) is logged at DEBUG on every failed attempt instead."""
         last: Optional[Exception] = None
-        last_url = self.urls[self.i % len(self.urls)]
+        last_url = self.current_url
         for attempt in range(self.retries):
-            last_url = self.urls[self.i % len(self.urls)]
+            last_url = self.current_url
             try:
                 body = self._post(payload)
                 err = check(body)

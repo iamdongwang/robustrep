@@ -513,5 +513,7 @@ def test_current_url_points_at_the_server_after_success_following_rotation():
 
 def test_rotate_advances_and_wraps():
     c = RpcClient(["http://a", "http://b"], user_agent="ua", session=FakeSession([]), sleep=lambda _: None)
-    c.rotate(); assert c.current_url == "http://b"
-    c.rotate(); assert c.current_url == "http://a"
+    c.rotate()
+    assert c.current_url == "http://b"
+    c.rotate()
+    assert c.current_url == "http://a"
