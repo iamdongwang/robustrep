@@ -59,7 +59,11 @@ class Config:
     bootstrap_seed: int = 0
     ci_level: float = 0.95
     # data source
-    rpc_urls: tuple[str, ...] = ("https://mainnet.base.org",)
+    # Official endpoint first; publicnode backs it up. RpcClient rotates to the
+    # next URL on failure and then sticks to it, so when mainnet.base.org
+    # throttles a method (it answers every eth_getLogs with HTTP 429 since
+    # 2026-10-12) a run loses one failed attempt, not the whole sync.
+    rpc_urls: tuple[str, ...] = ("https://mainnet.base.org", "https://base-rpc.publicnode.com")
     chunk_blocks: int = 2000
     user_agent: str = "robustrep/0.1 (+https://github.com/iamdongwang/robustrep)"
     confirmations: int = DEFAULT_CONFIRMATIONS

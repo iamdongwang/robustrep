@@ -2,12 +2,19 @@
 the default test run (``pyproject.toml``'s ``addopts = "-m 'not live'"``);
 run explicitly with ``pytest -m live tests/e2e``.
 
-These run against free public RPC endpoints on a weekly cron, so "the endpoint
-was down, slow, or throttling us" is a routine, uninteresting outcome that must
-not page anyone: every network call is wrapped in ``rpc_available()``, which
-turns exactly those failures into a skip. What stays a *failure* is the thing
-these tests exist to detect -- live data that does not match what we recorded.
-Assertions are therefore deliberately kept *outside* the guarded blocks.
+These run against free public RPC endpoints on a weekly cron. Every network
+call is wrapped in ``rpc_available()``, which classifies "the endpoint was
+down, slow, or throttling us" and reports it as a *labelled* failure (``RPC
+unavailable: rate limited`` / ``transport failure: ...``) rather than letting
+the raw exception through. It is still a failure, on purpose: a run that
+cannot reach the chain has not checked anything, and the owner wants the
+email (decided 2026-10-12, when mainnet.base.org began refusing every
+``eth_getLogs`` and a skip would have hidden that for weeks). The label is
+the whole value: the email says at a glance whether to look at the endpoint
+list or at the data. A genuine data failure -- live data that does not match
+what we recorded, a malformed response -- propagates unchanged. Assertions
+are deliberately kept *outside* the guarded blocks so they can never be
+reclassified.
 """
 import json
 from contextlib import contextmanager
@@ -113,19 +120,21 @@ def rpc_unavailable_reason(exc: BaseException) -> Optional[str]:
 
 @contextmanager
 def rpc_available():
-    """Wrap live RPC calls: an unavailable/throttled endpoint becomes a skip,
-    anything else propagates unchanged.
+    """Wrap live RPC calls: an unavailable/throttled endpoint becomes a
+    *labelled* failure (``RPC unavailable: <our label>``, server text never
+    included), anything else propagates unchanged.
 
     Keep assertions *outside* this block -- a mismatch between live data and
-    the recorded fixture is precisely what these tests are for and must fail.
+    the recorded fixture is precisely what these tests are for and must fail
+    as itself, not as an availability problem.
     """
     try:
         yield
-    except Exception as exc:  # noqa: BLE001 -- re-raised unless classified skippable
+    except Exception as exc:  # noqa: BLE001 -- re-raised unless classified as availability
         reason = rpc_unavailable_reason(exc)
         if reason is None:
             raise
-        pytest.skip(f"RPC unavailable: {reason}")
+        pytest.fail(f"RPC unavailable: {reason}", pytrace=False)
 
 
 def check_failed_ranges(store: Store) -> None:
@@ -141,10 +150,11 @@ def check_failed_ranges(store: Store) -> None:
     * no recorded failures -> return, let the assertions run;
     * every recorded failure classifies as "endpoint unusable" (via
       ``rpc_unavailable_reason``, so the same markers and the same no-leak
-      rule apply) -> skip;
-    * any failure that does *not* classify -> fail naming the range, exactly
-      as the exception would have if it had propagated. A throttled sibling
-      range never hides a real one.
+      rule apply) -> fail with the ``RPC unavailable`` label, like
+      ``rpc_available()``;
+    * any failure that does *not* classify -> fail naming the range and its
+      recorded error, exactly as the exception would have if it had
+      propagated. A throttled sibling range never hides a real one.
     """
     rows = store.failed_ranges()
     if not rows:
@@ -156,7 +166,7 @@ def check_failed_ranges(store: Store) -> None:
         pytest.fail(f"sync_feedback recorded {len(real)} failed range(s) that are not an RPC-availability "
                     f"problem: {detail}")
     labels = ", ".join(sorted(set(reasons)))
-    pytest.skip(f"RPC unavailable: {len(rows)} range(s) failed to fetch ({labels})")
+    pytest.fail(f"RPC unavailable: {len(rows)} range(s) failed to fetch ({labels})", pytrace=False)
 
 
 @pytest.mark.live

@@ -199,3 +199,15 @@ def test_config_rejects_invalid_window_share_and_chunk_params():
         Config(sybil_flag_share=-0.1)
     with pytest.raises(ValueError):
         Config(sybil_flag_share=1.1)
+
+
+def test_default_rpc_urls_has_a_fallback_endpoint():
+    """mainnet.base.org started answering every ``eth_getLogs`` with HTTP 429
+    (2026-10-12), which would stall both the weekly live run and the monthly
+    fetch. ``RpcClient`` rotates to the next URL on failure and then sticks to
+    it, so a second public endpoint in the default list is enough: the official
+    endpoint stays first, publicnode (known to serve the same query and to
+    batch correctly) backs it up."""
+    from robustrep.config import Config
+
+    assert Config().rpc_urls == ("https://mainnet.base.org", "https://base-rpc.publicnode.com")

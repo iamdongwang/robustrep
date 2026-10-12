@@ -2,8 +2,10 @@
 ``rpc_unavailable_reason`` / ``rpc_available``).
 
 The guard decides whether a weekly live run reports "the public endpoint was
-down or throttling us" (skip) or "the chain data no longer matches what we
-recorded" (fail). Getting that backwards silently disables the drift detector,
+down or throttling us" (a *labelled* failure, ``RPC unavailable: ...``) or
+"the chain data no longer matches what we recorded" (the raw failure). Neither
+is ever a skip -- the owner wants the email. Getting the label wrong misdirects
+the reader of that email,
 so the classifier is pinned here -- offline, unmarked, part of every run.
 
 Two properties get the most attention, both of them ways the guard could go
@@ -11,7 +13,7 @@ quietly wrong:
 
 * markers must not fire on ordinary chain data -- a block number containing
   ``429`` is not a rate limit;
-* a skip reason must carry *our* label and nothing else -- never a fragment of
+* a failure label must carry *our* label and nothing else -- never a fragment of
   a server-supplied error message, which can echo a keyed request URL into a
   public CI log.
 
@@ -122,7 +124,7 @@ CANARY = "canary-9f3a-not-a-real-credential"
     RpcError(f"batch entry id=1: [-32016] over rate limit ({CANARY})"),
     _http_error(503),
 ])
-def test_skip_reason_never_carries_server_supplied_text(exc):
+def test_failure_label_never_carries_server_supplied_text(exc):
     """The reason is our own label only. An exception message is partly
     server-supplied and routinely echoes the full request URL, which may embed
     a provider API key -- none of it may reach a CI log through here."""
@@ -142,7 +144,7 @@ def test_skip_reason_never_carries_server_supplied_text(exc):
 ])
 def test_a_block_number_containing_429_is_not_a_rate_limit(message):
     """Regression: a bare ``"429"`` marker matched block numbers, quietly
-    converting real failures into skips."""
+    relabelling real failures as rate limits."""
     assert live.rpc_unavailable_reason(RpcError(message)) is None
 
 
@@ -164,14 +166,14 @@ def test_real_failures_are_not_skippable(exc):
 
 # --- the context manager ----------------------------------------------------
 
-def test_guard_skips_on_an_unavailable_endpoint():
-    with pytest.raises(pytest.skip.Exception, match="RPC unavailable: transport failure: ConnectionError"):
+def test_guard_fails_loudly_on_an_unavailable_endpoint():
+    with pytest.raises(pytest.fail.Exception, match="RPC unavailable: transport failure: ConnectionError"):
         with live.rpc_available():
             raise requests.ConnectionError("down")
 
 
-def test_guard_skips_on_a_throttled_endpoint():
-    with pytest.raises(pytest.skip.Exception, match="RPC unavailable: rate limited"):
+def test_guard_fails_loudly_on_a_throttled_endpoint():
+    with pytest.raises(pytest.fail.Exception, match="RPC unavailable: rate limited"):
         with live.rpc_available():
             raise RpcError("gave up after 5 attempts: HTTPError (HTTP 429) from https://mainnet.base.org")
 
@@ -206,11 +208,11 @@ def test_guard_passes_through_when_nothing_raises():
     "gave up after 5 attempts: [-32000] garbage rate limit",
     "gave up after 5 attempts: [-32000] connectionerror in your face",
 ])
-def test_server_text_after_a_json_rpc_code_cannot_force_a_skip(message):
+def test_server_text_after_a_json_rpc_code_cannot_force_an_availability_label(message):
     assert live.rpc_unavailable_reason(RpcError(message)) is None
 
 
-def test_batch_structure_error_never_skips_even_with_transport_words():
+def test_batch_structure_error_is_never_relabelled_even_with_transport_words():
     assert live.rpc_unavailable_reason(RpcBatchStructureError("batch entry id=1: missing result (timeout)")) is None
 
 
@@ -243,24 +245,24 @@ def _store_with_failures(tmp_path, errors):
 
 def test_check_failed_ranges_passes_through_when_nothing_failed(tmp_path):
     with Store(tmp_path / "t.db") as store:
-        live.check_failed_ranges(store)  # no exception, no skip
+        live.check_failed_ranges(store)  # no exception at all
 
 
-def test_check_failed_ranges_skips_when_every_failure_is_throttling(tmp_path):
+def test_check_failed_ranges_fails_labelled_when_every_failure_is_throttling(tmp_path):
     with _store_with_failures(tmp_path, [
         "gave up after 5 attempts: HTTPError (HTTP 429) from https://mainnet.base.org",
         "gave up after 5 attempts: HTTPError (HTTP 429) from https://mainnet.base.org",
     ]) as store:
-        with pytest.raises(pytest.skip.Exception, match="RPC unavailable: .*rate limited"):
+        with pytest.raises(pytest.fail.Exception, match="RPC unavailable: .*rate limited"):
             live.check_failed_ranges(store)
 
 
-def test_check_failed_ranges_skips_on_transport_failures_too(tmp_path):
+def test_check_failed_ranges_fails_labelled_on_transport_failures_too(tmp_path):
     with _store_with_failures(tmp_path, [
         "gave up after 5 attempts: ReadTimeout contacting https://mainnet.base.org",
         "gave up after 5 attempts: HTTPError (HTTP 503) from https://mainnet.base.org",
     ]) as store:
-        with pytest.raises(pytest.skip.Exception, match="RPC unavailable: .*transport failure"):
+        with pytest.raises(pytest.fail.Exception, match="RPC unavailable: .*transport failure"):
             live.check_failed_ranges(store)
 
 
@@ -281,10 +283,10 @@ def test_check_failed_ranges_does_not_let_throttled_siblings_hide_a_real_failure
             live.check_failed_ranges(store)
 
 
-def test_check_failed_ranges_skip_reason_carries_no_server_text(tmp_path):
+def test_check_failed_ranges_label_carries_no_server_text(tmp_path):
     with _store_with_failures(tmp_path, [
         f"gave up after 5 attempts: ReadTimeout contacting https://rpc.example/v2/{CANARY}",
     ]) as store:
-        with pytest.raises(pytest.skip.Exception) as info:
+        with pytest.raises(pytest.fail.Exception) as info:
             live.check_failed_ranges(store)
     assert CANARY not in str(info.value)

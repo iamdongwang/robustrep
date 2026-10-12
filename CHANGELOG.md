@@ -6,15 +6,35 @@ so a `0.x` bump may change published numbers without changing the API.
 
 ## [Unreleased]
 
+### Changed
+
+- **Default RPC list gains a fallback: `("https://mainnet.base.org",
+  "https://base-rpc.publicnode.com")`.** On 2026-10-12 mainnet.base.org began
+  answering every `eth_getLogs` with HTTP 429 (`-32011 request limit reached`),
+  even for a 100-block window on a first request, which stalled the weekly
+  live run and would have stalled the monthly `fetch`. `RpcClient` already
+  rotates to the next URL on failure and sticks to it, so a second public
+  endpoint is all a run needs: one failed attempt, then everything goes to
+  publicnode. `--rpc-url` still overrides the whole list. Report provenance
+  records `rpc_urls`, so reports produced from here on show both endpoints.
+- **Live suite: an unusable endpoint is a labelled failure, never a skip.**
+  `rpc_available()` and the new `check_failed_ranges()` now report
+  `RPC unavailable: rate limited` / `transport failure: ...` with `pytest.fail`
+  instead of `pytest.skip`. A run that cannot reach the chain has checked
+  nothing, and a skip would have hidden the mainnet.base.org change for weeks;
+  the owner prefers the email. The label (never server-supplied text) says
+  whether to look at the endpoint list or at the data. Genuine data failures
+  propagate unchanged, as before.
+
 ### Fixed
 
-- **Live suite: a throttled `eth_getLogs` is a skip, not a failure.**
+- **Live suite saw a throttled `eth_getLogs` as a bare checkpoint failure.**
   `sync_feedback` records a chunk whose fetch failed in `failed_ranges` and
-  carries on rather than raising, so the live test's availability guard never
-  saw the HTTP 429 and the checkpoint assertion failed instead (weekly run of
+  carries on rather than raising, so the availability guard never saw the 429
+  and the test failed on `last_block` with no hint why (weekly run of
   2026-10-12). The test now reads the recorded errors through the new
-  read-only `Store.failed_ranges()` and applies the same classifier: all
-  throttling/transport -> skip, anything else -> fail naming the range.
+  read-only `Store.failed_ranges()` and classifies them with the same
+  markers; a throttled sibling range can never hide a real one.
 
 ## [0.1.2] — 2026-10-03
 
