@@ -25,8 +25,8 @@ what. Scoring is unchanged.
   window (default 50 blocks), rotates past dead endpoints, and bounds invalid
   rounds so it always terminates. `LogFetcher.from_config(rpc, cfg)` is the
   construction path shared by the CLI and the live tests.
-- **`sync_log` table and `Store.sync_sources()`.** One row per synced chunk
-  (`from_block, to_block, host, window, n_logs, fetched_at`), written by
+- **`sync_log` table and `Store.sync_sources()`.** One row per synced
+  sub-window of a chunk (`from_block, to_block, host, window, n_logs, fetched_at`), written by
   delete-intersecting-then-insert so reruns are idempotent;
   `sync_sources()` aggregates per host.
 - **`rpc_sources` report provenance** (last in `PROVENANCE_KEYS`). `report.md`
