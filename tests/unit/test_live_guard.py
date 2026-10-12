@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 import requests
 
-from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcError
+from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcError, RpcRangeTooLargeError
 from robustrep.store import Store
 
 
@@ -103,6 +103,16 @@ def test_rpc_errors_naming_throttling_are_skippable(message):
 ])
 def test_rpc_errors_naming_transport_failures_are_skippable(message, label):
     assert live.rpc_unavailable_reason(RpcError(message)) == f"transport failure: {label}"
+
+
+def test_no_usable_endpoint_is_an_availability_failure():
+    exc = RpcError("no usable endpoint: 4 of 4 endpoints rejected the minimum window")
+    assert live.rpc_unavailable_reason(exc) == "transport failure: no usable endpoint"
+
+
+def test_range_too_large_leaking_to_tests_is_a_real_failure():
+    # LogFetcher must absorb this; if it reaches a test it is a bug, not an outage.
+    assert live.rpc_unavailable_reason(RpcRangeTooLargeError("https://h", (50,))) is None
 
 
 def test_rate_limited_batch_subclass_is_skippable():

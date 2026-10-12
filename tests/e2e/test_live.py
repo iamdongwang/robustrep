@@ -26,6 +26,7 @@ import requests
 
 from robustrep.config import Config
 from robustrep.sources import base_erc8004 as base
+from robustrep.sources.log_fetcher import LogFetcher
 from robustrep.sources.rpc import RpcBatchStructureError, RpcClient, RpcError
 from robustrep.store import Store
 
@@ -55,6 +56,8 @@ TRANSPORT_MARKERS = (
     "connectionerror", "connecttimeout", "readtimeout", "timeout", "sslerror",
     "chunkedencodingerror", "toomanyredirects",
     "http 500", "http 502", "http 503", "http 504",
+    # LogFetcher's own give-up error: every endpoint refused even the minimum window.
+    "no usable endpoint",
 )
 
 # HTTP statuses that mean "try again later" rather than "the data is wrong".
@@ -176,9 +179,12 @@ def test_live_recent_blocks(tmp_path):
     with Store(tmp_path / "live.db") as store:
         with rpc_available():
             head = int(rpc.call("eth_blockNumber", []), 16)
-            base.sync_feedback(store, rpc, chunk=2000, start_block=head - 3999, end_block=head)
+            fetcher = LogFetcher.from_config(rpc, cfg)
+            base.sync_feedback(store, rpc, chunk=2000, start_block=head - 3999, end_block=head,
+                               fetcher=fetcher)
         check_failed_ranges(store)
         assert store.get_sync("last_block") == str(head)
+        assert store.sync_sources().sources
         with rpc_available():
             base.fill_block_timestamps(store, rpc)
         assert store.missing_block_ts() == []
@@ -200,18 +206,15 @@ def test_live_fixture_window_matches_recorded_fixture():
     themselves be evidence of exactly the kind of drift this test is meant to
     catch.
 
-    Only the ``eth_getLogs`` call is guarded by ``rpc_available()``: an
+    Only the ``LogFetcher.get_logs`` call (the same adaptive path the CLI uses) is guarded by ``rpc_available()``: an
     unreachable or throttling endpoint tells us nothing, but every comparison
     below runs unguarded so drift fails loudly.
     """
     cfg = Config()
     rpc = RpcClient(cfg.rpc_urls, user_agent=cfg.user_agent)
     with rpc_available():
-        logs = rpc.call("eth_getLogs", [{
-            "fromBlock": hex(FIX["from_block"]), "toBlock": hex(FIX["to_block"]),
-            "address": base.REPUTATION_REGISTRY,
-            "topics": [[base.TOPIC_NEW_FEEDBACK, base.TOPIC_REVOKED, base.TOPIC_RESPONSE]],
-        }])
+        logs = LogFetcher.from_config(rpc, cfg).get_logs(
+            FIX["from_block"], FIX["to_block"], base.LOG_FILTER).logs
 
     def feedback_keys(raw_logs):
         decoded = [base.decode_log(l) for l in raw_logs]
