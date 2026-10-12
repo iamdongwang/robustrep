@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robustrep"
-version = "0.1.2"
+version = "0.2.0"
 description = "Robust, transport-agnostic reputation scoring for AI agents"
 readme = "README.md"
 license = { text = "Apache-2.0" }

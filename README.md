@@ -29,6 +29,9 @@ result = score(records, Config())
     robustrep score  --db data/base.db --out scores.csv
     robustrep report --db data/base.db --out-dir reports
 
+The default endpoint list is rotated automatically and the `eth_getLogs` window adapts per
+endpoint; `--rpc-url` (repeatable) replaces the list and `--chunk` caps the window.
+
 Rater profiles: Blockscout (free, no key) by default; Etherscan V2 requires a paid plan for Base.
 Pick a source explicitly with `fetch --profile-source {auto,blockscout,etherscan,none}`.
 

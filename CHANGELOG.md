@@ -4,27 +4,66 @@ All notable changes to robustrep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0,
 so a `0.x` bump may change published numbers without changing the API.
 
-## [Unreleased]
+## [0.2.0] — 2026-10-12
+
+Adaptive `eth_getLogs` fetching. On 2026-10-12 mainnet.base.org began answering
+every `eth_getLogs` with HTTP 429 (`-32011 request limit reached`), even for a
+100-block window on a first request. The remaining free endpoints each cap the
+window differently (publicnode serves roughly the last 5,000 blocks, nodies
+50 blocks per call but deep history, drpc about 100), so fixed 2,000-block
+chunks could not back-fill the roughly 1.2M blocks since the last report. `fetch`
+now learns each endpoint's window at runtime and records which host served
+what. Scoring is unchanged.
+
+### Added
+
+- **`LogFetcher` (`robustrep/sources/log_fetcher.py`).** Sits between
+  `sync_feedback` and `RpcClient`: given a block range it returns all logs or
+  raises `RpcError`. It learns each endpoint's window cap (shrinks by at least
+  half on a range-too-large error, in one step to the cap when the server
+  names one), marks an endpoint dead for the run when it rejects the minimum
+  window (default 50 blocks), rotates past dead endpoints, and bounds invalid
+  rounds so it always terminates. `LogFetcher.from_config(rpc, cfg)` is the
+  construction path shared by the CLI and the live tests.
+- **`sync_log` table and `Store.sync_sources()`.** One row per synced chunk
+  (`from_block, to_block, host, window, n_logs, fetched_at`), written by
+  delete-intersecting-then-insert so reruns are idempotent;
+  `sync_sources()` aggregates per host.
+- **`rpc_sources` report provenance** (last in `PROVENANCE_KEYS`). `report.md`
+  gets a `Log sources:` line and a `Source recording starts at block ...`
+  line under Provenance (`Log sources: not recorded ...` for data fetched
+  before this version), and an always-present Limitations bullet, `Log sources
+  not cross-checked.`
+- **`Config` fields:** `rpc_window_hints` (tuple of `(host, cap)` pairs,
+  default empty), `rpc_min_window` (50) and `rpc_min_interval` (0.2 s between
+  call starts; the library default for `RpcClient` pacing stays 0).
+- **`RpcRangeTooLargeError(endpoint, numbers)`**, raised immediately (no
+  rotation or backoff) on provider range-cap errors. Its message is fixed
+  text; only parsed integers leave the module. `RpcClient` also gains
+  `current_url` and `rotate()`.
+- **`Store.failed_ranges()`**, a read-only view of the recorded failed
+  ranges, used by the live suite.
 
 ### Changed
 
-- **Default RPC list gains a fallback: `("https://mainnet.base.org",
-  "https://base-rpc.publicnode.com")`.** On 2026-10-12 mainnet.base.org began
-  answering every `eth_getLogs` with HTTP 429 (`-32011 request limit reached`),
-  even for a 100-block window on a first request, which stalled the weekly
-  live run and would have stalled the monthly `fetch`. `RpcClient` already
-  rotates to the next URL on failure and sticks to it, so a second public
-  endpoint is all a run needs: one failed attempt, then everything goes to
-  publicnode. `--rpc-url` still overrides the whole list. Report provenance
-  records `rpc_urls`, so reports produced from here on show both endpoints.
+- **Default `rpc_urls` is now four endpoints, in rotation order:**
+  `https://mainnet.base.org`, `https://base-rpc.publicnode.com`,
+  `https://base-pokt.nodies.app`, `https://base.drpc.org`. `--rpc-url`
+  (repeatable) still replaces the whole list. Report provenance records
+  `rpc_urls`, so reports produced from here on show them.
+- **`sync_feedback(..., fetcher=None)`.** With a fetcher it records
+  `sync_log`; without one it behaves as before and records no sources. The
+  CLI always passes one.
 - **Live suite: an unusable endpoint is a labelled failure, never a skip.**
-  `rpc_available()` and the new `check_failed_ranges()` now report
+  `rpc_available()` and the new `check_failed_ranges()` report
   `RPC unavailable: rate limited` / `transport failure: ...` with `pytest.fail`
   instead of `pytest.skip`. A run that cannot reach the chain has checked
   nothing, and a skip would have hidden the mainnet.base.org change for weeks;
   the owner prefers the email. The label (never server-supplied text) says
   whether to look at the endpoint list or at the data. Genuine data failures
-  propagate unchanged, as before.
+  propagate unchanged. Both live tests now go through `LogFetcher.from_config`.
+- **`--chunk` smaller than the minimum window still works**; it caps the
+  window and is not raised to 50.
 
 ### Fixed
 
@@ -32,9 +71,14 @@ so a `0.x` bump may change published numbers without changing the API.
   `sync_feedback` records a chunk whose fetch failed in `failed_ranges` and
   carries on rather than raising, so the availability guard never saw the 429
   and the test failed on `last_block` with no hint why (weekly run of
-  2026-10-12). The test now reads the recorded errors through the new
-  read-only `Store.failed_ranges()` and classifies them with the same
-  markers; a throttled sibling range can never hide a real one.
+  2026-10-12). The test now reads the recorded errors through
+  `Store.failed_ranges()` and classifies them with the same markers; a
+  throttled sibling range can never hide a real one.
+
+### Rollback
+
+To reproduce 0.1.2 behaviour (no source recording, no automatic rotation):
+`robustrep fetch --db data/base.db --chunk 50 --rpc-url https://base-pokt.nodies.app`
 
 ## [0.1.2] — 2026-10-03
 
@@ -159,6 +203,7 @@ no longer rescales a group by its own extremes.
 Initial release on PyPI: the scoring library, the Base ERC-8004 adapter, and the
 reproducible report.
 
+[0.2.0]: https://github.com/iamdongwang/robustrep/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/iamdongwang/robustrep/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/iamdongwang/robustrep/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/iamdongwang/robustrep/releases/tag/v0.1.0
