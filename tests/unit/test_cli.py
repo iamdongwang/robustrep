@@ -9,6 +9,7 @@ from robustrep import cli
 from robustrep.cli import app
 from robustrep.report import publish
 from robustrep.schema import RESULT_COLUMNS
+from robustrep.sources.log_fetcher import LogFetcher
 from robustrep.sources.rpc import RpcError
 from robustrep.store import Store
 
@@ -475,7 +476,8 @@ def test_fetch_rpc_url_and_confirmations_reach_config(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "RpcClient", _CapturingRpc)
 
-    def _capture_sync(store, rpc, chunk=None, end_block=None, confirmations=None):
+    def _capture_sync(store, rpc, chunk=None, end_block=None, confirmations=None, **kwargs):
+        seen["fetcher"] = kwargs.get("fetcher")
         seen["confirmations"] = confirmations
         seen["chunk"] = chunk
         seen["end_block"] = end_block
@@ -492,6 +494,7 @@ def test_fetch_rpc_url_and_confirmations_reach_config(tmp_path, monkeypatch):
     assert r.exit_code == 0, r.output
     assert seen["urls"] == ["https://a.example", "https://b.example"]
     assert seen["confirmations"] == 5
+    assert isinstance(seen["fetcher"], LogFetcher) and seen["fetcher"].min_interval == 0.2
 
 
 def test_fetch_to_block_and_chunk_reach_sync_feedback(tmp_path, monkeypatch):
@@ -501,7 +504,8 @@ def test_fetch_to_block_and_chunk_reach_sync_feedback(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
 
-    def _capture_sync(store, rpc, chunk=None, end_block=None, confirmations=None):
+    def _capture_sync(store, rpc, chunk=None, end_block=None, confirmations=None, **kwargs):
+        seen["fetcher"] = kwargs.get("fetcher")
         seen["chunk"] = chunk
         seen["end_block"] = end_block
         return 0
@@ -516,6 +520,28 @@ def test_fetch_to_block_and_chunk_reach_sync_feedback(tmp_path, monkeypatch):
     assert r.exit_code == 0, r.output
     assert seen["end_block"] == 123
     assert seen["chunk"] == 500
+
+
+def test_fetch_chunk_below_min_window_still_runs(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    seen = {}
+
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+
+    def _capture_sync(store, rpc, chunk=None, end_block=None, confirmations=None, **kwargs):
+        seen["fetcher"] = kwargs.get("fetcher")
+        return 0
+
+    monkeypatch.setattr(cli.base, "sync_feedback", _capture_sync)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--chunk", "20"])
+    assert r.exit_code == 0, r.output
+    assert seen["fetcher"].min_window == 20 and seen["fetcher"].max_window == 20
 
 
 def test_fetch_warns_when_block_timestamps_still_missing(tmp_path, monkeypatch):

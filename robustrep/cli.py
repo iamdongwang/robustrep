@@ -37,6 +37,7 @@ from .report.publish import (EVIDENCE_CAP_PER_URI_KEY, EVIDENCE_CAP_TOTAL_KEY, b
 from .report.sensitivity import sensitivity_table
 from .sources import base_erc8004 as base
 from .sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS, classify_all
+from .sources.log_fetcher import LogFetcher
 from .sources.rater_profile import DEFAULT_RPS, default_client, enrich_raters, estimate_seconds
 from .sources.rpc import RpcClient, RpcError
 from .store import Store
@@ -125,7 +126,8 @@ def _rpc_guard():
 
 def _step_sync(store: Store, rpc: RpcClient, cfg: Config, to_block: Optional[int]) -> str:
     """Sync feedback/revocation/response events up to ``to_block`` (or head)."""
-    n = base.sync_feedback(store, rpc, chunk=cfg.chunk_blocks, end_block=to_block, confirmations=cfg.confirmations)
+    n = base.sync_feedback(store, rpc, chunk=cfg.chunk_blocks, end_block=to_block,
+                           confirmations=cfg.confirmations, fetcher=LogFetcher.from_config(rpc, cfg))
     return f"feedback rows added: {n}"
 
 
