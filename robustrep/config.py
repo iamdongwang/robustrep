@@ -74,7 +74,7 @@ class Config:
     rpc_min_window: int = 50
     rpc_min_interval: float = 0.2
     chunk_blocks: int = 2000
-    user_agent: str = "robustrep/0.1 (+https://github.com/iamdongwang/robustrep)"
+    user_agent: str = "robustrep/0.2 (+https://github.com/iamdongwang/robustrep)"
     confirmations: int = DEFAULT_CONFIRMATIONS
 
     def __post_init__(self) -> None:
