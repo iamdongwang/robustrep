@@ -31,6 +31,7 @@ result = score(records, Config())
 
 The default endpoint list is rotated automatically and the `eth_getLogs` window adapts per
 endpoint; `--rpc-url` (repeatable) replaces the list and `--chunk` caps the window.
+RPC endpoint hostnames appear in the public report and `scores.json`; do not use an endpoint whose hostname embeds an account id or key.
 
 Rater profiles: Blockscout (free, no key) by default; Etherscan V2 requires a paid plan for Base.
 Pick a source explicitly with `fetch --profile-source {auto,blockscout,etherscan,none}`.

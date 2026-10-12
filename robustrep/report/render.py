@@ -254,7 +254,7 @@ def _log_source_lines(config: dict) -> list[str]:
     ]
     return [
         "- Log sources: " + "; ".join(parts),
-        f"- Source recording starts at block {rpc['recorded_from_block']:,}; blocks before it "
+        f"- Source recording starts at block {rpc['recorded_from_block']:,}; any blocks before it "
         "were fetched before source recording existed.",
     ]
 

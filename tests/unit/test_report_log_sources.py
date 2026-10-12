@@ -74,7 +74,7 @@ def test_render_log_sources_listed(records_factory):
     assert ("- Log sources: base-pokt.nodies.app (blocks 51,322,404\u201352,507,435, "
             "23,703 ranges, 1,185,032 blocks, 9,870 logs); mainnet.base.org (blocks "
             "52,507,436\u201352,510,000, 3 ranges, 2,565 blocks, 12 logs)") in md
-    assert ("- Source recording starts at block 51,322,404; blocks before it were fetched "
+    assert ("- Source recording starts at block 51,322,404; any blocks before it were fetched "
             "before source recording existed.") in md
     assert "Log sources not cross-checked" in md
     assert "not recorded (fetched before" not in md

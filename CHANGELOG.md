@@ -33,10 +33,13 @@ what. Scoring is unchanged.
   gets a `Log sources:` line and a `Source recording starts at block ...`
   line under Provenance (`Log sources: not recorded ...` for data fetched
   before this version), and an always-present Limitations bullet, `Log sources
-  not cross-checked.`
+  not cross-checked.` RPC endpoint hostnames appear in the public report and
+  `scores.json`; do not use an endpoint whose hostname embeds an account id or
+  key.
 - **`Config` fields:** `rpc_window_hints` (tuple of `(host, cap)` pairs,
   default empty), `rpc_min_window` (50) and `rpc_min_interval` (0.2 s between
-  call starts; the library default for `RpcClient` pacing stays 0).
+  call starts; this is the CLI default). The library default (`LogFetcher`'s
+  `min_interval`) is 0; `RpcClient` has no pacing.
 - **`RpcRangeTooLargeError(endpoint, numbers)`**, raised immediately (no
   rotation or backoff) on provider range-cap errors. Its message is fixed
   text; only parsed integers leave the module. `RpcClient` also gains
@@ -49,8 +52,9 @@ what. Scoring is unchanged.
 - **Default `rpc_urls` is now four endpoints, in rotation order:**
   `https://mainnet.base.org`, `https://base-rpc.publicnode.com`,
   `https://base-pokt.nodies.app`, `https://base.drpc.org`. `--rpc-url`
-  (repeatable) still replaces the whole list. Report provenance records
-  `rpc_urls`, so reports produced from here on show them.
+  (repeatable) still replaces the whole list. Report provenance does not
+  record this list; it records `rpc_sources`, the hosts that actually served
+  each block range.
 - **`sync_feedback(..., fetcher=None)`.** With a fetcher it records
   `sync_log`; without one it behaves as before and records no sources. The
   CLI always passes one.
@@ -77,8 +81,11 @@ what. Scoring is unchanged.
 
 ### Rollback
 
-To reproduce 0.1.2 behaviour (no source recording, no automatic rotation):
-`robustrep fetch --db data/base.db --chunk 50 --rpc-url https://base-pokt.nodies.app`
+To go back to 0.1.2 (no source recording, no automatic rotation), install the
+old release first: `pip install 'robustrep==0.1.2'`, then
+`robustrep fetch --db data/base.db --chunk 50 --rpc-url https://base-pokt.nodies.app`;
+the database is compatible in both directions (0.1.2 ignores `sync_log`;
+blocks fetched under 0.1.2 have no source rows).
 
 ## [0.1.2] — 2026-10-03
 
