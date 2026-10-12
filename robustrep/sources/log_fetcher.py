@@ -99,10 +99,11 @@ class LogFetcher:
     @classmethod
     def from_config(cls, rpc: RpcClient, cfg: "Config") -> "LogFetcher":
         """Build from a ``Config``; ``min_window`` is clamped to ``chunk_blocks``
-        so a small ``--chunk`` never makes ``min_window > max_window``."""
-        return cls(rpc, max_window=cfg.chunk_blocks,
-                   min_window=min(cfg.rpc_min_window, cfg.chunk_blocks),
-                   window_hints=dict(cfg.rpc_window_hints),
+        and every hint into ``[min_window, chunk_blocks]``, so a small
+        ``--chunk`` never makes ``min_window > max_window`` or a hint invalid."""
+        lo, hi = min(cfg.rpc_min_window, cfg.chunk_blocks), cfg.chunk_blocks
+        hints = {host: max(lo, min(w, hi)) for host, w in cfg.rpc_window_hints}
+        return cls(rpc, max_window=hi, min_window=lo, window_hints=hints,
                    min_interval=cfg.rpc_min_interval)
 
     def get_logs(self, from_block: int, to_block: int, filter: dict) -> FetchResult:
@@ -126,7 +127,7 @@ class LogFetcher:
                 if self._on_range_too_large(e, w):
                     invalid_rounds += 1
                 if invalid_rounds > len(self.rpc.urls):
-                    raise self._no_usable_endpoint()
+                    raise self._gave_up_after_invalid_rounds(invalid_rounds)
                 continue
             logs.extend(sub_logs)
             served.append(Served(cursor, sub_to, _endpoint(self.rpc.current_url), window, len(sub_logs)))
@@ -165,13 +166,27 @@ class LogFetcher:
         return host
 
     def _no_usable_endpoint(self) -> RpcError:
-        return RpcError(f"no usable endpoint: {len(self.dead)} of {len(self.rpc.urls)} "
-                        "endpoints rejected the minimum window")
+        return RpcError(f"no usable endpoint: all {len(self.rpc.urls)} endpoints "
+                        "rejected the minimum window")
+
+    def _gave_up_after_invalid_rounds(self, rounds: int) -> RpcError:
+        return RpcError(f"no usable endpoint: gave up after {rounds} invalid rounds "
+                        f"({len(self.rpc.urls)} endpoints, {len(self.dead)} dead)")
 
     def _call_get_logs(self, a: int, z: int, filter: dict) -> list[dict]:
+        """One ``eth_getLogs`` call. A non-range ``RpcError`` rotates the client
+        before propagating: a non-retryable answer is raised by ``RpcClient``
+        without rotating, and would otherwise pin every later call of the run
+        on the endpoint that gave it."""
         self._pace()
         self._last_start = self._clock()
-        result = self.rpc.call("eth_getLogs", [{"fromBlock": hex(a), "toBlock": hex(z), **filter}])
+        try:
+            result = self.rpc.call("eth_getLogs", [{"fromBlock": hex(a), "toBlock": hex(z), **filter}])
+        except RpcRangeTooLargeError:
+            raise
+        except RpcError:
+            self.rpc.rotate()
+            raise
         if not isinstance(result, list):
             raise RpcError(f"eth_getLogs returned a non-list result from {_endpoint(self.rpc.current_url)}")
         return result

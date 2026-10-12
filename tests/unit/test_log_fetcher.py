@@ -280,3 +280,58 @@ def test_from_config_clamps_min_window_to_chunk():
     assert LogFetcher.from_config(rpc, Config(chunk_blocks=20)).min_window == 20
     f = LogFetcher.from_config(rpc, Config())
     assert (f.max_window, f.min_window, f.min_interval) == (2000, 50, 0.2)
+
+
+def test_non_retryable_error_rotates_so_the_next_call_starts_on_another_host():
+    state = {"n": 0}
+
+    def flaky_a(p):
+        state["n"] += 1
+        return {"error": {"code": -32602, "message": "invalid params"}} if state["n"] == 1 else {"result": []}
+    s = RoutingSession({"https://a": flaky_a, "https://b": lambda p: {"result": []}})
+    f = LogFetcher(make_client(["https://a", "https://b"], s), max_window=50, min_window=50)
+    with pytest.raises(RpcError, match="non-retryable"):
+        f.get_logs(0, 49, FILTER)
+    n_before = len(s.calls)
+    res = f.get_logs(50, 99, FILTER)
+    assert s.calls[n_before][0] == "https://b"
+    assert [x.host for x in res.served] == ["https://b"]
+
+
+def test_non_retryable_error_rotate_is_harmless_with_a_single_url():
+    state = {"n": 0}
+
+    def flaky_a(p):
+        state["n"] += 1
+        return {"error": {"code": -32602, "message": "invalid params"}} if state["n"] == 1 else {"result": []}
+    s = RoutingSession({"https://a": flaky_a})
+    f = LogFetcher(make_client(["https://a"], s), max_window=50, min_window=50)
+    with pytest.raises(RpcError):
+        f.get_logs(0, 49, FILTER)
+    assert [x.host for x in f.get_logs(50, 99, FILTER).served] == ["https://a"]
+
+
+def test_all_dead_message_names_every_endpoint():
+    s = RoutingSession({"https://a": _capped(10), "https://b": _capped(10)})
+    f = LogFetcher(make_client(["https://a", "https://b"], s), max_window=2000, min_window=50)
+    with pytest.raises(RpcError, match=r"^no usable endpoint: all 2 endpoints rejected the minimum window$"):
+        f.get_logs(0, 99, FILTER)
+
+
+def test_invalid_round_bound_message_says_how_many_rounds_and_dead():
+    def down(p): raise requests.ConnectionError()
+    s = RoutingSession({"https://d": down, "https://n": _capped(10)})
+    f = LogFetcher(make_client(["https://d", "https://n"], s), max_window=2000, min_window=50)
+    with pytest.raises(RpcError, match=r"^no usable endpoint: gave up after 3 invalid rounds "
+                                       r"\(2 endpoints, 1 dead\)$"):
+        f.get_logs(0, 49, FILTER)
+
+
+def test_from_config_clamps_hints_into_the_window_bounds():
+    from robustrep.config import Config
+
+    rpc = make_client(["https://a"], RoutingSession({}))
+    f = LogFetcher.from_config(rpc, Config(chunk_blocks=20, rpc_window_hints=(("https://h", 100),)))
+    assert f.windows == {"https://h": 20}
+    f = LogFetcher.from_config(rpc, Config(rpc_window_hints=(("https://h", 10), ("https://g", 9999))))
+    assert f.windows == {"https://h": 50, "https://g": 2000}
