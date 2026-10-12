@@ -59,11 +59,20 @@ class Config:
     bootstrap_seed: int = 0
     ci_level: float = 0.95
     # data source
-    # Official endpoint first; publicnode backs it up. RpcClient rotates to the
-    # next URL on failure and then sticks to it, so when mainnet.base.org
-    # throttles a method (it answers every eth_getLogs with HTTP 429 since
-    # 2026-10-12) a run loses one failed attempt, not the whole sync.
-    rpc_urls: tuple[str, ...] = ("https://mainnet.base.org", "https://base-rpc.publicnode.com")
+    # Measured 2026-10-12: mainnet.base.org answers every eth_getLogs with 429;
+    # publicnode serves only ~the last 5000 blocks; nodies caps at 50 blocks per
+    # call but serves deep history; drpc caps at ~100. RpcClient rotates on
+    # failure and sticks, LogFetcher learns each host's window.
+    rpc_urls: tuple[str, ...] = (
+        "https://mainnet.base.org",
+        "https://base-rpc.publicnode.com",
+        "https://base.api.nodies.app",
+        "https://base.drpc.org",
+    )
+    # (scheme://hostname, max block window) pairs; a tuple so Config stays hashable.
+    rpc_window_hints: tuple[tuple[str, int], ...] = ()
+    rpc_min_window: int = 50
+    rpc_min_interval: float = 0.2
     chunk_blocks: int = 2000
     user_agent: str = "robustrep/0.1 (+https://github.com/iamdongwang/robustrep)"
     confirmations: int = DEFAULT_CONFIRMATIONS
@@ -94,5 +103,11 @@ class Config:
             raise ValueError("chunk_blocks must be >= 1")
         if len(self.rpc_urls) < 1:
             raise ValueError("rpc_urls must have at least 1 entry")
+        if any(w < 1 for _, w in self.rpc_window_hints):
+            raise ValueError("rpc_window_hints values must be >= 1")
+        if self.rpc_min_window < 1:
+            raise ValueError("rpc_min_window must be >= 1")
+        if self.rpc_min_interval < 0:
+            raise ValueError("rpc_min_interval must be >= 0")
         if self.confirmations < 0:
             raise ValueError("confirmations must be >= 0")

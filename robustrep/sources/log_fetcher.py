@@ -14,9 +14,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping, NamedTuple, Optional
 
 from .rpc import RpcClient, RpcError, RpcRangeTooLargeError, _endpoint
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,15 @@ class LogFetcher:
         self.dead: set[str] = set()
         self._sleep, self._clock = sleep, clock
         self._last_start: Optional[float] = None
+
+    @classmethod
+    def from_config(cls, rpc: RpcClient, cfg: "Config") -> "LogFetcher":
+        """Build from a ``Config``; ``min_window`` is clamped to ``chunk_blocks``
+        so a small ``--chunk`` never makes ``min_window > max_window``."""
+        return cls(rpc, max_window=cfg.chunk_blocks,
+                   min_window=min(cfg.rpc_min_window, cfg.chunk_blocks),
+                   window_hints=dict(cfg.rpc_window_hints),
+                   min_interval=cfg.rpc_min_interval)
 
     def get_logs(self, from_block: int, to_block: int, filter: dict) -> FetchResult:
         """Return every log in ``[from_block, to_block]`` (inclusive) matching

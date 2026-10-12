@@ -201,13 +201,29 @@ def test_config_rejects_invalid_window_share_and_chunk_params():
         Config(sybil_flag_share=1.1)
 
 
-def test_default_rpc_urls_has_a_fallback_endpoint():
-    """mainnet.base.org started answering every ``eth_getLogs`` with HTTP 429
-    (2026-10-12), which would stall both the weekly live run and the monthly
-    fetch. ``RpcClient`` rotates to the next URL on failure and then sticks to
-    it, so a second public endpoint in the default list is enough: the official
-    endpoint stays first, publicnode (known to serve the same query and to
-    batch correctly) backs it up."""
+def test_default_rpc_urls_lists_four_public_endpoints_in_rotation_order():
+    """Measured 2026-10-12: mainnet.base.org answers every ``eth_getLogs`` with
+    429; publicnode serves only about the last 5000 blocks; nodies caps at 50
+    blocks but serves deep history; drpc caps at about 100. ``RpcClient``
+    rotates on failure and sticks; ``LogFetcher`` learns each host's window."""
     from robustrep.config import Config
 
-    assert Config().rpc_urls == ("https://mainnet.base.org", "https://base-rpc.publicnode.com")
+    assert Config().rpc_urls == (
+        "https://mainnet.base.org",
+        "https://base-rpc.publicnode.com",
+        "https://base.api.nodies.app",
+        "https://base.drpc.org",
+    )
+
+
+def test_rpc_window_hints_and_limits_validate():
+    from robustrep.config import Config
+
+    with pytest.raises(ValueError):
+        Config(rpc_min_window=0)
+    with pytest.raises(ValueError):
+        Config(rpc_min_interval=-0.1)
+    with pytest.raises(ValueError):
+        Config(rpc_window_hints=(("https://x", 0),))
+    assert Config(rpc_window_hints=(("https://x", 50),)).rpc_window_hints == (("https://x", 50),)
+    hash(Config())

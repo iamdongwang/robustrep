@@ -252,3 +252,12 @@ def test_non_list_result_raises_rpcerror():
         with pytest.raises(RpcError, match="non-list"):
             res = f.get_logs(0, 99, FILTER)
         assert res is None
+
+
+def test_from_config_clamps_min_window_to_chunk():
+    from robustrep.config import Config
+
+    rpc = make_client(["https://a"], RoutingSession({}))
+    assert LogFetcher.from_config(rpc, Config(chunk_blocks=20)).min_window == 20
+    f = LogFetcher.from_config(rpc, Config())
+    assert (f.max_window, f.min_window, f.min_interval) == (2000, 50, 0.2)
