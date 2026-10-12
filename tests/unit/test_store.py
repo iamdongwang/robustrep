@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pytest
 
-from robustrep.store import Store
+from robustrep.store import Store, SyncSources
 
 FB = dict(chain="base", block=100, tx_hash="0xt", log_index=0, agent_id="7", client="0xc",
           feedback_index=1, value="87", value_decimals=0, tag1="quality", tag2="", endpoint="",
@@ -446,3 +446,35 @@ def test_n_lookup_budget_starved_counts_the_legacy_bare_note(tmp_path):
         s.upsert_evidence("https://c", 3, "")
         s.upsert_evidence("https://d", 1, "unfetchable")
         assert s.n_lookup_budget_starved() == 2
+
+
+def test_add_sync_log_is_transactional_and_idempotent_per_range(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        rows = [(0, 49, "https://n", 50, 2), (50, 99, "https://n", 50, 0)]
+        s.add_sync_log(0, 99, rows, now=1000)
+        s.add_sync_log(0, 99, [(0, 99, "https://p", 100, 2)], now=2000)   # rerun, different split
+        got = s.conn.execute("select from_block,to_block,host,window,n_logs,fetched_at from sync_log order by 1").fetchall()
+        assert got == [(0, 99, "https://p", 100, 2, 2000)]
+
+
+def test_add_sync_log_defaults_now_to_wall_clock(tmp_path, monkeypatch):
+    monkeypatch.setattr("robustrep.store.time.time", lambda: 1234.9)
+    with Store(tmp_path / "t.db") as s:
+        s.add_sync_log(0, 9, [(0, 9, "https://n", 10, 0)])
+        assert s.conn.execute("select fetched_at from sync_log").fetchone()[0] == 1234
+
+
+def test_sync_sources_aggregates_per_host_with_exact_block_counts(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.add_sync_log(0, 199, [(0, 99, "https://p", 100, 3), (100, 199, "https://n", 50, 1)], now=10)
+        s.add_sync_log(200, 299, [(200, 299, "https://p", 100, 0)], now=20)
+        src = s.sync_sources()
+        assert src.recorded_from_block == 0
+        assert [(x.host, x.blocks_min, x.blocks_max, x.n_ranges, x.n_blocks, x.n_logs, x.first_fetched_at, x.last_fetched_at)
+                for x in src.sources] == [("https://n", 100, 199, 1, 100, 1, 10, 10),
+                                          ("https://p", 0, 299, 2, 200, 3, 10, 20)]
+
+
+def test_sync_sources_empty(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        assert s.sync_sources() == SyncSources(sources=(), recorded_from_block=None)

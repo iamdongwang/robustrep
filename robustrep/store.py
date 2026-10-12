@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -59,6 +61,13 @@ CREATE TABLE IF NOT EXISTS agents(agent_id TEXT PRIMARY KEY NOT NULL, owner TEXT
 CREATE TABLE IF NOT EXISTS sync_state(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS failed_ranges(from_block INTEGER, to_block INTEGER, error TEXT,
   PRIMARY KEY(from_block, to_block));
+-- sync_log: which endpoint host served which sub-window of a synced chunk (host is
+-- scheme://hostname only, never a full URL). Re-syncing a range replaces the rows
+-- that intersect it, so (from_block, to_block) is unique per recorded sub-window.
+CREATE TABLE IF NOT EXISTS sync_log(
+  from_block INTEGER NOT NULL, to_block INTEGER NOT NULL, host TEXT NOT NULL,
+  window INTEGER NOT NULL, n_logs INTEGER NOT NULL, fetched_at INTEGER NOT NULL,
+  PRIMARY KEY(from_block, to_block));
 CREATE INDEX IF NOT EXISTS idx_feedback_block ON feedback(block);
 CREATE INDEX IF NOT EXISTS idx_feedback_client ON feedback(client);
 CREATE INDEX IF NOT EXISTS idx_feedback_uri ON feedback(feedback_uri);
@@ -81,6 +90,26 @@ def _row_values(row: dict, cols: list[str], what: str) -> list:
             raise ValueError(f"{what} row missing {c!r}")
         values.append(row[c])
     return values
+
+
+@dataclass(frozen=True)
+class SourceSummary:
+    """Per-host aggregate of ``sync_log`` rows."""
+    host: str
+    blocks_min: int
+    blocks_max: int
+    n_ranges: int
+    n_blocks: int
+    n_logs: int
+    first_fetched_at: int
+    last_fetched_at: int
+
+
+@dataclass(frozen=True)
+class SyncSources:
+    """All per-host summaries plus the lowest block recorded in ``sync_log``."""
+    sources: tuple[SourceSummary, ...]
+    recorded_from_block: Optional[int]
 
 
 class Store:
@@ -306,6 +335,27 @@ class Store:
         return [(r[0], r[1]) for r in rows]
 
     # --- loaders (produce the pipeline-facing record frame) --------------------------
+    def add_sync_log(self, from_block: int, to_block: int,
+                     rows: Iterable[tuple[int, int, str, int, int]],
+                     now: Optional[int] = None) -> None:
+        """Replace the ``sync_log`` rows intersecting ``[from_block, to_block]`` with
+        ``rows`` of ``(from, to, host, window, n_logs)``, in one transaction."""
+        ts = int(time.time()) if now is None else now
+        data = [(f, t, h, w, n, ts) for f, t, h, w, n in rows]
+        with self.conn:
+            self.conn.execute("DELETE FROM sync_log WHERE to_block >= ? AND from_block <= ?",
+                              (from_block, to_block))
+            self.conn.executemany("INSERT INTO sync_log VALUES(?,?,?,?,?,?)", data)
+
+    def sync_sources(self) -> SyncSources:
+        """Per-host summary of recorded sub-windows, ordered by host."""
+        rows = self.conn.execute(
+            "SELECT host, MIN(from_block), MAX(to_block), COUNT(*), SUM(to_block - from_block + 1), "
+            "SUM(n_logs), MIN(fetched_at), MAX(fetched_at) FROM sync_log GROUP BY host ORDER BY host"
+        ).fetchall()
+        lo = self.conn.execute("SELECT MIN(from_block) FROM sync_log").fetchone()[0]
+        return SyncSources(sources=tuple(SourceSummary(*r) for r in rows), recorded_from_block=lo)
+
     def load_records(self) -> pd.DataFrame:
         """Project raw feedback + caches into the eight-field pipeline record frame.
 
