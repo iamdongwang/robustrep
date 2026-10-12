@@ -478,3 +478,22 @@ def test_sync_sources_aggregates_per_host_with_exact_block_counts(tmp_path):
 def test_sync_sources_empty(tmp_path):
     with Store(tmp_path / "t.db") as s:
         assert s.sync_sources() == SyncSources(sources=(), recorded_from_block=None)
+
+
+def test_add_sync_log_deletes_intersecting_rows_only(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.add_sync_log(0, 99, [(0, 99, "https://n", 100, 0)], now=1)
+        s.add_sync_log(100, 199, [(100, 199, "https://n", 100, 0)], now=1)
+        s.add_sync_log(200, 299, [(200, 299, "https://n", 100, 0)], now=1)
+        s.add_sync_log(50, 150, [(50, 150, "https://p", 101, 0)], now=2)
+        got = s.conn.execute("select from_block,to_block,host from sync_log order by 1").fetchall()
+        assert got == [(50, 150, "https://p"), (200, 299, "https://n")]
+
+
+def test_add_sync_log_duplicate_rows_roll_back(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.add_sync_log(0, 99, [(0, 99, "https://n", 100, 1)], now=1)
+        with pytest.raises(sqlite3.IntegrityError):
+            s.add_sync_log(0, 99, [(0, 49, "https://p", 50, 0), (0, 49, "https://p", 50, 0)], now=2)
+        got = s.conn.execute("select from_block,to_block,host,fetched_at from sync_log").fetchall()
+        assert got == [(0, 99, "https://n", 1)]

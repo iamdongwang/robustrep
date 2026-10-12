@@ -334,7 +334,6 @@ class Store:
             self.conn.execute("DELETE FROM failed_ranges")
         return [(r[0], r[1]) for r in rows]
 
-    # --- loaders (produce the pipeline-facing record frame) --------------------------
     def add_sync_log(self, from_block: int, to_block: int,
                      rows: Iterable[tuple[int, int, str, int, int]],
                      now: Optional[int] = None) -> None:
@@ -356,6 +355,7 @@ class Store:
         lo = self.conn.execute("SELECT MIN(from_block) FROM sync_log").fetchone()[0]
         return SyncSources(sources=tuple(SourceSummary(*r) for r in rows), recorded_from_block=lo)
 
+    # --- loaders (produce the pipeline-facing record frame) --------------------------
     def load_records(self) -> pd.DataFrame:
         """Project raw feedback + caches into the eight-field pipeline record frame.
 
