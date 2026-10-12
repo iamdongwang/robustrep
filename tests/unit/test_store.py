@@ -497,3 +497,11 @@ def test_add_sync_log_duplicate_rows_roll_back(tmp_path):
             s.add_sync_log(0, 99, [(0, 49, "https://p", 50, 0), (0, 49, "https://p", 50, 0)], now=2)
         got = s.conn.execute("select from_block,to_block,host,fetched_at from sync_log").fetchall()
         assert got == [(0, 99, "https://n", 1)]
+
+
+def test_pre_0_2_database_gains_sync_log_on_next_open(tmp_path):
+    with Store(tmp_path / "old.db") as store:
+        store.conn.execute("DROP TABLE sync_log")
+    with Store(tmp_path / "old.db") as store:
+        assert store.conn.execute("SELECT name FROM sqlite_master WHERE name='sync_log'").fetchone()
+        assert store.sync_sources() == SyncSources(sources=(), recorded_from_block=None)
