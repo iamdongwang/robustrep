@@ -5,6 +5,7 @@ from eth_abi import encode
 
 from robustrep.config import Config
 from robustrep.sources import base_erc8004 as b
+from robustrep.sources.log_fetcher import FetchResult, Served
 from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcError
 from robustrep.store import Store
 
@@ -1034,3 +1035,41 @@ def test_fill_block_timestamps_caches_the_good_blocks_in_a_mixed_batch(tmp_path,
             assert b.fill_block_timestamps(store, MixedRpc({})) == 1
         assert store.missing_block_ts() == [8]
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_sync_without_fetcher_writes_no_sync_log(tmp_path):
+    with Store(tmp_path / "t.db") as store:
+        b.sync_feedback(store, FakeRpc({}, head=1999), chunk=2000, start_block=0, confirmations=0)
+        assert store.sync_sources().sources == ()
+
+def test_sync_with_fetcher_records_sources_then_checkpoint(tmp_path):
+    class F:   # 最小假 fetcher：接口只有 get_logs
+        def get_logs(self, a, z, filter):
+            assert filter == b.LOG_FILTER
+            return FetchResult(logs=[], served=[Served(a, a + 49, "https://n", 50, 0), Served(a + 50, z, "https://n", 50, 0)])
+    with Store(tmp_path / "t.db") as store:
+        b.sync_feedback(store, FakeRpc({}, head=199), chunk=100, start_block=0, confirmations=0, fetcher=F())
+        src = store.sync_sources()
+        assert src.recorded_from_block == 0 and src.sources[0].n_blocks == 200 and src.sources[0].n_ranges == 4
+        assert store.get_sync("last_block") == "199"
+
+def test_fetcher_rpcerror_records_failed_range_and_no_sync_log(tmp_path):
+    class F:
+        def get_logs(self, a, z, filter): raise RpcError("gave up")
+    with Store(tmp_path / "t.db") as store:
+        b.sync_feedback(store, FakeRpc({}, head=99), chunk=100, start_block=0, confirmations=0, fetcher=F())
+        assert store.failed_ranges()[0][:2] == (0, 99) and store.sync_sources().sources == ()
+
+def test_rerun_after_crash_between_sync_log_and_checkpoint_leaves_no_overlap(tmp_path, monkeypatch):
+    class F:
+        def get_logs(self, a, z, filter): return FetchResult(logs=[], served=[Served(a, z, "https://n", 100, 0)])
+    def crash(store, end): raise RuntimeError("crash")
+    with Store(tmp_path / "t.db") as store:
+        real = b._advance_checkpoint
+        monkeypatch.setattr(b, "_advance_checkpoint", crash)
+        with pytest.raises(RuntimeError):
+            b.sync_feedback(store, FakeRpc({}, head=99), chunk=100, start_block=0, confirmations=0, fetcher=F())
+        monkeypatch.setattr(b, "_advance_checkpoint", real)
+        b.sync_feedback(store, FakeRpc({}, head=99), chunk=100, start_block=0, confirmations=0, fetcher=F())
+        rows = store.conn.execute("select from_block,to_block from sync_log order by 1").fetchall()
+        assert rows == [(0, 99)] and store.get_sync("last_block") == "99"

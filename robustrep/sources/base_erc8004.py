@@ -38,12 +38,23 @@ waiting on a fetch), the whole per-chunk loop runs under a ``try/finally``: on
 not yet fully processed -- the one that was in flight plus everything still
 pending -- is re-added to ``failed_ranges`` before the exception propagates, so
 no range is ever silently lost to a crash.
+
+Per-chunk source recording (the ``sync_log`` table) exists only when a
+``fetcher`` (``robustrep.sources.log_fetcher.LogFetcher``) is passed -- the CLI
+always passes one. With a fetcher, each chunk is fetched via
+``fetcher.get_logs(a, z, LOG_FILTER)``; after its logs are decoded and applied,
+the sub-windows that actually served it are written with
+``Store.add_sync_log`` (which replaces any rows intersecting the chunk), and only
+then is the checkpoint advanced. A crash between those two writes leaves the
+chunk in ``failed_ranges`` (via the ``finally`` above); the retry replaces its
+``sync_log`` rows, so no overlap is ever recorded. Without a fetcher, the chunk
+is a single plain ``eth_getLogs`` call and no ``sync_log`` rows are written.
 """
 from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from eth_abi import decode
 from eth_hash.auto import keccak
@@ -52,6 +63,9 @@ from ..config import DEFAULT_CONFIRMATIONS
 from ..store import Store
 from .http_util import short_for_log as _short
 from .rpc import RpcBatchUnsupportedError, RpcError
+
+if TYPE_CHECKING:
+    from .log_fetcher import LogFetcher, Served
 
 logger = logging.getLogger(__name__)
 
@@ -297,8 +311,14 @@ def _fetch_logs(rpc, a: int, z: int) -> list[dict]:
     return rpc.call("eth_getLogs", params)
 
 
+def _served_summary(served: list[Served]) -> str:
+    """``host(window w)`` for each distinct (host, window) that served a chunk, sorted."""
+    return ", ".join(f"{host}(window {w})" for host, w in sorted({(x.host, x.window) for x in served}))
+
+
 def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLOY_BLOCK,
-                   end_block: Optional[int] = None, confirmations: int = DEFAULT_CONFIRMATIONS) -> int:
+                   end_block: Optional[int] = None, confirmations: int = DEFAULT_CONFIRMATIONS,
+                   fetcher: Optional[LogFetcher] = None) -> int:
     """Pull NewFeedback/FeedbackRevoked/ResponseAppended from the last checkpoint
     (``store.get_sync("last_block")``) up to ``end_block`` and persist them into
     ``store``. Returns the number of feedback rows decoded across all chunks
@@ -322,6 +342,13 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
     including the one that failed, is re-added to ``failed_ranges`` before the
     exception propagates. If the checkpoint is already at or past ``end_block``,
     no RPC calls are made and 0 is returned.
+
+    Source recording exists only when a ``fetcher`` is passed (the CLI always
+    passes one): each chunk is then fetched with ``fetcher.get_logs(a, z,
+    LOG_FILTER)`` and, after decode/apply, its served sub-windows are written via
+    ``store.add_sync_log`` before the checkpoint advances. With ``fetcher=None``
+    each chunk is one plain ``eth_getLogs`` call on ``rpc`` and no ``sync_log``
+    rows are written.
     """
     head = end_block if end_block is not None else _chain_head(rpc, confirmations)
     last = store.get_sync("last_block")
@@ -333,8 +360,13 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
         while pending:
             current = pending.pop(0)
             a, z = current
+            served: Optional[list[Served]] = None
             try:
-                logs = _fetch_logs(rpc, a, z)
+                if fetcher is None:
+                    logs = _fetch_logs(rpc, a, z)
+                else:
+                    res = fetcher.get_logs(a, z, LOG_FILTER)
+                    logs, served = res.logs, res.served
             except Exception as e:  # noqa: BLE001 - transient fetch failure: recorded, not swallowed
                 logger.warning("sync_feedback: range %d-%d fetch failed: %s", a, z, e)
                 store.add_failed_range(a, z, str(e)[:200])
@@ -350,8 +382,12 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
                 logger.error("sync_feedback: range %d-%d decode/apply failed: %s", a, z, e)
                 raise
             n += n_fb
+            if served is not None:
+                store.add_sync_log(a, z, served)
             _advance_checkpoint(store, z)
-            logger.info("sync_feedback: range %d-%d: %d logs, %d feedback rows", a, z, len(logs), n_fb)
+            n_calls, via = (1, "rpc") if served is None else (len(served), _served_summary(served))
+            logger.info("sync_feedback: range %d-%d: %d calls via %s; %d logs, %d feedback rows",
+                        a, z, n_calls, via, len(logs), n_fb)
             current = None
     finally:
         leftover = ([current] if current is not None else []) + pending
