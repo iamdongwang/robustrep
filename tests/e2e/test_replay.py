@@ -81,6 +81,10 @@ def test_replay_full_pipeline(tmp_path):
         pngs = sorted(target.glob("*.png"))
         assert len(pngs) == 5
         assert (target / "report.md").exists()
+        # the replay syncs without a LogFetcher, so no log source is recorded.
+        report_md = (target / "report.md").read_text()
+        assert "Log sources: not recorded" in report_md
+        assert "Log sources not cross-checked" in report_md
         json_path = target / "scores.json"
         assert json_path.exists()
         data = json.loads(json_path.read_text())

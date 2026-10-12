@@ -22,6 +22,7 @@ says about the run that made it is part of the artifact, not part of the CLI.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import shutil
@@ -34,7 +35,7 @@ import pandas
 from ..config import Config
 from ..evidence import MAX_TX_LOOKUPS_PER_URI
 from ..sources.evidence_batch import DEFAULT_MAX_TOTAL_LOOKUPS
-from ..store import Store
+from ..store import Store, SyncSources
 from .export import export_json, versions
 from .figures import fig_evidence, fig_mean_vs_robust, fig_rank_shift, fig_sybil_clusters
 from .provenance_keys import PROVENANCE_KEYS
@@ -173,10 +174,22 @@ def evidence_caps_for_provenance(store: Optional[Store]) -> dict:
     return caps
 
 
+def _rpc_sources_for_provenance(sync_sources: Optional[SyncSources]):
+    """`config["rpc_sources"]`: the store's per-host sync_log summary, or
+    `UNAVAILABLE` when there is no store or it recorded no source at all."""
+    if sync_sources is None or sync_sources.recorded_from_block is None:
+        return UNAVAILABLE
+    return {
+        "sources": [dataclasses.asdict(source) for source in sync_sources.sources],
+        "recorded_from_block": int(sync_sources.recorded_from_block),
+    }
+
+
 def build_provenance(mode: str, cfg: Config, records: pandas.DataFrame,
                 result: Optional[pandas.DataFrame] = None,
                 n_lookup_budget_starved: int = 0,
-                evidence_caps: Optional[dict] = None) -> dict:
+                evidence_caps: Optional[dict] = None,
+                sync_sources: Optional[SyncSources] = None) -> dict:
     caps = evidence_caps if evidence_caps is not None else evidence_caps_for_provenance(None)
     config = dict(
         bootstrap_n=cfg.bootstrap_n,
@@ -204,6 +217,10 @@ def build_provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         # caller with no store to count from (e.g. `build_provenance` called
         # directly on an in-memory `records` frame, as several tests do).
         evidence_lookup_starved_uris=n_lookup_budget_starved,
+        # Which RPC endpoints served the logs, per Store.sync_sources. Last,
+        # and UNAVAILABLE (not an empty list) when this store never recorded
+        # a source: "not recorded" and "recorded, nothing" are different claims.
+        rpc_sources=_rpc_sources_for_provenance(sync_sources),
     )
     # PROVENANCE_KEYS is the published order, shared with `report.render` so the
     # two artifacts cannot drift (a test pins them equal). Ordering through it

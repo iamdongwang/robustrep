@@ -3,6 +3,7 @@ adversarial evidence, limitations, provenance)."""
 from __future__ import annotations
 
 from typing import Optional
+from urllib.parse import urlsplit
 
 import pandas as pd
 
@@ -226,6 +227,38 @@ _NORMALIZATION_ORDER_BULLET = (
 )
 
 
+# Always the last Limitations bullet, whether or not sources were recorded:
+# listing several endpoints in Provenance says where logs came from, never that
+# they agree. Kept the report's only use of "cross-checked against".
+_LOG_SOURCE_LIMITATION = (
+    "- **Log sources not cross-checked.** Logs from different endpoints are not "
+    "cross-checked against each other; the weekly drift test covers only the recorded "
+    "fixture window."
+)
+
+# Rendered by `_log_source_lines`, so `_provenance_config_lines` does not dump
+# the raw structure as well.
+_RPC_SOURCES_KEY = "rpc_sources"
+
+
+def _log_source_lines(config: dict) -> list:
+    """The "Log sources" lines of the Provenance block, from
+    `config["rpc_sources"]` (see `report.publish._rpc_sources_for_provenance`)."""
+    rpc = config.get(_RPC_SOURCES_KEY)
+    if not isinstance(rpc, dict):
+        return ["- Log sources: not recorded (fetched before source recording existed)."]
+    parts = [
+        f"{urlsplit(src['host']).hostname} (blocks {src['blocks_min']:,}\u2013{src['blocks_max']:,}, "
+        f"{src['n_ranges']:,} ranges, {src['n_blocks']:,} blocks, {src['n_logs']:,} logs)"
+        for src in rpc["sources"]
+    ]
+    return [
+        "- Log sources: " + "; ".join(parts),
+        f"- Source recording starts at block {rpc['recorded_from_block']:,}; blocks before it "
+        "were fetched before source recording existed.",
+    ]
+
+
 def _provenance_config_lines(config: dict) -> list:
     """The "Scoring configuration used" block: every key of `config`,
     `PROVENANCE_KEYS` first (the published order, shared with
@@ -233,11 +266,13 @@ def _provenance_config_lines(config: dict) -> list:
 
     Nothing is dropped. The previous hardcoded key tuple silently omitted
     `evidence_level_shares` -- published in scores.json, absent from report.md
-    -- and would have omitted every key added after it in the same way.
+    -- and would have omitted every key added after it in the same way. The
+    one exception is `rpc_sources`, rendered readably by `_log_source_lines`
+    instead of as a raw dict.
     """
     if not config:
         return []
-    known = [key for key in PROVENANCE_KEYS if key in config]
+    known = [key for key in PROVENANCE_KEYS if key in config and key != _RPC_SOURCES_KEY]
     extra = sorted(key for key in config if key not in set(PROVENANCE_KEYS))
     return ["- Scoring configuration used:"] + [f"  - `{key}`: {config[key]}"
                                                 for key in known + extra]
@@ -404,12 +439,14 @@ def render_markdown(scores: pd.DataFrame, records: pd.DataFrame, block: int, fig
         "make expensive; a rare-tag merge is a v0.2 item.",
         *_evidence_budget_lines(config),
         _NORMALIZATION_ORDER_BULLET,
+        _LOG_SOURCE_LIMITATION,
         "",
         "## Provenance",
     ]
     lines.append(f"- Rater profile mode: {prov.get('rater_profile_mode', 'unknown')}")
     lines.append(f"- Confirmations lag (data cut is final as of this block): "
                  f"{prov.get('confirmations', 'unknown')}")
+    lines += _log_source_lines(config)
     lines += _provenance_config_lines(config)
     versions = prov.get("versions") or {}
     if versions:

@@ -532,6 +532,8 @@ def report(
             # Same reason: provenance publishes the caps the fetch run
             # recorded in *this* store, not this build's constants.
             evidence_caps = evidence_caps_for_provenance(store)
+            # And which RPC endpoints served the logs, from this store's sync_log.
+            sync_sources = store.sync_sources()
         block = int(last_block) if last_block is not None else 0
         # Inside the guard: sensitivity_table re-scores the whole dataset once
         # per variant, so any ValueError scoring can raise, it can raise too.
@@ -543,7 +545,8 @@ def report(
     adv = scenario_table()
     provenance = build_provenance(mode, cfg, records, result,
                               n_lookup_budget_starved=n_lookup_budget_starved,
-                              evidence_caps=evidence_caps)
+                              evidence_caps=evidence_caps,
+                              sync_sources=sync_sources)
 
     block_dir = out_dir / str(block)
     # Guarded like the scoring above: `export_json` refuses an address-bearing

@@ -359,3 +359,54 @@ def test_write_report_gives_both_artifacts_the_same_versions_dict(tmp_path, reco
                          block=1, provenance=provenance, top_n=5)
     assert json.loads((tmp_path / "scores.json").read_text())["versions"] == sentinel
     assert "robustrep 1.2.3-sentinel" in (tmp_path / "report.md").read_text()
+
+
+# --- 0.2.0 adaptive log fetch: rpc_sources provenance ------------------------
+
+
+def _one_record():
+    from robustrep.schema import validate_records
+
+    return validate_records(pd.DataFrame([dict(
+        rater="r", ratee="A", value=50, scale="d0", tag="q", ts=0,
+        evidence_uri=None, source="test", evidence_level=0)]))
+
+
+def test_rpc_sources_unavailable_without_store():
+    from robustrep import Config
+
+    config = publish.build_provenance("onchain", Config(), _one_record())["config"]
+    assert config["rpc_sources"] == publish.UNAVAILABLE
+
+
+def test_rpc_sources_unavailable_when_nothing_recorded():
+    from robustrep import Config
+    from robustrep.store import SyncSources
+
+    config = publish.build_provenance(
+        "onchain", Config(), _one_record(),
+        sync_sources=SyncSources(sources=(), recorded_from_block=None))["config"]
+    assert config["rpc_sources"] == publish.UNAVAILABLE
+
+
+def test_rpc_sources_from_sync_sources():
+    from robustrep import Config
+    from robustrep.store import SourceSummary, SyncSources
+
+    a = SourceSummary(host="https://base-pokt.nodies.app", blocks_min=100, blocks_max=199,
+                      n_ranges=2, n_blocks=100, n_logs=7, first_fetched_at=10, last_fetched_at=20)
+    b = SourceSummary(host="https://mainnet.base.org", blocks_min=200, blocks_max=299,
+                      n_ranges=1, n_blocks=100, n_logs=3, first_fetched_at=30, last_fetched_at=40)
+    config = publish.build_provenance(
+        "onchain", Config(), _one_record(),
+        sync_sources=SyncSources(sources=(a, b), recorded_from_block=100))["config"]
+    assert config["rpc_sources"] == {
+        "sources": [
+            dict(host="https://base-pokt.nodies.app", blocks_min=100, blocks_max=199,
+                 n_ranges=2, n_blocks=100, n_logs=7, first_fetched_at=10, last_fetched_at=20),
+            dict(host="https://mainnet.base.org", blocks_min=200, blocks_max=299,
+                 n_ranges=1, n_blocks=100, n_logs=3, first_fetched_at=30, last_fetched_at=40),
+        ],
+        "recorded_from_block": 100,
+    }
+    assert list(config)[-1] == "rpc_sources"

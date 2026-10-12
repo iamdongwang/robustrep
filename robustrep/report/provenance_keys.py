@@ -31,4 +31,5 @@ PROVENANCE_KEYS = (
     "evidence_max_lookups_per_uri",
     "evidence_max_total_lookups",
     "evidence_lookup_starved_uris",
+    "rpc_sources",
 )

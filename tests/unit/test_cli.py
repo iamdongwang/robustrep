@@ -1236,6 +1236,42 @@ def test_report_provenance_includes_evidence_lookup_starved_uris(tmp_path):
     assert data["config"]["evidence_lookup_starved_uris"] == 2
 
 
+def test_report_provenance_reads_rpc_sources_from_store(tmp_path):
+    """`report` reads the sync_log summary while the store is open and publishes
+    it as `rpc_sources` in scores.json and as "Log sources" lines in report.md."""
+    db = tmp_path / "t.db"
+    _seed(db, n=4)
+    s = Store(db)
+    s.add_sync_log(100, 299, [(100, 199, "https://base-pokt.nodies.app", 100, 5),
+                              (200, 299, "https://base-pokt.nodies.app", 100, 2)], now=10)
+    s.close()
+
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+
+    md = (out_dir / "latest" / "report.md").read_text()
+    assert ("- Log sources: base-pokt.nodies.app (blocks 100\u2013299, 2 ranges, 200 blocks, "
+            "7 logs)") in md
+    assert "- Source recording starts at block 100;" in md
+    data = json.loads((out_dir / "latest" / "scores.json").read_text())
+    rpc = data["config"]["rpc_sources"]
+    assert rpc["recorded_from_block"] == 100
+    assert [x["host"] for x in rpc["sources"]] == ["https://base-pokt.nodies.app"]
+
+
+def test_report_provenance_rpc_sources_unavailable_without_sync_log(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db, n=4)
+    out_dir = tmp_path / "reports"
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out_dir), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+    md = (out_dir / "latest" / "report.md").read_text()
+    assert "- Log sources: not recorded (fetched before source recording existed)." in md
+    data = json.loads((out_dir / "latest" / "scores.json").read_text())
+    assert data["config"]["rpc_sources"] == "unavailable"
+
+
 def test_report_provenance_includes_evidence_level_shares(tmp_path):
     """`_seed` writes feedback rows with no evidence_uri -- every row classifies
     to evidence level 0 -- so the shares should read 100% level 0, and land in
