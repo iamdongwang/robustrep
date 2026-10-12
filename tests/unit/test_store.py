@@ -49,6 +49,22 @@ def test_failed_ranges_and_missing_blocks(tmp_path):
         assert s.missing_block_ts() == [100, 101]
 
 
+def test_failed_ranges_reads_without_clearing(tmp_path):
+    """``failed_ranges`` is the non-destructive view (range + recorded error,
+    ordered by start block); only ``pop_failed_ranges`` clears."""
+    with Store(tmp_path / "t.db") as s:
+        assert s.failed_ranges() == []
+        s.add_failed_range(2001, 4000, "gave up after 5 attempts: HTTPError (HTTP 429) from https://h")
+        s.add_failed_range(1, 2000, "boom")
+        assert s.failed_ranges() == [
+            (1, 2000, "boom"),
+            (2001, 4000, "gave up after 5 attempts: HTTPError (HTTP 429) from https://h"),
+        ]
+        assert s.failed_ranges() == s.failed_ranges()  # still there
+        assert s.pop_failed_ranges() == [(1, 2000), (2001, 4000)]
+        assert s.failed_ranges() == []
+
+
 def test_raters_and_agents(tmp_path):
     with Store(tmp_path / "t.db") as s:
         s.upsert_rater("0xc", first_seen_ts=5, funder="0xf")

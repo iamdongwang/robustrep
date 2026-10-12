@@ -4,6 +4,18 @@ All notable changes to robustrep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0,
 so a `0.x` bump may change published numbers without changing the API.
 
+## [Unreleased]
+
+### Fixed
+
+- **Live suite: a throttled `eth_getLogs` is a skip, not a failure.**
+  `sync_feedback` records a chunk whose fetch failed in `failed_ranges` and
+  carries on rather than raising, so the live test's availability guard never
+  saw the HTTP 429 and the checkpoint assertion failed instead (weekly run of
+  2026-10-12). The test now reads the recorded errors through the new
+  read-only `Store.failed_ranges()` and applies the same classifier: all
+  throttling/transport -> skip, anything else -> fail naming the range.
+
 ## [0.1.2] — 2026-10-03
 
 A dependency security release. No API, CLI or scoring changes.

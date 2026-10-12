@@ -128,6 +128,37 @@ def rpc_available():
         pytest.skip(f"RPC unavailable: {reason}")
 
 
+def check_failed_ranges(store: Store) -> None:
+    """Apply the availability guard to the sync path that never raises.
+
+    ``base.sync_feedback`` records a chunk whose ``eth_getLogs`` failed in
+    ``failed_ranges`` and carries on (so a real fetch can resume later) instead
+    of raising -- which means ``rpc_available()`` around it sees nothing, and a
+    throttled endpoint would surface as a bare checkpoint assertion failure
+    (as it did on the 2026-10-12 weekly run: both ranges HTTP 429). Call this
+    after ``sync_feedback``, before asserting on the checkpoint:
+
+    * no recorded failures -> return, let the assertions run;
+    * every recorded failure classifies as "endpoint unusable" (via
+      ``rpc_unavailable_reason``, so the same markers and the same no-leak
+      rule apply) -> skip;
+    * any failure that does *not* classify -> fail naming the range, exactly
+      as the exception would have if it had propagated. A throttled sibling
+      range never hides a real one.
+    """
+    rows = store.failed_ranges()
+    if not rows:
+        return
+    reasons = [rpc_unavailable_reason(RpcError(err)) for _, _, err in rows]
+    real = [(a, z, err) for (a, z, err), r in zip(rows, reasons) if r is None]
+    if real:
+        detail = "; ".join(f"{a}-{z}: {err}" for a, z, err in real)
+        pytest.fail(f"sync_feedback recorded {len(real)} failed range(s) that are not an RPC-availability "
+                    f"problem: {detail}")
+    labels = ", ".join(sorted(set(reasons)))
+    pytest.skip(f"RPC unavailable: {len(rows)} range(s) failed to fetch ({labels})")
+
+
 @pytest.mark.live
 def test_live_recent_blocks(tmp_path):
     cfg = Config()
@@ -136,6 +167,7 @@ def test_live_recent_blocks(tmp_path):
         with rpc_available():
             head = int(rpc.call("eth_blockNumber", []), 16)
             base.sync_feedback(store, rpc, chunk=2000, start_block=head - 3999, end_block=head)
+        check_failed_ranges(store)
         assert store.get_sync("last_block") == str(head)
         with rpc_available():
             base.fill_block_timestamps(store, rpc)

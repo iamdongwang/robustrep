@@ -26,6 +26,7 @@ import pytest
 import requests
 
 from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcError
+from robustrep.store import Store
 
 
 def _load_live_module():
@@ -221,3 +222,69 @@ def test_batch_structure_error_never_skips_even_with_transport_words():
 ])
 def test_our_own_redacted_prefixes_still_classify(message, expected):
     assert live.rpc_unavailable_reason(RpcError(message)) == expected
+
+
+# --- recorded fetch failures (the sync path that never raises) ------------------
+#
+# ``base.sync_feedback`` deliberately does not raise when a chunk's
+# ``eth_getLogs`` fails: it records the range in ``failed_ranges`` and moves
+# on. So ``rpc_available()`` around it sees nothing, and a throttled endpoint
+# surfaced as a plain assertion failure on the checkpoint (2026-10-12 weekly
+# run: both ranges HTTP 429, ``last_block`` never written). ``check_failed_ranges``
+# closes that gap: it reads the recorded errors and applies the same classifier.
+
+
+def _store_with_failures(tmp_path, errors):
+    store = Store(tmp_path / "t.db")
+    for i, err in enumerate(errors):
+        store.add_failed_range(i * 2000, i * 2000 + 1999, err)
+    return store
+
+
+def test_check_failed_ranges_passes_through_when_nothing_failed(tmp_path):
+    with Store(tmp_path / "t.db") as store:
+        live.check_failed_ranges(store)  # no exception, no skip
+
+
+def test_check_failed_ranges_skips_when_every_failure_is_throttling(tmp_path):
+    with _store_with_failures(tmp_path, [
+        "gave up after 5 attempts: HTTPError (HTTP 429) from https://mainnet.base.org",
+        "gave up after 5 attempts: HTTPError (HTTP 429) from https://mainnet.base.org",
+    ]) as store:
+        with pytest.raises(pytest.skip.Exception, match="RPC unavailable: .*rate limited"):
+            live.check_failed_ranges(store)
+
+
+def test_check_failed_ranges_skips_on_transport_failures_too(tmp_path):
+    with _store_with_failures(tmp_path, [
+        "gave up after 5 attempts: ReadTimeout contacting https://mainnet.base.org",
+        "gave up after 5 attempts: HTTPError (HTTP 503) from https://mainnet.base.org",
+    ]) as store:
+        with pytest.raises(pytest.skip.Exception, match="RPC unavailable: .*transport failure"):
+            live.check_failed_ranges(store)
+
+
+def test_check_failed_ranges_fails_on_a_real_failure(tmp_path):
+    with _store_with_failures(tmp_path, [
+        "gave up after 5 attempts: malformed response: expected an object",
+    ]) as store:
+        with pytest.raises(pytest.fail.Exception, match="0-1999"):
+            live.check_failed_ranges(store)
+
+
+def test_check_failed_ranges_does_not_let_throttled_siblings_hide_a_real_failure(tmp_path):
+    with _store_with_failures(tmp_path, [
+        "gave up after 5 attempts: HTTPError (HTTP 429) from https://mainnet.base.org",
+        "gave up after 5 attempts: malformed response: expected an object",
+    ]) as store:
+        with pytest.raises(pytest.fail.Exception, match="2000-3999"):
+            live.check_failed_ranges(store)
+
+
+def test_check_failed_ranges_skip_reason_carries_no_server_text(tmp_path):
+    with _store_with_failures(tmp_path, [
+        f"gave up after 5 attempts: ReadTimeout contacting https://rpc.example/v2/{CANARY}",
+    ]) as store:
+        with pytest.raises(pytest.skip.Exception) as info:
+            live.check_failed_ranges(store)
+    assert CANARY not in str(info.value)

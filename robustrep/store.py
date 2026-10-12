@@ -287,6 +287,14 @@ class Store:
         with self.conn:
             self.conn.execute("INSERT OR REPLACE INTO failed_ranges VALUES(?,?,?)", (from_block, to_block, error))
 
+    def failed_ranges(self) -> list[tuple[int, int, str]]:
+        """Non-destructive view of the recorded failed block ranges with their
+        stored error text, ordered by start block. Does not clear anything --
+        that is ``pop_failed_ranges``, which the next sync uses to retry."""
+        rows = self.conn.execute(
+            "SELECT from_block,to_block,error FROM failed_ranges ORDER BY from_block").fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
     def pop_failed_ranges(self) -> list[tuple[int, int]]:
         """Atomically return and clear all recorded failed block ranges, ordered by
         start block. SELECT and DELETE run inside a single transaction so a range
