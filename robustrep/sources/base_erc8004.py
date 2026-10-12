@@ -71,6 +71,13 @@ def _topic(sig: str) -> str:
 TOPIC_NEW_FEEDBACK = _topic("NewFeedback(uint256,address,uint64,int128,uint8,string,string,string,string,string,bytes32)")
 TOPIC_REVOKED = _topic("FeedbackRevoked(uint256,address,uint64)")
 TOPIC_RESPONSE = _topic("ResponseAppended(uint256,address,uint64,address,string,bytes32)")
+
+# Server-side ``eth_getLogs`` filter (minus the block range): this registry's
+# three known event topics.
+LOG_FILTER: dict = {
+    "address": REPUTATION_REGISTRY,
+    "topics": [[TOPIC_NEW_FEEDBACK, TOPIC_REVOKED, TOPIC_RESPONSE]],
+}
 FEEDBACK_TYPES = ["uint64", "int128", "uint8", "string", "string", "string", "string", "bytes32"]
 RESPONSE_TYPES = ["uint64", "string", "bytes32"]
 
@@ -284,6 +291,12 @@ def _chain_head(rpc, confirmations: int) -> int:
         raise RpcError(f"eth_blockNumber returned a malformed head: {e}") from None
 
 
+def _fetch_logs(rpc, a: int, z: int) -> list[dict]:
+    """One ``eth_getLogs`` call over blocks ``a``..``z`` (inclusive) using ``LOG_FILTER``."""
+    params = [{"fromBlock": hex(a), "toBlock": hex(z), **LOG_FILTER}]
+    return rpc.call("eth_getLogs", params)
+
+
 def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLOY_BLOCK,
                    end_block: Optional[int] = None, confirmations: int = DEFAULT_CONFIRMATIONS) -> int:
     """Pull NewFeedback/FeedbackRevoked/ResponseAppended from the last checkpoint
@@ -321,10 +334,7 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
             current = pending.pop(0)
             a, z = current
             try:
-                logs = rpc.call("eth_getLogs", [{
-                    "fromBlock": hex(a), "toBlock": hex(z), "address": REPUTATION_REGISTRY,
-                    "topics": [[TOPIC_NEW_FEEDBACK, TOPIC_REVOKED, TOPIC_RESPONSE]],
-                }])
+                logs = _fetch_logs(rpc, a, z)
             except Exception as e:  # noqa: BLE001 - transient fetch failure: recorded, not swallowed
                 logger.warning("sync_feedback: range %d-%d fetch failed: %s", a, z, e)
                 store.add_failed_range(a, z, str(e)[:200])

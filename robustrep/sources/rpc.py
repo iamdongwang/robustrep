@@ -127,6 +127,12 @@ def _is_non_retryable(message: str) -> bool:
     return any(s.lower() in low for s in NON_RETRYABLE)
 
 
+def _raise_if_fatal(err: str) -> None:
+    """Raise ``RpcError`` (no further retries) if ``err`` names a ``NON_RETRYABLE`` error."""
+    if _is_non_retryable(err):
+        raise RpcError(f"non-retryable error: {err}")
+
+
 def _is_batch_rate_limited(message: str) -> bool:
     low = message.lower()
     return any(s.lower() in low for s in BATCH_RATE_LIMIT)
@@ -233,8 +239,7 @@ class RpcClient:
                 err = check(body)
                 if err is None:
                     return body
-                if _is_non_retryable(err):
-                    raise RpcError(f"non-retryable error: {err}")
+                _raise_if_fatal(err)
                 last = RpcError(err)
             except (requests.RequestException, ValueError) as e:
                 last = e
