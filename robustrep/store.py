@@ -347,13 +347,16 @@ class Store:
             self.conn.executemany("INSERT INTO sync_log VALUES(?,?,?,?,?,?)", data)
 
     def sync_sources(self) -> SyncSources:
-        """Per-host summary of recorded sub-windows, ordered by host."""
+        """Per-host summary of recorded sub-windows, ordered by host, plus the
+        lowest recorded block (``None`` when ``sync_log`` is empty) -- derived
+        from the same grouped rows, so one query and always self-consistent."""
         rows = self.conn.execute(
             "SELECT host, MIN(from_block), MAX(to_block), COUNT(*), SUM(to_block - from_block + 1), "
             "SUM(n_logs), MIN(fetched_at), MAX(fetched_at) FROM sync_log GROUP BY host ORDER BY host"
         ).fetchall()
-        lo = self.conn.execute("SELECT MIN(from_block) FROM sync_log").fetchone()[0]
-        return SyncSources(sources=tuple(SourceSummary(*r) for r in rows), recorded_from_block=lo)
+        sources = tuple(SourceSummary(*r) for r in rows)
+        lo = min((x.blocks_min for x in sources), default=None)
+        return SyncSources(sources=sources, recorded_from_block=lo)
 
     # --- loaders (produce the pipeline-facing record frame) --------------------------
     def load_records(self) -> pd.DataFrame:

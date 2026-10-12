@@ -87,7 +87,11 @@ TOPIC_REVOKED = _topic("FeedbackRevoked(uint256,address,uint64)")
 TOPIC_RESPONSE = _topic("ResponseAppended(uint256,address,uint64,address,string,bytes32)")
 
 # Server-side ``eth_getLogs`` filter (minus the block range): this registry's
-# three known event topics.
+# three known event topics. Read-only by convention: every request spreads it
+# into a fresh params dict (``_fetch_logs``, ``LogFetcher._call_get_logs``),
+# but that copy is shallow, so the inner topics list is shared by all of them
+# and must never be mutated. It stays a list of lists (not tuples) because it
+# is serialized verbatim as the JSON-RPC ``topics`` param.
 LOG_FILTER: dict = {
     "address": REPUTATION_REGISTRY,
     "topics": [[TOPIC_NEW_FEEDBACK, TOPIC_REVOKED, TOPIC_RESPONSE]],
@@ -316,6 +320,22 @@ def _served_summary(served: list[Served]) -> str:
     return ", ".join(f"{host}(window {w})" for host, w in sorted({(x.host, x.window) for x in served}))
 
 
+def _fetch_chunk(rpc, fetcher: Optional[LogFetcher], a: int,
+                 z: int) -> tuple[list[dict], Optional[list[Served]]]:
+    """Logs of blocks ``a``..``z`` and, with a ``fetcher``, the sub-requests
+    that served them (``None`` without one: a single plain call on ``rpc``)."""
+    if fetcher is None:
+        return _fetch_logs(rpc, a, z), None
+    res = fetcher.get_logs(a, z, LOG_FILTER)
+    return res.logs, res.served
+
+
+def _log_chunk_done(a: int, z: int, served: Optional[list[Served]], n_logs: int, n_fb: int) -> None:
+    n_calls, via = (1, "rpc") if served is None else (len(served), _served_summary(served))
+    logger.info("sync_feedback: range %d-%d: %d calls via %s; %d logs, %d feedback rows",
+                a, z, n_calls, via, n_logs, n_fb)
+
+
 def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLOY_BLOCK,
                    end_block: Optional[int] = None, confirmations: int = DEFAULT_CONFIRMATIONS,
                    fetcher: Optional[LogFetcher] = None) -> int:
@@ -360,13 +380,8 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
         while pending:
             current = pending.pop(0)
             a, z = current
-            served: Optional[list[Served]] = None
             try:
-                if fetcher is None:
-                    logs = _fetch_logs(rpc, a, z)
-                else:
-                    res = fetcher.get_logs(a, z, LOG_FILTER)
-                    logs, served = res.logs, res.served
+                logs, served = _fetch_chunk(rpc, fetcher, a, z)
             except Exception as e:  # noqa: BLE001 - transient fetch failure: recorded, not swallowed
                 logger.warning("sync_feedback: range %d-%d fetch failed: %s", a, z, e)
                 store.add_failed_range(a, z, str(e)[:200])
@@ -385,9 +400,7 @@ def sync_feedback(store: Store, rpc, chunk: int = 2000, start_block: int = DEPLO
             if served is not None:
                 store.add_sync_log(a, z, served)
             _advance_checkpoint(store, z)
-            n_calls, via = (1, "rpc") if served is None else (len(served), _served_summary(served))
-            logger.info("sync_feedback: range %d-%d: %d calls via %s; %d logs, %d feedback rows",
-                        a, z, n_calls, via, len(logs), n_fb)
+            _log_chunk_done(a, z, served, len(logs), n_fb)
             current = None
     finally:
         leftover = ([current] if current is not None else []) + pending

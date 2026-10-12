@@ -1042,13 +1042,14 @@ def test_sync_without_fetcher_writes_no_sync_log(tmp_path):
         b.sync_feedback(store, FakeRpc({}, head=1999), chunk=2000, start_block=0, confirmations=0)
         assert store.sync_sources().sources == ()
 
-def test_sync_with_fetcher_records_sources_then_checkpoint(tmp_path):
+def test_sync_with_fetcher_records_sources_then_checkpoint(tmp_path, caplog):
     class F:   # 最小假 fetcher：接口只有 get_logs
         def get_logs(self, a, z, filter):
             assert filter == b.LOG_FILTER
             return FetchResult(logs=[], served=[Served(a, a + 49, "https://n", 50, 0), Served(a + 50, z, "https://n", 50, 0)])
-    with Store(tmp_path / "t.db") as store:
+    with Store(tmp_path / "t.db") as store, caplog.at_level(logging.INFO, logger="robustrep.sources.base_erc8004"):
         b.sync_feedback(store, FakeRpc({}, head=199), chunk=100, start_block=0, confirmations=0, fetcher=F())
+        assert sum("2 calls via https://n(window 50)" in m for m in caplog.messages) == 2
         src = store.sync_sources()
         assert src.recorded_from_block == 0 and src.sources[0].n_blocks == 200 and src.sources[0].n_ranges == 4
         assert store.get_sync("last_block") == "199"
@@ -1070,6 +1071,7 @@ def test_rerun_after_crash_between_sync_log_and_checkpoint_leaves_no_overlap(tmp
         with pytest.raises(RuntimeError):
             b.sync_feedback(store, FakeRpc({}, head=99), chunk=100, start_block=0, confirmations=0, fetcher=F())
         monkeypatch.setattr(b, "_advance_checkpoint", real)
+        # The rerun processes (0, 99) again; add_sync_log's delete-then-insert keeps one row.
         b.sync_feedback(store, FakeRpc({}, head=99), chunk=100, start_block=0, confirmations=0, fetcher=F())
         rows = store.conn.execute("select from_block,to_block from sync_log order by 1").fetchall()
         assert rows == [(0, 99)] and store.get_sync("last_block") == "99"
