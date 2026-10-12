@@ -37,12 +37,25 @@ class FakeResponse:
             self._session.closes += 1
 
 
+class FakeErrorResponse(FakeResponse):
+    """A non-2xx response: ``raise_for_status`` raises ``HTTPError`` like
+    ``requests`` does. ``body`` is a decoded JSON object or raw ``bytes``."""
+
+    def __init__(self, status: int, body, session=None):
+        super().__init__(body if isinstance(body, bytes) else jsonlib.dumps(body).encode(), session=session)
+        self.status_code = status
+
+    def raise_for_status(self):
+        raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
+
+
 class FakeSession:
     """Fake ``requests.Session`` whose responses are streamed byte bodies.
 
     ``responses`` items are decoded JSON objects (serialized here), raw
-    ``bytes`` (for a malformed/oversized body), or an ``Exception`` to raise
-    from ``post`` itself."""
+    ``bytes`` (for a malformed/oversized body), a ``FakeErrorResponse`` (a
+    non-2xx status, returned as-is), or an ``Exception`` to raise from
+    ``post`` itself."""
 
     def __init__(self, responses):
         self.responses, self.calls, self.headers = list(responses), [], []
@@ -55,6 +68,9 @@ class FakeSession:
         r = self.responses.pop(0)
         if isinstance(r, Exception):
             raise r
+        if isinstance(r, FakeErrorResponse):
+            r._session = self
+            return r
         body = r if isinstance(r, bytes) else jsonlib.dumps(r).encode()
         return FakeResponse(body, session=self)
 
@@ -517,3 +533,78 @@ def test_rotate_advances_and_wraps():
     assert c.current_url == "http://b"
     c.rotate()
     assert c.current_url == "http://a"
+
+
+# --- HTTP 400 carrying a JSON-RPC error body (drpc) --------------------------------
+
+DRPC_RANGE_ERROR = {"jsonrpc": "2.0", "id": 1,
+                    "error": {"code": 35, "message": "ranges over 10000 blocks are not supported on free plan"}}
+
+
+def test_http_400_with_range_error_body_raises_range_too_large_immediately():
+    s = FakeSession([FakeErrorResponse(400, DRPC_RANGE_ERROR)])
+    slept = []
+    c = RpcClient(["https://d", "https://e"], user_agent="ua", session=s, sleep=slept.append)
+    with pytest.raises(RpcRangeTooLargeError) as info:
+        c.call("eth_getLogs", [{}])
+    assert info.value.endpoint == "https://d"
+    assert info.value.numbers == (35, 10000)
+    assert len(s.calls) == 1 and slept == [] and c.current_url == "https://d"
+    assert s.closes == 1
+
+
+def test_http_400_with_non_retryable_body_raises_immediately():
+    s = FakeSession([FakeErrorResponse(400, {"error": {"code": -32602, "message": "invalid params"}})])
+    c = RpcClient(["https://d", "https://e"], user_agent="ua", session=s, sleep=lambda _: None)
+    with pytest.raises(RpcError, match="non-retryable"):
+        c.call("m", [])
+    assert len(s.calls) == 1
+
+
+def test_http_400_with_other_json_error_is_retried_and_rotated():
+    s = FakeSession([FakeErrorResponse(400, {"error": {"code": -32000, "message": "header not found"}}),
+                     {"result": "ok"}])
+    c = RpcClient(["https://d", "https://e"], user_agent="ua", session=s, sleep=lambda _: None)
+    assert c.call("m", []) == "ok"
+    assert [u for u, _ in s.calls] == ["https://d", "https://e"]
+
+
+def test_http_400_with_non_json_body_stays_an_http_error():
+    s = FakeSession([FakeErrorResponse(400, b"Bad Request")])
+    c = RpcClient(["https://d"], user_agent="ua", session=s, sleep=lambda _: None, retries=1)
+    with pytest.raises(RpcError) as info:
+        c.call("m", [])
+    assert "HTTPError (HTTP 400) from https://d" in str(info.value)
+    assert "Bad Request" not in str(info.value)
+    assert s.closes == 1
+
+
+@pytest.mark.parametrize("body", [{"result": "ok"}, ["not", "a", "dict"], {"error": None}])
+def test_http_400_with_json_body_without_error_stays_an_http_error(body):
+    # Only a dict carrying an ``error`` is handed to classification; a 400
+    # whose JSON body happens to hold a ``result`` must not be taken as success.
+    s = FakeSession([FakeErrorResponse(400, body)])
+    c = RpcClient(["https://d"], user_agent="ua", session=s, sleep=lambda _: None, retries=1)
+    with pytest.raises(RpcError, match=r"HTTPError \(HTTP 400\) from https://d"):
+        c.call("m", [])
+
+
+def test_http_400_with_oversized_body_stays_an_http_error():
+    s = FakeSession([FakeErrorResponse(400, b"x" * 5000)])
+    c = RpcClient(["https://d"], user_agent="ua", session=s, sleep=lambda _: None, retries=1,
+                  max_response_bytes=64)
+    with pytest.raises(RpcError, match=r"HTTPError \(HTTP 400\) from https://d"):
+        c.call("m", [])
+    assert s.closes == 1
+
+
+@pytest.mark.parametrize("status", [403, 429, 500, 503])
+def test_http_403_and_429_json_bodies_stay_http_errors(status):
+    body = {"error": {"code": -32602, "message": "SERVER_TEXT archive refused"}}
+    s = FakeSession([FakeErrorResponse(status, body)])
+    c = RpcClient(["https://d"], user_agent="ua", session=s, sleep=lambda _: None, retries=1)
+    with pytest.raises(RpcError) as info:
+        c.call("m", [])
+    msg = str(info.value)
+    assert f"HTTPError (HTTP {status}) from https://d" in msg
+    assert "SERVER_TEXT" not in msg and "-32602" not in msg and "non-retryable" not in msg

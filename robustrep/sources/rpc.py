@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 # ``http_util.read_json_capped``.
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
+# The one non-2xx status whose JSON-RPC error body is classified like a 200's
+# (see ``RpcClient._post``): base.drpc.org reports its range cap as HTTP 400.
+HTTP_BAD_REQUEST = 400
+
 
 class RpcError(RuntimeError):
     """Raised when a JSON-RPC call/batch fails on every configured retry, or
@@ -245,10 +249,25 @@ class RpcClient:
         a failure that is not theirs. The message names only the scrubbed
         endpoint and the limit: never the body, never the full URL (which may
         embed a provider API key).
+
+        An HTTP **400** whose body decodes to a JSON object carrying an
+        ``error`` key is returned like a 200 body, so ``_with_retry``'s
+        ``check`` classifies it as usual (range-too-large, ``NON_RETRYABLE``,
+        or retry/rotate): base.drpc.org reports its ``eth_getLogs`` range cap
+        this way. A 400 whose body is not such an object (not JSON, oversized,
+        or JSON without ``error``) raises ``HTTPError`` as before. Every other
+        non-2xx status -- 403, 429, 5xx -- raises ``HTTPError`` without its
+        body being read: a parsed 403 archive refusal (``-32602``) would be
+        ``NON_RETRYABLE`` and lose rotation, and a 429 must stay recognisable
+        as ``HTTPError (HTTP 429)``.
         """
         url = self.current_url
         r = self.session.post(url, json=payload, headers=self.headers, timeout=self.timeout, stream=True)
         try:
+            if r.status_code == HTTP_BAD_REQUEST:
+                body = self._json_error_body(r)
+                if body is not None:
+                    return body
             r.raise_for_status()
             return read_json_capped(r, self.max_response_bytes)
         except ResponseTooLarge:
@@ -257,9 +276,22 @@ class RpcClient:
         finally:
             r.close()
 
+    def _json_error_body(self, r) -> Optional[dict]:
+        """The body of the non-2xx response ``r`` if it is a JSON object with an
+        ``error`` key, else ``None`` (also when it is not JSON or is over
+        ``max_response_bytes`` -- the caller then raises the HTTP error)."""
+        try:
+            body = read_json_capped(r, self.max_response_bytes)
+        except ValueError:      # includes ResponseTooLarge
+            return None
+        return body if isinstance(body, dict) and body.get("error") is not None else None
+
     def _with_retry(self, payload, check: Callable[[object], Optional[str]]):
         """Post ``payload``, retrying (rotating URL, sleeping with backoff) while
-        ``check(body)`` returns a non-``None`` error message. Raises ``RpcError``
+        ``check(body)`` returns a non-``None`` error message. ``body`` is a
+        2xx response's decoded JSON, or an HTTP 400's JSON-RPC error object
+        (see ``_post``); any other non-2xx status reaches this loop as
+        ``requests.HTTPError`` instead and is retried as a transport failure. Raises ``RpcError``
         naming the last failure once ``retries`` attempts are exhausted, or
         immediately (no rotation, no sleep, no further attempts) if ``check``
         reports a ``NON_RETRYABLE`` error (or a range-too-large one, which

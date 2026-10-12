@@ -72,7 +72,10 @@ class Config:
     # (scheme://hostname, max block window) pairs; a tuple so Config stays hashable.
     rpc_window_hints: tuple[tuple[str, int], ...] = ()
     rpc_min_window: int = 50
-    rpc_min_interval: float = 0.2
+    # Seconds between eth_getLogs call starts (CLI default; LogFetcher's own is 0).
+    # nodies throttled at ~5 calls/s sustained during the 2026-10-12 back-fill
+    # (104 HTTP 429s), so 0.2 s was too tight.
+    rpc_min_interval: float = 0.5
     chunk_blocks: int = 2000
     user_agent: str = "robustrep/0.2 (+https://github.com/iamdongwang/robustrep)"
     confirmations: int = DEFAULT_CONFIRMATIONS

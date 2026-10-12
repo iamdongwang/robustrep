@@ -494,7 +494,7 @@ def test_fetch_rpc_url_and_confirmations_reach_config(tmp_path, monkeypatch):
     assert r.exit_code == 0, r.output
     assert seen["urls"] == ["https://a.example", "https://b.example"]
     assert seen["confirmations"] == 5
-    assert isinstance(seen["fetcher"], LogFetcher) and seen["fetcher"].min_interval == 0.2
+    assert isinstance(seen["fetcher"], LogFetcher) and seen["fetcher"].min_interval == 0.5
 
 
 def test_fetch_to_block_and_chunk_reach_sync_feedback(tmp_path, monkeypatch):

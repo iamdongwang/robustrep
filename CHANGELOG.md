@@ -37,7 +37,7 @@ what. Scoring is unchanged.
   `scores.json`; do not use an endpoint whose hostname embeds an account id or
   key.
 - **`Config` fields:** `rpc_window_hints` (tuple of `(host, cap)` pairs,
-  default empty), `rpc_min_window` (50) and `rpc_min_interval` (0.2 s between
+  default empty), `rpc_min_window` (50) and `rpc_min_interval` (0.5 s between
   call starts; this is the CLI default). The library default (`LogFetcher`'s
   `min_interval`) is 0; `RpcClient` has no pacing.
 - **`RpcRangeTooLargeError(endpoint, numbers)`**, raised immediately (no
@@ -78,6 +78,19 @@ what. Scoring is unchanged.
   2026-10-12). The test now reads the recorded errors through
   `Store.failed_ranges()` and classifies them with the same markers; a
   throttled sibling range can never hide a real one.
+- **JSON-RPC error bodies carried by HTTP 400 are now classified.**
+  base.drpc.org answers an over-cap `eth_getLogs` with HTTP 400 and a JSON-RPC
+  error (`ranges over 10000 blocks are not supported on free plan`).
+  `RpcClient` raised on the status before reading the body, so the range error
+  was never recognised and drpc's window was never learned; every rotation to
+  it re-sent a full-width request that failed. A 400 whose body is a JSON
+  object with an `error` now goes through the same classification as a 200
+  with an error (range too large, non-retryable, or retry and rotate). A 400
+  without such a body, and every 403, 429 and 5xx, is still an HTTP error as
+  before.
+- **Default CLI pacing is 0.5 s between `eth_getLogs` calls (was 0.2 s).** The
+  2026-10-12 back-fill showed nodies throttling at about 5 calls per second
+  sustained (104 HTTP 429s). `LogFetcher`'s library default stays 0.
 
 ### Rollback
 

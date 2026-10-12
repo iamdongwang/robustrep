@@ -31,11 +31,12 @@ class FakeRaw:
 class FakeResponse:
     status_code = 200
 
-    def __init__(self, body: bytes) -> None:
-        self.raw, self.closed = FakeRaw(body), False
+    def __init__(self, body: bytes, status_code: int = 200) -> None:
+        self.raw, self.closed, self.status_code = FakeRaw(body), False, status_code
 
     def raise_for_status(self) -> None:
-        pass
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
 
     def close(self) -> None:
         self.closed = True
@@ -45,7 +46,8 @@ class RoutingSession:
     """Fake ``requests.Session`` that dispatches each POST to ``handlers[url]``.
 
     A handler takes the JSON-RPC payload and returns a JSON object (serialized
-    as the response body) or returns/raises an ``Exception`` (raised from
+    as the response body), an ``("http", status, body)`` tuple (that JSON body
+    under a non-2xx status), or returns/raises an ``Exception`` (raised from
     ``post``). Every call is recorded in ``calls`` as ``(url, payload)``."""
 
     def __init__(self, handlers: dict[str, Callable[[dict], object]]) -> None:
@@ -58,6 +60,9 @@ class RoutingSession:
         r = self.handlers[url](json)
         if isinstance(r, Exception):
             raise r
+        if isinstance(r, tuple):
+            _, status, body = r
+            return FakeResponse(jsonlib.dumps(body).encode(), status_code=status)
         return FakeResponse(jsonlib.dumps(r).encode())
 
 
@@ -279,7 +284,7 @@ def test_from_config_clamps_min_window_to_chunk():
     rpc = make_client(["https://a"], RoutingSession({}))
     assert LogFetcher.from_config(rpc, Config(chunk_blocks=20)).min_window == 20
     f = LogFetcher.from_config(rpc, Config())
-    assert (f.max_window, f.min_window, f.min_interval) == (2000, 50, 0.2)
+    assert (f.max_window, f.min_window, f.min_interval) == (2000, 50, 0.5)
 
 
 def test_non_retryable_error_rotates_so_the_next_call_starts_on_another_host():
@@ -335,3 +340,23 @@ def test_from_config_clamps_hints_into_the_window_bounds():
     assert f.windows == {"https://h": 20}
     f = LogFetcher.from_config(rpc, Config(rpc_window_hints=(("https://h", 10), ("https://g", 9999))))
     assert f.windows == {"https://h": 50, "https://g": 2000}
+
+
+def test_drpc_style_http_400_range_error_teaches_the_window():
+    # base.drpc.org answers an over-cap eth_getLogs with HTTP 400 and a
+    # JSON-RPC error body; the fetcher must learn its window from it.
+    drpc_body = {"jsonrpc": "2.0", "id": 1,
+                 "error": {"message": "ranges over 10000 blocks are not supported on free plan", "code": 35}}
+
+    def drpc(p):
+        q = p["params"][0]
+        size = int(q["toBlock"], 16) - int(q["fromBlock"], 16) + 1
+        return ("http", 400, drpc_body) if size > 100 else {"result": []}
+
+    s = RoutingSession({"https://d": drpc})
+    f = LogFetcher(make_client(["https://d"], s), max_window=2000)
+    res = f.get_logs(0, 1999, FILTER)
+    assert res.logs == []
+    sizes = [b - a + 1 for a, b in getlogs_ranges(s, "https://d")]
+    assert sizes[:6] == [2000, 1000, 500, 250, 125, 62]
+    assert f.windows["https://d"] == 62
