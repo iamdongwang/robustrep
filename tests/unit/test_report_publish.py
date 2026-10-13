@@ -410,3 +410,25 @@ def test_rpc_sources_from_sync_sources():
         "recorded_from_block": 100,
     }
     assert list(config)[-1] == "rpc_sources"
+
+
+# --- 0.2.2 owner pass: funder_kind_counts provenance ------------------------------
+
+
+def test_funder_kind_counts_unavailable_without_store():
+    from robustrep import Config
+
+    config = publish.build_provenance("onchain", Config(), _one_record())["config"]
+    assert config["funder_kind_counts"] == publish.UNAVAILABLE
+
+
+def test_funder_kind_counts_published_as_given_before_rpc_sources():
+    from robustrep import Config
+
+    counts = {"transfer": 12870, "owner": 5100, "none": 240, "unknown": 0}
+    config = publish.build_provenance("onchain", Config(), _one_record(), funder_kind_counts=counts)["config"]
+    assert config["funder_kind_counts"] == counts
+    assert config["funder_kind_counts"] is not counts  # a copy: provenance never aliases store state
+    keys = list(config)
+    assert keys.index("funder_kind_counts") == keys.index("rpc_sources") - 1
+    assert keys[-1] == "rpc_sources"

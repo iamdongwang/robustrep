@@ -185,11 +185,25 @@ def _rpc_sources_for_provenance(sync_sources: Optional[SyncSources]) -> Union[st
     }
 
 
+def _funder_kind_counts_for_provenance(counts: Optional[dict]) -> Union[str, dict]:
+    """`config["funder_kind_counts"]`: how many rater rows each funder rule
+    produced (`Store.funder_kind_counts`: ``transfer``/``owner``/``none``, plus
+    ``unknown`` for rows the owner pass has not reached), or `UNAVAILABLE`
+    when there is no store to count from. Published because the two rules
+    link raters differently -- a shared controlling key versus a shared first
+    funder -- so a reader comparing two reports' clusters needs to know how
+    much of each store was linked by which rule. Copied, never aliased."""
+    if counts is None:
+        return UNAVAILABLE
+    return {str(kind): int(n) for kind, n in counts.items()}
+
+
 def build_provenance(mode: str, cfg: Config, records: pandas.DataFrame,
                 result: Optional[pandas.DataFrame] = None,
                 n_lookup_budget_starved: int = 0,
                 evidence_caps: Optional[dict] = None,
-                sync_sources: Optional[SyncSources] = None) -> dict:
+                sync_sources: Optional[SyncSources] = None,
+                funder_kind_counts: Optional[dict] = None) -> dict:
     caps = evidence_caps if evidence_caps is not None else evidence_caps_for_provenance(None)
     config = dict(
         bootstrap_n=cfg.bootstrap_n,
@@ -217,6 +231,9 @@ def build_provenance(mode: str, cfg: Config, records: pandas.DataFrame,
         # caller with no store to count from (e.g. `build_provenance` called
         # directly on an in-memory `records` frame, as several tests do).
         evidence_lookup_starved_uris=n_lookup_budget_starved,
+        # Which funder rule produced each rater row (Store.funder_kind_counts);
+        # UNAVAILABLE for a caller with no store.
+        funder_kind_counts=_funder_kind_counts_for_provenance(funder_kind_counts),
         # Which RPC endpoints served the logs, per Store.sync_sources. Last,
         # and UNAVAILABLE (not an empty list) when this store never recorded
         # a source: "not recorded" and "recorded, nothing" are different claims.

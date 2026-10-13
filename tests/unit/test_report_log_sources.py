@@ -107,3 +107,52 @@ def test_render_log_sources_host_without_hostname_reads_unknown_host(records_fac
     bad = dict(_TWO_SOURCES, sources=[dict(_TWO_SOURCES["sources"][0], host="not-a-url")])
     md = _render_with_config(records_factory, {"rpc_sources": bad})
     assert "- Log sources: unknown host (blocks 51,322,404\u201352,507,435," in md
+
+
+# --- 0.2.2 owner pass: "Funder kinds" Provenance line and the linking limitation --
+
+_COUNTS = {"transfer": 12870, "owner": 5100, "none": 240, "unknown": 0}
+
+
+def test_render_funder_kinds_line(records_factory):
+    md = _render_with_config(records_factory, {"funder_kind_counts": _COUNTS})
+    assert "- Funder kinds: transfer 12,870; owner 5,100; none 240; unknown 0" in md
+    assert "`funder_kind_counts`" not in md and "{'transfer'" not in md
+
+
+@pytest.mark.parametrize("config", [{}, {"funder_kind_counts": "unavailable"}], ids=["missing", "unavailable"])
+def test_render_funder_kinds_not_recorded(records_factory, config):
+    md = _render_with_config(records_factory, config)
+    assert "- Funder kinds: not recorded." in md
+    assert "`funder_kind_counts`" not in md
+
+
+def test_funder_kinds_line_sits_in_provenance_after_the_profile_mode(records_factory):
+    md = _render_with_config(records_factory, {"funder_kind_counts": _COUNTS})
+    lines = md.splitlines()
+    prov = lines.index("## Provenance")
+    mode = next(i for i, l in enumerate(lines) if l.startswith("- Rater profile mode:"))
+    kinds = next(i for i, l in enumerate(lines) if l.startswith("- Funder kinds:"))
+    logs = next(i for i, l in enumerate(lines) if l.startswith("- Log sources:"))
+    assert prov < mode < kinds < logs
+
+
+def test_render_limitations_state_controlling_key_linking(records_factory):
+    md = _render_with_config(records_factory, {})
+    bullet = next(line for line in md.splitlines() if "Controlling-key linking" in line)
+    for phrase in ("no incoming transfer", "ownerAtIndex", "owner()", "one cluster", "bundler", "paymaster",
+                   "shared infrastructure", "passkey", "unlinked", "funder_kind"):
+        assert phrase in bullet, phrase
+    lowered = bullet.lower()
+    for banned in ("cheat", "fraud", "attacker", "intent", "detect"):
+        assert banned not in lowered, banned
+
+
+def test_controlling_key_bullet_precedes_the_log_source_limitation(records_factory):
+    md = _render_with_config(records_factory, {})
+    lines = md.splitlines()
+    end = lines.index("## Provenance")
+    bullets = [l for l in lines[lines.index("## Limitations"):end] if l.startswith("- ")]
+    idx = next(i for i, b in enumerate(bullets) if "Controlling-key linking" in b)
+    assert idx == 2  # right after the two clustering bullets
+    assert bullets[-1].startswith("- **Log sources not cross-checked.**")

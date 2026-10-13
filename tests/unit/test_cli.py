@@ -1934,3 +1934,16 @@ def test_step_raters_offline_fallback_line_has_no_funder_kinds(tmp_path, monkeyp
         line = cli._step_raters(store, None, profile_source="none", rpc=object())
     assert "funder kinds" not in line
     assert "rows not written" in line
+
+
+def test_report_publishes_the_store_funder_kind_counts(tmp_path):
+    db, out = tmp_path / "t.db", tmp_path / "reports"
+    _seed(db, n=4)  # four raters profiled with a timestamp and no funder: legacy NULL kind
+    with Store(db) as store:
+        store.upsert_rater("0x" + "e" * 40, None, "0x" + "f" * 40, "owner")
+    r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out), "--bootstrap-n", "5"])
+    assert r.exit_code == 0, r.output
+    md = (out / "latest" / "report.md").read_text()
+    assert "- Funder kinds: transfer 0; owner 1; none 0; unknown 4" in md
+    config = json.loads((out / "latest" / "scores.json").read_text())["config"]
+    assert config["funder_kind_counts"] == {"transfer": 0, "owner": 1, "none": 0, "unknown": 4}

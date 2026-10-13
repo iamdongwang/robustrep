@@ -43,6 +43,18 @@ The Alchemy key is read from the environment only (no flag), redacted from urlli
 from robustrep's own log records that echo server text, and never appears in an error message —
 Alchemy puts it in the request URL's path, so nothing that quotes a URL is ever raised or logged.
 
+A rater's `funder` is "who controls or funded it", by one of two rules, recorded per row in
+`raters.funder_kind`. `transfer`: the `from` of the address's first incoming transfer (the original
+rule). `owner`: since October 2026 nearly every new rater on Base is a smart-contract account that
+never received a transfer (230/230 sampled on 2026-10-13; 55/60 are Coinbase Smart Wallets), so
+`fetch` runs a second pass that reads the account's controlling key over plain RPC (`ownerAtIndex(0..3)`,
+then `owner()`) and stores it as the funder — on the sampled wallets 55 accounts resolved to only
+4 keys. Wallets sharing a key cluster exactly as wallets sharing a first funder do; the bundlers and
+paymaster behind their first transactions are shared infrastructure and are never used. An account
+with no owner is retried through Alchemy with internal transfers admitted, and what is still
+unresolved is marked `none` (passkey-controlled accounts land here) and not looked up again. The
+report's Provenance lists the row count per kind.
+
 Latest scores: `reports/latest/scores.json`, also served at
 https://iamdongwang.github.io/robustrep/reports/latest/scores.json
 

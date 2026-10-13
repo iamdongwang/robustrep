@@ -236,9 +236,24 @@ _LOG_SOURCE_LIMITATION = (
     "fixture window."
 )
 
-# Rendered by `_log_source_lines`, so `_provenance_config_lines` does not dump
-# the raw structure as well.
+# Rendered by `_log_source_lines` / `_funder_kind_lines`, so
+# `_provenance_config_lines` does not dump the raw structures as well.
 _RPC_SOURCES_KEY = "rpc_sources"
+_FUNDER_KIND_COUNTS_KEY = "funder_kind_counts"
+_RENDERED_SEPARATELY = frozenset({_RPC_SOURCES_KEY, _FUNDER_KIND_COUNTS_KEY})
+
+
+def _funder_kind_lines(config: dict) -> list[str]:
+    """The "Funder kinds" line of the Provenance block, from
+    `config["funder_kind_counts"]` (see `report.publish.
+    _funder_kind_counts_for_provenance`): how many rater rows were linked by
+    each funder rule -- `transfer` (first incoming transfer), `owner` (the
+    smart account's controlling key), `none` (neither found) and `unknown`
+    (rows the owner pass has not reached)."""
+    counts = config.get(_FUNDER_KIND_COUNTS_KEY)
+    if not isinstance(counts, dict):
+        return ["- Funder kinds: not recorded."]
+    return ["- Funder kinds: " + "; ".join(f"{kind} {int(n):,}" for kind, n in counts.items())]
 
 
 def _log_source_lines(config: dict) -> list[str]:
@@ -267,12 +282,12 @@ def _provenance_config_lines(config: dict) -> list:
     Nothing is dropped. The previous hardcoded key tuple silently omitted
     `evidence_level_shares` -- published in scores.json, absent from report.md
     -- and would have omitted every key added after it in the same way. The
-    one exception is `rpc_sources`, rendered readably by `_log_source_lines`
-    instead of as a raw dict.
+    exceptions are `rpc_sources` and `funder_kind_counts`, rendered readably
+    by `_log_source_lines` / `_funder_kind_lines` instead of as raw dicts.
     """
     if not config:
         return []
-    known = [key for key in PROVENANCE_KEYS if key in config and key != _RPC_SOURCES_KEY]
+    known = [key for key in PROVENANCE_KEYS if key in config and key not in _RENDERED_SEPARATELY]
     extra = sorted(key for key in config if key not in set(PROVENANCE_KEYS))
     return ["- Scoring configuration used:"] + [f"  - `{key}`: {config[key]}"
                                                 for key in known + extra]
@@ -403,6 +418,22 @@ _LARGE_RATEE_GROUP_BULLET = (
 )
 
 
+# The funder signal has two rules since 0.2.2 (see `robustrep.sources.account_owner`);
+# this bullet describes the mechanism and its reach, nothing about anyone's purpose.
+_CONTROLLING_KEY_BULLET = (
+    "- **Controlling-key linking.** Most new raters are smart-contract accounts with no "
+    "incoming transfer (230/230 sampled 2026-10-13), so no first funder exists for them. "
+    "Such a rater is linked instead by the key that controls the account (`ownerAtIndex`, "
+    "then `owner()`), stored as its funder with `funder_kind` = `owner`: wallets sharing a "
+    "controlling key count as one cluster, exactly as wallets sharing a first funder do. "
+    "The bundlers and paymaster that carry these accounts' first transactions are "
+    "deliberately not used -- they are shared infrastructure common to unrelated raters. "
+    "Accounts controlled by a passkey expose no comparable key and stay unlinked "
+    "(`funder_kind` = `none`); the Funder kinds line in Provenance says how many rows "
+    "each rule produced."
+)
+
+
 _DNS_REBINDING_BULLET = (
     "- **DNS rebinding in the evidence fetcher (the residual unmitigated gap in v0.1).** "
     "The SSRF guard resolves an evidence URI's host and checks *those* addresses, but "
@@ -459,6 +490,7 @@ def _limitations_lines(scores: pd.DataFrame, prov: dict, config: dict) -> list[s
         "## Limitations",
         _CLUSTERING_EVASION_BULLET,
         _LARGE_RATEE_GROUP_BULLET,
+        _CONTROLLING_KEY_BULLET,
         *_budget_limit_lines(scores, prov),
         _DNS_REBINDING_BULLET,
         _TWO_TAG_BULLET,
@@ -475,6 +507,7 @@ def _provenance_lines(prov: dict, config: dict) -> list[str]:
     lines.append(f"- Rater profile mode: {prov.get('rater_profile_mode', 'unknown')}")
     lines.append(f"- Confirmations lag (data cut is final as of this block): "
                  f"{prov.get('confirmations', 'unknown')}")
+    lines += _funder_kind_lines(config)
     lines += _log_source_lines(config)
     lines += _provenance_config_lines(config)
     versions = prov.get("versions") or {}

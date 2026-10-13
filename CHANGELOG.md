@@ -4,6 +4,54 @@ All notable changes to robustrep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0,
 so a `0.x` bump may change published numbers without changing the API.
 
+## [Unreleased]
+
+Since October 2026 the new ERC-8004 raters on Base are almost all
+smart-contract accounts: of 230 sampled unprofiled raters (2026-10-13),
+230/230 had code and none had ever received a transfer, so no profile
+source can name a first funder for them. 55 of 60 inspected are Coinbase
+Smart Wallet proxies whose first transactions go through the ERC-4337
+EntryPoint, sent by ~10 bundlers and sponsored by one paymaster -- shared
+infrastructure, not a signal. `ownerAtIndex(0)` on those 55 wallets returns
+only 4 distinct controlling keys (26/14/11/4). Scoring is unchanged; what
+changes is which raters the funder signal can link.
+
+### Added
+
+- **Owner lookup (`robustrep/sources/account_owner.py`).** For a rater
+  whose first-transfer lookup found nothing, `fetch` reads the smart
+  account's controlling key over plain RPC -- `ownerAtIndex(0..3)` (Coinbase
+  Smart Wallet; a 32-byte address payload is the owner, a 64-byte payload is
+  a passkey and yields nothing, an empty slot moves to the next index), then
+  `owner()` -- batched 50 addresses per JSON-RPC batch with the same
+  per-address fallback as agent-owner resolution. A revert means the
+  selector is absent; any other RPC error fails the chunk and leaves its
+  rows for the next run. The key is stored in `raters.funder`, so sybil
+  clustering links wallets sharing a controlling key exactly as it links
+  wallets sharing a first funder; `first_seen_ts` stays NULL for such rows
+  (clustering falls back to the earliest feedback time; caching that
+  approximation would break the M4 rule).
+- **`raters.funder_kind`:** `transfer` (first incoming transfer), `owner`
+  (controlling key), `none` (every lookup tried, nothing found; never
+  retried) or NULL (legacy row: only the transfer lookup ran). Opening a
+  pre-0.2.2 store adds the column and marks existing funders `transfer`
+  once; `Store.upsert_rater` takes the kind, `raters_needing_owner_lookup`
+  and `funder_kind_counts` are new.
+- **Internal-transfer retry.** An address with no owner is retried through
+  Alchemy with `category: ["external", "internal"]`
+  (`AlchemyClient.first_tx(categories=...)`) before being marked `none`.
+- **Provenance `funder_kind_counts`** (in `scores.json` and as the
+  `Funder kinds` line of `report.md`), a `Controlling-key linking`
+  Limitations bullet, and the `fetch` summary line's per-run funder-kind
+  counts.
+
+### Changed
+
+- **Meaning of `funder`:** "who funded the address" becomes "who controls
+  or funded it". The sybil comparison (equality of the normalised funder)
+  is unchanged, so an existing store keeps its clusters and gains the
+  owner-linked ones on the next `fetch`.
+
 ## [0.2.1] — 2026-10-13
 
 Blockscout's free tier stopped serving Base: its developer portal states

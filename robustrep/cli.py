@@ -573,6 +573,9 @@ def report(
             evidence_caps = evidence_caps_for_provenance(store)
             # And which RPC endpoints served the logs, from this store's sync_log.
             sync_sources = store.sync_sources()
+            # And how many rater rows each funder rule produced (transfer /
+            # owner / none / unknown), so the clusters can be read against it.
+            funder_kind_counts = store.funder_kind_counts()
         block = int(last_block) if last_block is not None else 0
         # Inside the guard: sensitivity_table re-scores the whole dataset once
         # per variant, so any ValueError scoring can raise, it can raise too.
@@ -585,7 +588,8 @@ def report(
     provenance = build_provenance(mode, cfg, records, result,
                               n_lookup_budget_starved=n_lookup_budget_starved,
                               evidence_caps=evidence_caps,
-                              sync_sources=sync_sources)
+                              sync_sources=sync_sources,
+                              funder_kind_counts=funder_kind_counts)
 
     block_dir = out_dir / str(block)
     # Guarded like the scoring above: `export_json` refuses an address-bearing
