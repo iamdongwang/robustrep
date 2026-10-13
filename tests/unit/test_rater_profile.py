@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 import requests
 
-from robustrep.sources import http_util, rater_profile
+from robustrep.sources import http_util, profile_http, rater_profile
 from robustrep.sources.rater_profile import (
     BLOCKSCOUT_BASE,
     BLOCKSCOUT_V2_BASE,
@@ -496,9 +496,9 @@ def test_first_tx_unparseable_timestamp_returns_none_with_one_warning(caplog):
     # not raise either -- the address simply goes unprofiled.
     http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "not-a-number", "from": "0xF"}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
-    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
+    warnings = _warnings(caplog, "robustrep.sources.profile_http")
     assert len(warnings) == 1
     assert "not-a-number" in warnings[0].getMessage() and "0xa" in warnings[0].getMessage()
 
@@ -1220,7 +1220,7 @@ def test_max_profile_response_bytes_is_8_mib():
 
 
 def test_etherscan_oversized_body_raises_without_leaking_key_or_body(caplog, monkeypatch):
-    monkeypatch.setattr(rater_profile, "MAX_PROFILE_RESPONSE_BYTES", 1024)
+    monkeypatch.setattr(profile_http, "MAX_PROFILE_RESPONSE_BYTES", 1024)
     http = FakeHttp([b'{"status": "1", "leak": "' + b"SECRETBODY" * 2000 + b'"}'])
     c = EtherscanClient("SECRET-KEY-VALUE", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.DEBUG):
@@ -1233,7 +1233,7 @@ def test_etherscan_oversized_body_raises_without_leaking_key_or_body(caplog, mon
 
 
 def test_etherscan_oversized_body_is_not_retried(monkeypatch):
-    monkeypatch.setattr(rater_profile, "MAX_PROFILE_RESPONSE_BYTES", 1024)
+    monkeypatch.setattr(profile_http, "MAX_PROFILE_RESPONSE_BYTES", 1024)
     http = FakeHttp([b"x" * 200_000] * 3)
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None, retries=3)
     with pytest.raises(RuntimeError):
@@ -1250,7 +1250,7 @@ def test_blockscout_v2_streams_the_response():
 
 
 def test_blockscout_v2_oversized_body_raises_without_leaking_body(monkeypatch):
-    monkeypatch.setattr(rater_profile, "MAX_PROFILE_RESPONSE_BYTES", 1024)
+    monkeypatch.setattr(profile_http, "MAX_PROFILE_RESPONSE_BYTES", 1024)
     http = FakeV2Http([b'{"items": [], "leak": "' + b"SECRETBODY" * 2000 + b'"}'])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
     with pytest.raises(RuntimeError) as exc:
@@ -1265,9 +1265,9 @@ def test_blockscout_v2_oversized_body_raises_without_leaking_body(monkeypatch):
 def test_etherscan_negative_timestamp_returns_none_with_one_warning(caplog):
     http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-1", "from": "0xF"}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
-    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
+    warnings = _warnings(caplog, "robustrep.sources.profile_http")
     assert len(warnings) == 1 and "'-1'" in warnings[0].getMessage()
 
 
@@ -1291,27 +1291,27 @@ def test_max_plausible_ts_is_2100_01_01():
 def test_blockscout_pre_1970_timestamp_returns_none_with_one_warning(caplog):
     body = {"items": [bs_tx("0x1", 1, "1900-01-01T00:00:00Z", "0xf")], "next_page_params": None}
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
-    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
+    warnings = _warnings(caplog, "robustrep.sources.profile_http")
     assert len(warnings) == 1 and "1900-01-01" in warnings[0].getMessage()
 
 
 def test_blockscout_far_future_timestamp_returns_none_with_one_warning(caplog):
     body = {"items": [bs_tx("0x1", 1, "2200-01-01T00:00:00Z", "0xf")], "next_page_params": None}
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
-    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
+    warnings = _warnings(caplog, "robustrep.sources.profile_http")
     assert len(warnings) == 1 and "2200-01-01" in warnings[0].getMessage()
 
 
 def test_blockscout_garbage_timestamp_returns_none_with_one_warning(caplog):
     body = {"items": [bs_tx("0x1", 1, "garbage", "0xf")], "next_page_params": None}
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
-    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
+    warnings = _warnings(caplog, "robustrep.sources.profile_http")
     assert len(warnings) == 1 and "garbage" in warnings[0].getMessage()
 
 
@@ -1384,18 +1384,18 @@ def test_etherscan_overflowing_timestamp_returns_none_with_one_warning(caplog):
     http = FakeHttp([b'{"status": "1", "result": [{"blockNumber": "3", "timeStamp": 1e400, '
                      b'"from": "0xF"}]}'])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
-    assert len(_warnings(caplog, "robustrep.sources.rater_profile")) == 1
+    assert len(_warnings(caplog, "robustrep.sources.profile_http")) == 1
 
 
 def test_etherscan_infinity_string_timestamp_returns_none_with_one_warning(caplog):
     http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "Infinity",
                                                   "from": "0xF"}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
-    with caplog.at_level(logging.WARNING, logger="robustrep.sources.rater_profile"):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
-    warnings = _warnings(caplog, "robustrep.sources.rater_profile")
+    warnings = _warnings(caplog, "robustrep.sources.profile_http")
     assert len(warnings) == 1 and "Infinity" in warnings[0].getMessage()
 
 

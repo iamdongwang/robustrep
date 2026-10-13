@@ -33,21 +33,29 @@ permanently stuck with the approximate value. ``enrich_raters`` records which
 mode ran via ``Store.set_sync("rater_profile_mode", ...)`` so downstream
 reports can state which mode produced the profile.
 
-Both clients treat their remote as hostile, per the security review:
+Both clients treat their remote as hostile, per the security review. The
+rules they share with every other rater-profile client (``alchemy_profile``
+included) live in ``profile_http`` and are applied through its helpers:
 
 - **M1** -- an Etherscan API key must never reach a log. The key already stays
-  out of this module's own messages, but ``urllib3`` logs the whole request
-  line (query string included) at DEBUG, so ``EtherscanClient`` installs an
-  ``http_util.install_key_redaction`` filter on urllib3's loggers.
-- **M2** -- response bodies are read through ``http_util.read_json_capped``
-  with an 8 MiB cap instead of ``requests``' unbounded ``Response.json()``.
+  out of this module's own messages (``profile_http.status_code`` is the only
+  thing read off a ``requests`` exception), but ``urllib3`` logs the whole
+  request line (query string included) at DEBUG, so ``EtherscanClient``
+  installs an ``http_util.install_key_redaction`` filter on urllib3's loggers.
+- **M2** -- response bodies are read through ``profile_http.capped_json``
+  (over ``http_util.read_json_capped``) with an 8 MiB cap instead of
+  ``requests``' unbounded ``Response.json()``.
 - **M4** -- a first-transaction timestamp that is not a plausible epoch second
-  (``<= 0`` or past ``MAX_PLAUSIBLE_TS``) is refused rather than cached: one
-  bad value written to the raters table makes ``robustrep.sybil._validate_meta``
-  raise on every later ``score``/``report`` run.
+  (``<= 0`` or past ``profile_http.MAX_PLAUSIBLE_TS``) is refused rather than
+  cached (``profile_http.plausible_ts``/``implausible``): one bad value written
+  to the raters table makes ``robustrep.sybil._validate_meta`` raise on every
+  later ``score``/``report`` run.
 - **L5** -- Blockscout's ``next_page_params`` are echoed back as query params
   on the next request, so they are allowlisted (see
   ``blockscout_util.safe_next_page_params``) rather than forwarded verbatim.
+
+``MAX_PLAUSIBLE_TS``, ``MAX_PROFILE_RESPONSE_BYTES`` and ``ProfilePlanError``
+are re-exported here for callers that import them from this module.
 """
 from __future__ import annotations
 
@@ -60,7 +68,20 @@ import requests
 
 from ..store import Store
 from . import blockscout_util
-from .http_util import ResponseTooLarge, install_key_redaction, read_json_capped, short_for_log
+from .http_util import install_key_redaction
+from .profile_http import (
+    MAX_PLAUSIBLE_TS,
+    MAX_PROFILE_RESPONSE_BYTES,
+    ProfilePlanError,
+    capped_json,
+    implausible,
+    is_transient_http,
+    plausible_ts,
+    raise_exhausted,
+    retry_after_seconds,
+    status_code,
+    warn_bad_ts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,130 +138,12 @@ _NOT_FOUND = object()
 _BLOCKSCOUT_V2_FILTER = {"filter": "to"}
 
 
-# Largest profile-API response body ever buffered (M2). A first-transaction
-# lookup asks for one page of one address's transactions; anything past this
-# is a broken or hostile endpoint, not a bigger answer worth parsing.
-MAX_PROFILE_RESPONSE_BYTES = 8 * 1024 * 1024
-
-# Upper bound on a plausible first-transaction timestamp: 2100-01-01T00:00:00Z
-# (M4). Anything above this -- or at/below zero -- is a third-party bug or an
-# attempt to poison the raters cache, not a real epoch second.
-MAX_PLAUSIBLE_TS = 4102444800
-
-
-def _warn_bad_ts(address: str, value) -> None:
-    """One WARNING for a first-transaction timestamp this pipeline refuses to
-    cache (M4). Both the address and the offending value are attacker-influenced,
-    so both are logged with ``%r``."""
-    logger.warning("rater_profile: implausible first-tx timestamp for %r: %r - leaving address unprofiled",
-                    address, short_for_log(value))
-
-
-def _implausible(ts: Optional[int]) -> bool:
-    """True for a timestamp that must never reach ``Store.upsert_rater``: one
-    negative/zero or past ``MAX_PLAUSIBLE_TS`` wedges every later ``score``/
-    ``report`` run (``robustrep.sybil._validate_meta`` raises on it, and there
-    is no way to un-cache it short of ``fetch --reprofile-raters``)."""
-    return ts is None or ts <= 0 or ts > MAX_PLAUSIBLE_TS
-
-
-def _plausible_ts(value, address: str) -> Optional[int]:
-    """``value`` as epoch seconds, or ``None`` (with one WARNING) if it is
-    unparseable or implausible -- see ``_implausible`` (M4)."""
-    try:
-        ts = int(value)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError: JSON's 1e400 is standards-conformant and decodes to
-        # float("inf"), which int() refuses (I2).
-        ts = None
-    if _implausible(ts):
-        _warn_bad_ts(address, value)
-        return None
-    return ts
-
-
-def _capped_json(r, address: str, label: str):
-    """Decode a streamed response body, refusing to buffer more than
-    ``MAX_PROFILE_RESPONSE_BYTES`` (M2).
-
-    An oversized body raises ``RuntimeError`` immediately -- the same
-    non-retryable, scrubbed error path both clients already use for a
-    permanent HTTP rejection, naming only the label and the target address so
-    neither the API key nor any body text can reach a log. A body that simply
-    is not JSON still raises ``ValueError``, which callers keep treating as a
-    transient failure."""
-    try:
-        return read_json_capped(r, MAX_PROFILE_RESPONSE_BYTES)
-    except ResponseTooLarge:
-        raise RuntimeError(f"{label} response for {address} exceeds the "
-                           f"{MAX_PROFILE_RESPONSE_BYTES} byte limit") from None
-
-
-def _exhausted(label: str, address: str, last_kind: str, last_status, retries: int):
-    """Raise the terminal error for an address whose every attempt failed.
-
-    ``ValueError`` when the last attempt's body never parsed as JSON,
-    ``RuntimeError`` otherwise (naming the last HTTP status, or ``n/a`` when
-    the failures never produced a response). Shared by both clients so they
-    stay identical in the one respect that matters: the message carries only
-    the source label, the address and a status code -- never the request URL
-    or params (which carry the API key) and never any body text."""
-    if last_kind == "json":
-        raise ValueError(f"non-JSON {label} response for {address}")
-    status_label = last_status if last_status is not None else "n/a"
-    raise RuntimeError(f"{label} HTTP error for {address} after {retries} attempts "
-                        f"(status {status_label})")
-
-
-def _status_code(e: requests.RequestException) -> Optional[int]:
-    """HTTP status code carried by a ``requests`` exception, or ``None`` if
-    the failure happened before any response was received (connection
-    error, timeout). Shared by ``EtherscanClient`` and ``BlockscoutV2Client``."""
-    resp = getattr(e, "response", None)
-    return getattr(resp, "status_code", None) if resp is not None else None
-
-
-def _is_transient_http(code: Optional[int]) -> bool:
-    """429 and 5xx are transient; so is no response at all (connection
-    errors, timeouts); any other HTTP status is a permanent rejection."""
-    if code is None:
-        return True
-    return code == 429 or 500 <= code < 600
-
-
-# Longest backoff sleep honored from a 429 response's Retry-After header,
-# in seconds -- caps a misbehaving/adversarial server from stalling a run.
-_RETRY_AFTER_CAP = 60.0
-
-
-def _retry_after_seconds(e: requests.RequestException) -> Optional[float]:
-    """Seconds named by the response's ``Retry-After`` header, capped at
-    ``_RETRY_AFTER_CAP``, or ``None`` if there is no response, no such
-    header, or its value isn't a non-negative number. Only the numeric
-    (seconds) form of the header is honored -- the HTTP-date form is
-    ignored rather than trusted to `sleep()` against a possibly-skewed
-    remote clock."""
-    resp = getattr(e, "response", None)
-    if resp is None:
-        return None
-    value = resp.headers.get("Retry-After")
-    if value is None:
-        return None
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        return None
-    if seconds < 0:
-        return None
-    return min(seconds, _RETRY_AFTER_CAP)
-
-
-class EtherscanPlanError(RuntimeError):
+class EtherscanPlanError(ProfilePlanError):
     """The configured Etherscan API plan does not cover this chain (e.g. the
     free plan does not support Base via the V2 API). Non-retryable: no
     number of retries or different address fixes this, only a different
-    plan or a different ``--profile-source``. ``enrich_raters`` treats this
-    specially -- see its docstring."""
+    plan or a different ``--profile-source``. A ``ProfilePlanError``, so
+    ``enrich_raters`` treats it specially -- see its docstring."""
 
 
 class EtherscanClient:
@@ -255,7 +158,7 @@ class EtherscanClient:
     HTTP 429/5xx, connection/timeout errors, a non-JSON body, or a rate-limit
     message -- are retried up to ``retries`` times with exponential backoff
     (a 429 whose response carries a ``Retry-After`` header uses that instead,
-    capped at 60s -- see ``_retry_after_seconds``); any other HTTP 4xx, an
+    capped at 60s -- see ``profile_http.retry_after_seconds``); any other HTTP 4xx, an
     invalid API key, an unsupported plan, or a malformed address raise
     immediately, without consuming a retry. A per-request throttle sleep
     (``1/rps``) runs after every attempt regardless of outcome, so the
@@ -333,10 +236,10 @@ class EtherscanClient:
                         raise RuntimeError(f"Etherscan HTTP {code} for {address}") from None
                     transient, last_status, last_kind = True, code, "http"
                     if code == 429:
-                        retry_after = _retry_after_seconds(e)
+                        retry_after = retry_after_seconds(e)
                 else:
                     try:
-                        body = _capped_json(r, address, "Etherscan")
+                        body = capped_json(r, address, "Etherscan")
                     except ValueError:
                         transient, last_kind = True, "json"
                     else:
@@ -361,7 +264,7 @@ class EtherscanClient:
                 # exponential backoff, when the server told us how long to wait.
                 self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
 
-        _exhausted("Etherscan", address, last_kind, last_status, self.retries)
+        raise_exhausted("Etherscan", address, last_kind, last_status, self.retries)
 
     def _params(self, address: str) -> dict:
         """Query params for one ``txlist`` lookup. The API key appears here and
@@ -409,17 +312,17 @@ class EtherscanClient:
 
     @staticmethod
     def _status_code(e: requests.RequestException) -> Optional[int]:
-        return _status_code(e)
+        return status_code(e)
 
     @staticmethod
     def _is_transient_http(code: Optional[int]) -> bool:
-        return _is_transient_http(code)
+        return is_transient_http(code)
 
     @staticmethod
     def _parse_tx(tx: dict, address: str) -> Optional[tuple[int, int, str]]:
         """``(block, ts, funder)`` for one Etherscan tx entry, or ``None`` when
         its ``timeStamp`` is unparseable or implausible (M4 -- see
-        ``_plausible_ts``: refusing the profile keeps a poisoned value out of
+        ``profile_http.plausible_ts``: refusing the profile keeps a poisoned value out of
         the raters cache, where it would wedge every later scoring run).
         Still raises ``ValueError`` for an entry missing the fields every tx
         has -- that is a malformed response, not a suspect value."""
@@ -429,7 +332,7 @@ class EtherscanClient:
             frm = str(tx["from"]).lower()
         except (KeyError, TypeError, ValueError, OverflowError) as e:
             raise ValueError(f"malformed Etherscan tx entry for {address}: {e}") from e
-        ts = _plausible_ts(raw_ts, address)
+        ts = plausible_ts(raw_ts, address)
         return None if ts is None else (block, ts, frm)
 
 
@@ -542,17 +445,17 @@ class BlockscoutV2Client:
                     r = self.session.get(url, params=params, timeout=30, stream=True)
                     r.raise_for_status()
                 except requests.RequestException as e:
-                    code = _status_code(e)
+                    code = status_code(e)
                     if code == 404:
                         return _NOT_FOUND
-                    if not _is_transient_http(code):
+                    if not is_transient_http(code):
                         raise RuntimeError(f"Blockscout HTTP {code} for {address}") from None
                     transient, last_status, last_kind = True, code, "http"
                     if code == 429:
-                        retry_after = _retry_after_seconds(e)
+                        retry_after = retry_after_seconds(e)
                 else:
                     try:
-                        body = _capped_json(r, address, "Blockscout")
+                        body = capped_json(r, address, "Blockscout")
                     except ValueError:
                         transient, last_kind = True, "json"
                     else:
@@ -573,7 +476,7 @@ class BlockscoutV2Client:
                 # exponential backoff, when the server told us how long to wait.
                 self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
 
-        _exhausted("Blockscout", address, last_kind, last_status, self.retries)
+        raise_exhausted("Blockscout", address, last_kind, last_status, self.retries)
 
     @staticmethod
     def _parse_tx(tx: dict, address: str) -> Optional[tuple[int, int, str]]:
@@ -593,12 +496,12 @@ class BlockscoutV2Client:
 
 def _parse_blockscout_timestamp(ts, address: str) -> Optional[int]:
     """Epoch seconds for a Blockscout ISO8601 timestamp, or ``None`` (with one
-    WARNING) if it is unparseable or implausible -- see ``_implausible`` (M4).
+    WARNING) if it is unparseable or implausible -- see ``profile_http.implausible`` (M4).
     The parsing itself lives in ``blockscout_util.parse_timestamp``; what is
     decided here is whether the result is a value we are willing to cache."""
     epoch = blockscout_util.parse_timestamp(ts)
-    if epoch is None or _implausible(epoch):
-        _warn_bad_ts(address, ts)
+    if epoch is None or implausible(epoch):
+        warn_bad_ts(address, ts)
         return None
     return epoch
 
@@ -686,9 +589,9 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
     attribute, for compatibility with simple duck-typed test doubles) when
     every address succeeded, or ``"<source>-partial"`` when some failed.
 
-    Exception: if the *first* address attempted raises ``EtherscanPlanError``
-    (the configured Etherscan plan does not cover this chain -- see its
-    docstring), that error is re-raised immediately instead of being counted
+    Exception: if the *first* address attempted raises ``ProfilePlanError``
+    (the configured plan/key/network cannot serve this chain -- see
+    ``profile_http.ProfilePlanError``; ``EtherscanPlanError`` is one), that error is re-raised immediately instead of being counted
     as a per-address failure and continuing -- a plan-level rejection will
     fail identically for every remaining address, so there is no reason to
     burn through (and log an ERROR for) all of them just to say so 13,000
@@ -732,7 +635,7 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
     for idx, a in enumerate(addrs):
         try:
             got = client.first_tx(a)
-        except EtherscanPlanError:
+        except ProfilePlanError:
             if idx == 0:
                 raise
             logger.error("rater_profile: failed to enrich %s: plan does not support this chain", a)
