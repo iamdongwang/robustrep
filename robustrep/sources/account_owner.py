@@ -55,7 +55,7 @@ from typing import Optional
 
 from .base_erc8004 import ZERO_ADDRESS, BatchState, _decode_owner_result, _warn_batch_fallback
 from .profile_http import funder_address
-from .rpc import RpcError
+from .rpc import RpcError, is_revert
 
 logger = logging.getLogger(__name__)
 
@@ -151,13 +151,14 @@ _REVERTED = object()
 
 
 def _call(rpc, address: str, params: list, what: str):
-    """One ``eth_call``; a revert (``RpcError`` whose message mentions
-    "revert") is the ``_REVERTED`` sentinel, logged at DEBUG -- the selector
-    does not exist on this contract. Any other ``RpcError`` propagates."""
+    """One ``eth_call``; a revert (``rpc.is_revert``: an ``RpcRevertError``,
+    or an ``RpcError`` whose message mentions "revert") is the ``_REVERTED``
+    sentinel, logged at DEBUG -- the selector does not exist on this
+    contract. Any other ``RpcError`` propagates."""
     try:
         return rpc.call("eth_call", params)
     except RpcError as e:
-        if "revert" in str(e).lower():
+        if is_revert(e):
             logger.debug("account_owner: %s on %s reverted (selector not implemented): %s", what, address, e)
             return _REVERTED
         raise

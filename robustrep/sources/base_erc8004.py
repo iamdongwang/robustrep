@@ -66,7 +66,7 @@ from eth_hash.auto import keccak
 from ..config import DEFAULT_CONFIRMATIONS
 from ..store import Store
 from .http_util import short_for_log as _short
-from .rpc import RpcBatchUnsupportedError, RpcError
+from .rpc import RpcBatchUnsupportedError, RpcError, is_revert, scrub_rpc_error
 
 if TYPE_CHECKING:
     from .log_fetcher import LogFetcher, Served
@@ -319,26 +319,9 @@ def _fetch_logs(rpc, a: int, z: int) -> list[dict]:
     return rpc.call("eth_getLogs", params)
 
 
-_RPC_CODE_TOKEN = re.compile(r"\[-?\d{1,10}\]")
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
-_ERROR_TEXT_CAP = 200
-
-
-def _scrub_rpc_error(e: BaseException) -> str:
-    """The part of a fetch error that is safe to log and store.
-
-    Server text in ``RpcClient`` messages only ever follows a ``[code]``
-    token (``"gave up after 5 attempts: [-32016] <server text>"``), so keep
-    our own prefix before the first ``[`` plus that token when it is an
-    integer JSON-RPC code, and drop everything after it. Control characters
-    become spaces (no log-line or CI workflow-command injection), whitespace
-    runs collapse, and the result is capped at 200 characters."""
-    text = str(e)
-    head, bracket, rest = text.partition("[")
-    if bracket:
-        code = _RPC_CODE_TOKEN.match("[" + rest)
-        head = head + code.group(0) if code else head
-    return " ".join(_CONTROL_CHARS.sub(" ", head).split())[:_ERROR_TEXT_CAP]
+# ``rpc.scrub_rpc_error`` under the name this module's callers and tests have
+# always used: the part of an RPC error that is safe to log and store.
+_scrub_rpc_error = scrub_rpc_error
 
 
 def _served_summary(served: list[Served]) -> str:
@@ -623,9 +606,10 @@ def owner_of(rpc, agent_id: str) -> Optional[str]:
 
     Returns the lowercase ``0x``-prefixed owner address, or ``None`` if the call
     returns an empty result, the zero address (agent burned/never minted), or the
-    call reverts (``RpcError`` whose message mentions "revert" -- ``ownerOf`` on
-    a nonexistent token reverts rather than returning zero on most ERC-721
-    implementations; logged at DEBUG). Any other ``RpcError`` (network failure,
+    call reverts (``rpc.is_revert``: an ``RpcRevertError``, or an ``RpcError``
+    whose message mentions "revert" -- ``ownerOf`` on a nonexistent token
+    reverts rather than returning zero on most ERC-721 implementations;
+    logged at DEBUG). Any other ``RpcError`` (network failure,
     rate limit, ...) propagates rather than being mistaken for "no owner".
 
     An ``agent_id`` that cannot be ABI-encoded at all (see ``_owner_call_data``)
@@ -639,7 +623,7 @@ def owner_of(rpc, agent_id: str) -> Optional[str]:
     try:
         out = rpc.call("eth_call", [{"to": IDENTITY_REGISTRY, "data": data}, "latest"])
     except RpcError as e:
-        if "revert" in str(e).lower():
+        if is_revert(e):
             logger.debug("owner_of: agent %s eth_call reverted (likely nonexistent): %s", agent_id, e)
             return None
         raise

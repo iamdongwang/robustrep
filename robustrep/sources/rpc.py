@@ -12,6 +12,14 @@ Response bodies are read through ``http_util.read_json_capped`` with a
 untrusted third party, and ``requests``' ``Response.json()`` would happily buffer
 an unbounded -- or deliberately endless -- body straight into this process's
 memory.
+
+Two kinds of JSON-RPC error are not retried: a request the endpoint rejects
+as malformed or over its limits (``NON_RETRYABLE``), and an ``eth_call`` the
+node executed and that reverted (``RpcRevertError``) -- the second is an
+answer about the contract, not the endpoint, and asking again cannot change
+it. ``batch(..., per_entry_errors=True)`` goes one step further for callers
+that ask many independent contracts one question each: a failed entry comes
+back as an ``RpcEntryError`` in its slot instead of failing the batch.
 """
 from __future__ import annotations
 
@@ -19,6 +27,7 @@ import logging
 import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.parse import urlsplit
 
@@ -43,6 +52,33 @@ HTTP_BAD_REQUEST = 400
 class RpcError(RuntimeError):
     """Raised when a JSON-RPC call/batch fails on every configured retry, or
     immediately for a non-retryable error (see ``NON_RETRYABLE``)."""
+
+
+class RpcRevertError(RpcError):
+    """The node executed the call and it reverted (``execution reverted``,
+    JSON-RPC code 3 on Base's public nodes, ``-32000`` on some clients).
+    Raised immediately -- no retry, rotation or sleep -- for a single call
+    and for a ``batch()`` entry alike (the batch message names the entry
+    id): the answer is a property of the contract, not of the endpoint, so
+    re-asking cannot change it. Measured 2026-10-13, treating it as
+    retryable cost 5 POSTs and 15 s of backoff per reverting call. Callers
+    that read a revert as "selector not implemented" (``base_erc8004.
+    owner_of``, ``account_owner``) test ``isinstance`` on this class via
+    ``is_revert`` instead of substring-matching the message."""
+
+
+@dataclass(frozen=True)
+class RpcEntryError:
+    """One failed entry of a ``batch(..., per_entry_errors=True)`` call, in
+    the slot its call occupied. ``message`` has already been through
+    ``scrub_rpc_text`` -- it is our ``[code]`` token at most, never server
+    text, so it can be logged and stored as is. ``reverted`` is True for an
+    ``execution reverted`` entry (the contract has no such function or
+    refused the call); any other entry error is a node-side execution
+    failure for that call alone (out of gas, invalid opcode, ...)."""
+    code: Optional[int]
+    message: str
+    reverted: bool
 
 
 class RpcBatchUnsupportedError(RpcError):
@@ -129,7 +165,13 @@ def _redact(last: Optional[BaseException], url: str) -> str:
 # request itself is malformed or permanently rejected -- retrying identically (or
 # rotating URL) cannot help, so these are raised immediately instead of consuming
 # the retry budget.
-NON_RETRYABLE = ("limited to a", "invalid params", "-32602", "-32600")
+NON_RETRYABLE = ("limited to a", "invalid params", "-32602", "-32600", "execution reverted")
+
+# The ``NON_RETRYABLE`` entry that means "the call executed and reverted" --
+# raised as ``RpcRevertError`` rather than a plain ``RpcError`` so callers
+# can tell "this contract does not implement the selector" from "the request
+# was malformed" by type.
+REVERT_MARKER = "execution reverted"
 
 # Substrings (case-insensitive) of a JSON-RPC error message/code that mean "you
 # are being rate-limited" -- checked only against a *batch* entry's error (see
@@ -161,12 +203,53 @@ def _numbers_in(message: str, limit: int = 8) -> tuple[int, ...]:
     return tuple(int(m.replace(",", "")) for m in re.findall(r"\d[\d,]*", message)[:limit])
 
 
+def _is_revert(message: str) -> bool:
+    return REVERT_MARKER in message.lower()
+
+
+def is_revert(e: BaseException) -> bool:
+    """True when ``e`` says the call reverted: an ``RpcRevertError``, or --
+    for an ``RpcError`` built elsewhere (test doubles, pre-0.2.2 message
+    shapes) -- one whose text mentions "revert". The type check is the
+    contract; the substring is compatibility."""
+    return isinstance(e, RpcRevertError) or (isinstance(e, RpcError) and "revert" in str(e).lower())
+
+
+_RPC_CODE_TOKEN = re.compile(r"\[-?\d{1,10}\]")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_ERROR_TEXT_CAP = 200
+
+
+def scrub_rpc_text(text: str) -> str:
+    """The part of an RPC error message that is safe to log and store.
+
+    Server text in this module's messages only ever follows a ``[code]``
+    token (``"gave up after 5 attempts: [-32016] <server text>"``), so keep
+    our own prefix before the first ``[`` plus that token when it is an
+    integer JSON-RPC code, and drop everything after it. Control characters
+    become spaces (no log-line or CI workflow-command injection), whitespace
+    runs collapse, and the result is capped at 200 characters."""
+    head, bracket, rest = text.partition("[")
+    if bracket:
+        code = _RPC_CODE_TOKEN.match("[" + rest)
+        head = head + code.group(0) if code else head
+    return " ".join(_CONTROL_CHARS.sub(" ", head).split())[:_ERROR_TEXT_CAP]
+
+
+def scrub_rpc_error(e: BaseException) -> str:
+    """``scrub_rpc_text`` of ``str(e)``."""
+    return scrub_rpc_text(str(e))
+
+
 def _raise_if_fatal(err: str, url: str) -> None:
     """Raise (no further retries) if ``err`` is a range-too-large rejection
-    (``RpcRangeTooLargeError``) or names a ``NON_RETRYABLE`` error (``RpcError``)."""
+    (``RpcRangeTooLargeError``), an execution revert (``RpcRevertError``) or
+    names any other ``NON_RETRYABLE`` error (``RpcError``)."""
     if _is_range_too_large(err):
         logger.debug("rpc: range too large from %s: %s", _endpoint(url), err)
         raise RpcRangeTooLargeError(_endpoint(url), _numbers_in(err))
+    if _is_revert(err):
+        raise RpcRevertError(f"non-retryable error: {err}")
     if _is_non_retryable(err):
         raise RpcError(f"non-retryable error: {err}")
 
@@ -298,8 +381,8 @@ class RpcClient:
         ``requests.HTTPError`` instead and is retried as a transport failure. Raises ``RpcError``
         naming the last failure once ``retries`` attempts are exhausted, or
         immediately (no rotation, no sleep, no further attempts) if ``check``
-        reports a ``NON_RETRYABLE`` error (or a range-too-large one, which
-        raises ``RpcRangeTooLargeError``), or if ``check`` itself raises (as
+        reports a ``NON_RETRYABLE`` error (a revert raises ``RpcRevertError``,
+        a range-too-large one ``RpcRangeTooLargeError``), or if ``check`` itself raises (as
         ``_check_batch`` does for ``RpcBatchStructureError``/``RpcBatchRateLimitError``
         -- neither of these is caught here, so they propagate straight through
         on the very first attempt). The final failed attempt is never followed
@@ -352,32 +435,56 @@ class RpcClient:
             return "malformed response: no 'result' or 'error' field"
         return None
 
-    @classmethod
-    def _check_batch(cls, n: int, body) -> Optional[str]:
-        """Validate a batch response body, either returning a retryable error
-        message (an ordinary per-entry JSON-RPC error) or raising directly
-        for a failure that retrying cannot fix -- see ``RpcBatchStructureError``
-        (malformed shape: not a list, wrong count, id mismatch, missing/null
-        result) and ``RpcBatchRateLimitError`` (an entry's error reports the
-        endpoint is rate-limiting this batch specifically). Raising instead
-        of returning skips ``_with_retry``'s retry/backoff/rotation entirely,
-        the same way a ``NON_RETRYABLE`` single-call error does."""
+    @staticmethod
+    def _check_batch_shape(n: int, body) -> None:
+        """Raise ``RpcBatchStructureError`` unless ``body`` is a list of
+        exactly ``n`` entries whose ids are exactly ``1..n``."""
         if not isinstance(body, list) or len(body) != n:
             got = len(body) if isinstance(body, list) else type(body).__name__
             raise RpcBatchStructureError(f"malformed batch response: expected {n} entries, got {got}")
         ids = sorted(x.get("id") for x in body if isinstance(x, dict))
         if ids != list(range(1, n + 1)):
             raise RpcBatchStructureError(f"malformed batch response: ids {ids} != 1..{n}")
+
+    @classmethod
+    def _check_batch(cls, n: int, body, per_entry_errors: bool = False) -> Optional[str]:
+        """Validate a batch response body, either returning a retryable error
+        message (an ordinary per-entry JSON-RPC error) or raising directly
+        for a failure that retrying cannot fix -- see ``RpcBatchStructureError``
+        (malformed shape: not a list, wrong count, id mismatch, an entry with
+        neither error nor result) and ``RpcBatchRateLimitError`` (an entry's
+        error reports the endpoint is rate-limiting this batch specifically).
+        Raising instead of returning skips ``_with_retry``'s
+        retry/backoff/rotation entirely, the same way a ``NON_RETRYABLE``
+        single-call error does.
+
+        With ``per_entry_errors`` an entry's own JSON-RPC error is not a
+        failure of the batch at all: it is returned to the caller in that
+        entry's slot (see ``batch``), so only the shape and rate-limit checks
+        apply and the method never returns a retryable message."""
+        cls._check_batch_shape(n, body)
         for item in body:
             err = item.get("error")
             if err is not None:
                 msg = cls._error_message(err)
                 if _is_batch_rate_limited(msg):
                     raise RpcBatchRateLimitError(f"batch entry id={item.get('id')}: {msg}")
-                return f"batch entry id={item.get('id')}: {msg}"
-            if item.get("result") is None:
+                if not per_entry_errors:
+                    return f"batch entry id={item.get('id')}: {msg}"
+            elif item.get("result") is None:
                 raise RpcBatchStructureError(f"batch entry id={item.get('id')}: missing result")
         return None
+
+    @classmethod
+    def _entry_error(cls, err) -> RpcEntryError:
+        """An entry's JSON-RPC ``error`` object as an ``RpcEntryError``: the
+        integer ``code`` (``None`` when absent or not an int), the scrubbed
+        ``[code] message`` text, and whether it is a revert."""
+        code = err.get("code") if isinstance(err, dict) else None
+        if isinstance(code, bool) or not isinstance(code, int):
+            code = None
+        msg = cls._error_message(err)
+        return RpcEntryError(code=code, message=scrub_rpc_text(msg), reverted=_is_revert(msg))
 
     def call(self, method: str, params: list):
         """Make a single JSON-RPC call and return its ``result``.
@@ -391,23 +498,40 @@ class RpcClient:
         body = self._with_retry(payload, self._check_single)
         return body["result"]
 
-    def batch(self, calls: list[tuple[str, list]]) -> list:
+    def batch(self, calls: list[tuple[str, list]], *, per_entry_errors: bool = False) -> list:
         """Make a JSON-RPC batch call and return results in the same order as
         ``calls``, matched by response ``id`` (not response position -- servers
         are free to return batch entries in any order).
 
-        Raises ``RpcError`` if every retry transport-fails or an entry has a
-        non-null JSON-RPC ``error`` (retried like a single-call error, subject
-        to the same ``NON_RETRYABLE`` immediate-raise). Raises immediately --
-        no retry, no rotation, no backoff -- via a more specific subclass when
-        the failure means retrying the batch itself is pointless:
-        ``RpcBatchStructureError`` (the response isn't a list of exactly
-        ``len(calls)`` entries, entry ids aren't exactly ``{1..len(calls)}``,
-        or an entry has a missing/null ``result``) or ``RpcBatchRateLimitError``
-        (an entry's error reports the batch itself is rate-limited).
+        By default (``per_entry_errors=False``) raises ``RpcError`` if every
+        retry transport-fails or an entry has a non-null JSON-RPC ``error``
+        (retried like a single-call error, subject to the same
+        ``NON_RETRYABLE`` immediate-raise -- a reverting entry raises
+        ``RpcRevertError`` naming its id on the first attempt). Raises
+        immediately -- no retry, no rotation, no backoff -- via a more
+        specific subclass when the failure means retrying the batch itself is
+        pointless: ``RpcBatchStructureError`` (the response isn't a list of
+        exactly ``len(calls)`` entries, entry ids aren't exactly
+        ``{1..len(calls)}``, or an entry has neither ``result`` nor ``error``)
+        or ``RpcBatchRateLimitError`` (an entry's error reports the batch
+        itself is rate-limited).
+
+        With ``per_entry_errors=True`` an entry's own JSON-RPC error does
+        not fail the batch: its slot in the returned list holds an
+        ``RpcEntryError`` (scrubbed message, ``reverted`` flag) and every
+        other slot holds its ``result`` as usual, so a caller asking fifty
+        independent contracts one question each learns every answer in one
+        round trip even when some of them revert. Structural failures,
+        batch-level rate limits and transport failures behave exactly as
+        in the default mode.
         """
         n = len(calls)
         payload = [{"jsonrpc": "2.0", "id": i + 1, "method": m, "params": p} for i, (m, p) in enumerate(calls)]
-        body = self._with_retry(payload, lambda b: self._check_batch(n, b))
+        body = self._with_retry(payload, lambda b: self._check_batch(n, b, per_entry_errors))
         by_id = {x["id"]: x for x in body}
-        return [by_id[i + 1]["result"] for i in range(n)]
+        out = []
+        for i in range(n):
+            item = by_id[i + 1]
+            err = item.get("error")
+            out.append(self._entry_error(err) if per_entry_errors and err is not None else item["result"])
+        return out
