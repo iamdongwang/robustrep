@@ -56,7 +56,13 @@ CREATE TABLE IF NOT EXISTS responses(
 -- case so NULL block numbers are correctly rejected.
 CREATE TABLE IF NOT EXISTS blocks(number INT PRIMARY KEY NOT NULL, ts INTEGER);
 CREATE TABLE IF NOT EXISTS evidence_cache(uri TEXT PRIMARY KEY NOT NULL, level INTEGER, note TEXT);
-CREATE TABLE IF NOT EXISTS raters(address TEXT PRIMARY KEY NOT NULL, first_seen_ts INTEGER, funder TEXT);
+-- raters.funder_kind says which rule produced ``funder`` (see FUNDER_KINDS): "transfer"
+-- (the ``from`` of the first incoming transfer), "owner" (the smart account's
+-- controlling key), "none" (every lookup was tried and found nothing; never retried),
+-- or NULL (legacy row: only the transfer lookup was ever tried). Stores created before
+-- 0.2.2 lack the column; Store.__init__ adds and backfills it (see _migrate_funder_kind).
+CREATE TABLE IF NOT EXISTS raters(address TEXT PRIMARY KEY NOT NULL, first_seen_ts INTEGER, funder TEXT,
+  funder_kind TEXT);
 CREATE TABLE IF NOT EXISTS agents(agent_id TEXT PRIMARY KEY NOT NULL, owner TEXT);
 CREATE TABLE IF NOT EXISTS sync_state(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS failed_ranges(from_block INTEGER, to_block INTEGER, error TEXT,
@@ -79,6 +85,16 @@ FB_COLS = ["chain", "block", "tx_hash", "log_index", "agent_id", "client", "feed
 
 RESPONSE_COLS = ["agent_id", "client", "feedback_index", "responder", "response_uri", "response_hash",
                   "block", "tx_hash", "log_index"]
+
+# The values ``raters.funder_kind`` may hold (besides NULL, the legacy "only the
+# transfer lookup was tried" state). ``FUNDER_KIND_UNKNOWN`` is the label
+# ``Store.funder_kind_counts`` reports NULL under -- a provenance key, never a
+# stored value.
+FUNDER_KIND_TRANSFER = "transfer"
+FUNDER_KIND_OWNER = "owner"
+FUNDER_KIND_NONE = "none"
+FUNDER_KINDS = (FUNDER_KIND_TRANSFER, FUNDER_KIND_OWNER, FUNDER_KIND_NONE)
+FUNDER_KIND_UNKNOWN = "unknown"
 
 
 def _row_values(row: dict, cols: list[str], what: str) -> list:
@@ -139,6 +155,26 @@ class Store:
             raise ValueError(
                 "stale robustrep schema (feedback.revoked column present): "
                 "delete the database file and re-run fetch")
+        self._migrate_funder_kind()
+
+    def _migrate_funder_kind(self) -> None:
+        """Add ``raters.funder_kind`` to a store created before the column
+        existed, then backfill it once: every legacy row that already holds a
+        funder got it from the first-incoming-transfer rule, so it is marked
+        ``"transfer"``; a legacy row with no funder stays NULL, which is exactly
+        the state ``raters_needing_owner_lookup`` selects -- the owner pass must
+        get to try those. Idempotent: a store that already has the column is
+        left alone, and the backfill touches only rows whose kind is still NULL
+        and whose funder is set (a later ``"owner"``/``"none"`` is never
+        overwritten). A fresh store gets the column from ``SCHEMA`` and reaches
+        only the (no-op) backfill."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(raters)").fetchall()}
+        with self.conn:
+            if "funder_kind" not in cols:
+                self.conn.execute("ALTER TABLE raters ADD COLUMN funder_kind TEXT")
+            self.conn.execute(
+                "UPDATE raters SET funder_kind=? WHERE funder IS NOT NULL AND funder<>'' "
+                "AND funder_kind IS NULL", (FUNDER_KIND_TRANSFER,))
 
     def __enter__(self) -> "Store":
         return self
@@ -259,13 +295,58 @@ class Store:
         r = self.conn.execute("SELECT level FROM evidence_cache WHERE uri=?", (uri,)).fetchone()
         return None if r is None else int(r[0])
 
-    def upsert_rater(self, address: str, first_seen_ts: Optional[int], funder: Optional[str]) -> None:
-        """Cache rater profile metadata (first-seen timestamp, funder address)."""
+    def upsert_rater(self, address: str, first_seen_ts: Optional[int], funder: Optional[str],
+                     funder_kind: Optional[str] = None) -> None:
+        """Cache rater profile metadata: first-seen timestamp, funder address and
+        ``funder_kind`` -- which rule produced the funder (one of
+        ``FUNDER_KINDS``, or ``None``).
+
+        ``funder`` means "who controls or funded this address": the ``from`` of
+        its first incoming transfer (``"transfer"``), or -- for a smart-contract
+        account that never received a transfer (since 2026-10 nearly every new
+        ERC-8004 rater on Base) -- its controlling key (``"owner"``). ``"none"``
+        records that every lookup was tried and found nothing, so later runs
+        do not retry it. ``None`` (the default) marks a row where only the
+        transfer lookup has run: a caller that writes ``(None, None)`` for "no
+        transfer found" leaves the kind NULL *on purpose*, so
+        ``raters_needing_owner_lookup`` picks the address up for the owner
+        pass. A caller that writes a found transfer funder must pass
+        ``"transfer"``. Raises ``ValueError`` for any other kind, before
+        anything is written.
+        """
+        if funder_kind is not None and funder_kind not in FUNDER_KINDS:
+            raise ValueError(f"raters: funder_kind must be one of {FUNDER_KINDS} or None, got {funder_kind!r}")
         try:
             with self.conn:
-                self.conn.execute("INSERT OR REPLACE INTO raters VALUES(?,?,?)", (address, first_seen_ts, funder))
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO raters(address, first_seen_ts, funder, funder_kind) VALUES(?,?,?,?)",
+                    (address, first_seen_ts, funder, funder_kind))
         except sqlite3.IntegrityError as e:
             raise ValueError(f"raters: {e}") from e
+
+    def raters_needing_owner_lookup(self) -> list[str]:
+        """Addresses whose transfer lookup found no funder and whose
+        ``funder_kind`` is still NULL -- i.e. the owner pass has never run for
+        them -- sorted. Rows marked ``"none"`` (every lookup already tried) and
+        rows that have a funder of any kind are excluded, so a later ``fetch``
+        never re-queries what an earlier one settled."""
+        rows = self.conn.execute(
+            "SELECT address FROM raters WHERE (funder IS NULL OR funder='') AND funder_kind IS NULL "
+            "ORDER BY address").fetchall()
+        return [r[0] for r in rows]
+
+    def funder_kind_counts(self) -> dict[str, int]:
+        """How many ``raters`` rows each ``funder_kind`` holds, for report
+        provenance: keys ``transfer``/``owner``/``none`` plus ``unknown`` for
+        NULL (legacy rows the owner pass has not reached). Every key is always
+        present (0 when empty) so two reports' provenance diff key for key."""
+        counts = {kind: 0 for kind in (*FUNDER_KINDS, FUNDER_KIND_UNKNOWN)}
+        rows = self.conn.execute(
+            "SELECT COALESCE(funder_kind, ?), COUNT(*) FROM raters GROUP BY 1",
+            (FUNDER_KIND_UNKNOWN,)).fetchall()
+        for kind, n in rows:
+            counts[kind] = int(n)
+        return counts
 
     def clear_raters(self) -> int:
         """Drop every cached rater profile and forget ``rater_profile_mode``;

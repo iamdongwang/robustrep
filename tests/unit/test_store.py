@@ -505,3 +505,115 @@ def test_pre_0_2_database_gains_sync_log_on_next_open(tmp_path):
     with Store(tmp_path / "old.db") as store:
         assert store.conn.execute("SELECT name FROM sqlite_master WHERE name='sync_log'").fetchone()
         assert store.sync_sources() == SyncSources(sources=(), recorded_from_block=None)
+
+
+# --- raters.funder_kind: which rule produced the funder --------------------------
+
+# The raters CREATE statement as it stood through 0.2.1 (no funder_kind). Used to
+# build a legacy store that Store.__init__ must migrate in place.
+_OLD_RATERS_SCHEMA = ("CREATE TABLE IF NOT EXISTS raters("
+                      "address TEXT PRIMARY KEY NOT NULL, first_seen_ts INTEGER, funder TEXT)")
+
+
+def _rater_columns(store: Store) -> set:
+    return {r[1] for r in store.conn.execute("PRAGMA table_info(raters)").fetchall()}
+
+
+def _rater_rows(store: Store) -> dict:
+    rows = store.conn.execute("SELECT address, first_seen_ts, funder, funder_kind FROM raters").fetchall()
+    return {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+
+def test_fresh_store_has_funder_kind_column(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        assert "funder_kind" in _rater_columns(s)
+
+
+def test_opening_an_old_store_adds_funder_kind_and_backfills_transfer_only_for_funded_rows(tmp_path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(_OLD_RATERS_SCHEMA)
+    conn.executemany("INSERT INTO raters VALUES(?,?,?)", [
+        ("0xa", 100, "0xf"),   # a found funder -> legacy transfer rule
+        ("0xb", None, None),   # no transfer found -> left NULL (owner pass picks it up)
+        ("0xc", 5, ""),        # empty-string funder counts as none too
+    ])
+    conn.commit()
+    conn.close()
+    with Store(path) as s:
+        assert "funder_kind" in _rater_columns(s)
+        assert _rater_rows(s) == {"0xa": (100, "0xf", "transfer"), "0xb": (None, None, None),
+                                  "0xc": (5, "", None)}
+
+
+def test_funder_kind_migration_is_idempotent_and_keeps_later_kinds(tmp_path):
+    path = tmp_path / "t.db"
+    with Store(path) as s:
+        s.upsert_rater("0xa", 100, "0xf", "transfer")
+        s.upsert_rater("0xb", None, "0xkey", "owner")
+        s.upsert_rater("0xc", None, None, "none")
+        s.upsert_rater("0xd", None, None)
+    for _ in range(2):
+        with Store(path) as s:
+            assert _rater_rows(s) == {"0xa": (100, "0xf", "transfer"), "0xb": (None, "0xkey", "owner"),
+                                      "0xc": (None, None, "none"), "0xd": (None, None, None)}
+
+
+@pytest.mark.parametrize("kind", [None, "transfer", "owner", "none"])
+def test_upsert_rater_accepts_each_funder_kind(tmp_path, kind):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xa", 1, "0xf", kind)
+        assert _rater_rows(s)["0xa"] == (1, "0xf", kind)
+
+
+@pytest.mark.parametrize("kind", ["", "TRANSFER", "funder", 1, "unknown"])
+def test_upsert_rater_rejects_an_unknown_funder_kind(tmp_path, kind):
+    with Store(tmp_path / "t.db") as s:
+        with pytest.raises(ValueError, match="funder_kind"):
+            s.upsert_rater("0xa", 1, "0xf", kind)
+        assert _rater_rows(s) == {}
+
+
+def test_upsert_rater_default_kind_is_null_and_replace_overwrites_it(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xa", None, None)
+        assert _rater_rows(s)["0xa"] == (None, None, None)
+        s.upsert_rater("0xa", None, "0xkey", "owner")
+        assert _rater_rows(s)["0xa"] == (None, "0xkey", "owner")
+
+
+def test_raters_needing_owner_lookup_selects_only_unfunded_rows_of_unknown_kind(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xd", None, None)                  # NULL kind, no funder -> yes
+        s.upsert_rater("0xb", None, "", None)              # empty funder, NULL kind -> yes
+        s.upsert_rater("0xa", 100, "0xf", "transfer")      # has a funder -> no
+        s.upsert_rater("0xc", None, None, "none")          # already tried everything -> no
+        s.upsert_rater("0xe", None, "0xkey", "owner")      # has an owner -> no
+        s.upsert_rater("0xf", 7, "0xg")                    # funder but NULL kind (legacy) -> no
+        assert s.raters_needing_owner_lookup() == ["0xb", "0xd"]
+
+
+def test_raters_needing_owner_lookup_is_empty_on_a_fresh_store(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        assert s.raters_needing_owner_lookup() == []
+
+
+def test_funder_kind_counts_covers_every_kind_including_unknown_for_null(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        assert s.funder_kind_counts() == {"transfer": 0, "owner": 0, "none": 0, "unknown": 0}
+        s.upsert_rater("0xa", 100, "0xf", "transfer")
+        s.upsert_rater("0xb", 101, "0xg", "transfer")
+        s.upsert_rater("0xc", None, "0xkey", "owner")
+        s.upsert_rater("0xd", None, None, "none")
+        s.upsert_rater("0xe", None, None)
+        assert s.funder_kind_counts() == {"transfer": 2, "owner": 1, "none": 1, "unknown": 1}
+
+
+def test_load_rater_meta_and_clear_raters_are_unchanged_by_funder_kind(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xa", 100, "0xf", "transfer")
+        s.upsert_rater("0xb", None, "0xkey", "owner")
+        meta = s.load_rater_meta()
+        assert list(meta.columns) == ["rater", "first_seen_ts", "funder"]
+        assert s.clear_raters() == 2
+        assert s.funder_kind_counts() == {"transfer": 0, "owner": 0, "none": 0, "unknown": 0}
