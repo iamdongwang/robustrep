@@ -78,14 +78,13 @@ from .http_util import install_key_redaction
 from .profile_http import (
     MAX_PLAUSIBLE_TS,
     MAX_PROFILE_RESPONSE_BYTES,
+    REJECTED,
+    REQUEST_TIMEOUT,
+    RETRY,
     ProfilePlanError,
-    capped_json,
+    fetch_with_retries,
     implausible,
-    is_transient_http,
     plausible_ts,
-    raise_exhausted,
-    retry_after_seconds,
-    status_code,
     warn_bad_ts,
 )
 
@@ -128,12 +127,6 @@ _PLAN_UNSUPPORTED = ("free api access is not supported",)
 # Substrings meaning the request address itself is malformed -- a caller bug,
 # not a transient failure.
 _INVALID_ADDRESS = ("invalid address",)
-
-# Sentinel returned by ``EtherscanClient._parse_body`` for a body-level error
-# (e.g. Etherscan's own "Max rate limit reached" message) that should be
-# retried like a transport-level failure, as opposed to a real result (which
-# may legitimately be ``None``).
-_RETRY = object()
 
 # Sentinel returned internally by ``BlockscoutV2Client._fetch_page`` to mean
 # "HTTP 404 -- unknown address", distinguishing it from a real page body.
@@ -226,51 +219,11 @@ class EtherscanClient:
         """
         address = address.lower()
         params = self._params(address)
-        last_status: Optional[int] = None
-        last_kind = "http"
-        for attempt in range(self.retries):
-            transient = False
-            retry_after: Optional[float] = None
-            r = None
-            try:
-                try:
-                    r = self.session.get(self.base_url, params=params, timeout=30, stream=True)
-                    r.raise_for_status()
-                except requests.RequestException as e:
-                    code = self._status_code(e)
-                    if not self._is_transient_http(code):
-                        raise RuntimeError(f"Etherscan HTTP {code} for {address}") from None
-                    transient, last_status, last_kind = True, code, "http"
-                    if code == 429:
-                        retry_after = retry_after_seconds(e)
-                else:
-                    try:
-                        body = capped_json(r, address, "Etherscan")
-                    except ValueError:
-                        transient, last_kind = True, "json"
-                    else:
-                        if not isinstance(body, dict):
-                            raise ValueError(f"Etherscan response is not a JSON object for {address}")
-                        outcome = self._parse_body(body, address)
-                        if outcome is _RETRY:
-                            transient, last_kind = True, "body"
-                        else:
-                            return outcome
-            finally:
-                # The body is streamed (M2), so the response must be closed
-                # explicitly -- on every path, including the error ones.
-                if r is not None:
-                    r.close()
-                # Rate-limit throttle: always paid, success or failure, so a
-                # string of errors can't be used to blow past the configured rps.
-                self.sleep(self.gap)
-
-            if transient and attempt < self.retries - 1:
-                # Honor a 429's Retry-After header (capped) over the usual
-                # exponential backoff, when the server told us how long to wait.
-                self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
-
-        raise_exhausted("Etherscan", address, last_kind, last_status, self.retries)
+        return fetch_with_retries(
+            "Etherscan", address,
+            lambda: self.session.get(self.base_url, params=params, timeout=REQUEST_TIMEOUT, stream=True),
+            lambda body: self._parse_body(body, address),
+            retries=self.retries, gap=self.gap, sleep=self.sleep)
 
     def _params(self, address: str) -> dict:
         """Query params for one ``txlist`` lookup. The API key appears here and
@@ -286,7 +239,7 @@ class EtherscanClient:
 
     def _parse_body(self, body: dict, address: str):
         """Interpret one decoded JSON response body. Returns the ``first_tx``
-        result (a tuple, or ``None`` for "no transactions"), or ``_RETRY`` for
+        result (a tuple, or ``None`` for "no transactions"), or ``RETRY`` for
         a transient body-level error. Raises ``ValueError``/``RuntimeError``
         (including ``EtherscanPlanError``) directly for non-transient errors
         (see ``first_tx``)."""
@@ -314,15 +267,7 @@ class EtherscanClient:
             raise ValueError(f"malformed address {address}: rejected as an invalid address format")
         if any(s in low or s in mlow for s in _NON_RETRYABLE):
             raise RuntimeError(f"Etherscan API Key rejected for {address}")
-        return _RETRY
-
-    @staticmethod
-    def _status_code(e: requests.RequestException) -> Optional[int]:
-        return status_code(e)
-
-    @staticmethod
-    def _is_transient_http(code: Optional[int]) -> bool:
-        return is_transient_http(code)
+        return RETRY
 
     @staticmethod
     def _parse_tx(tx: dict, address: str) -> Optional[tuple[int, int, str]]:
@@ -436,53 +381,18 @@ class BlockscoutV2Client:
         return None
 
     def _fetch_page(self, url: str, params: dict, address: str):
-        """Fetch and JSON-decode one page. Returns the decoded body (a
-        dict), or the ``_NOT_FOUND`` sentinel for HTTP 404. Raises
+        """Fetch and JSON-decode one page through
+        ``profile_http.fetch_with_retries``. Returns the decoded body (a
+        dict), or the ``_NOT_FOUND`` sentinel for HTTP 404 (the one status
+        this client maps to a value rather than an error). Raises
         ``ValueError``/``RuntimeError`` for other failures (see
         ``first_tx``'s docstring)."""
-        last_status: Optional[int] = None
-        last_kind = "http"
-        for attempt in range(self.retries):
-            transient = False
-            retry_after: Optional[float] = None
-            r = None
-            try:
-                try:
-                    r = self.session.get(url, params=params, timeout=30, stream=True)
-                    r.raise_for_status()
-                except requests.RequestException as e:
-                    code = status_code(e)
-                    if code == 404:
-                        return _NOT_FOUND
-                    if not is_transient_http(code):
-                        raise RuntimeError(f"Blockscout HTTP {code} for {address}") from None
-                    transient, last_status, last_kind = True, code, "http"
-                    if code == 429:
-                        retry_after = retry_after_seconds(e)
-                else:
-                    try:
-                        body = capped_json(r, address, "Blockscout")
-                    except ValueError:
-                        transient, last_kind = True, "json"
-                    else:
-                        if not isinstance(body, dict):
-                            raise ValueError(f"Blockscout response is not a JSON object for {address}")
-                        return body
-            finally:
-                # The body is streamed (M2), so the response must be closed
-                # explicitly -- on every path, including the error ones.
-                if r is not None:
-                    r.close()
-                # Rate-limit throttle: always paid, success or failure, so a
-                # string of errors can't be used to blow past the configured rps.
-                self.sleep(self.gap)
-
-            if transient and attempt < self.retries - 1:
-                # Honor a 429's Retry-After header (capped) over the usual
-                # exponential backoff, when the server told us how long to wait.
-                self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
-
-        raise_exhausted("Blockscout", address, last_kind, last_status, self.retries)
+        return fetch_with_retries(
+            "Blockscout", address,
+            lambda: self.session.get(url, params=params, timeout=REQUEST_TIMEOUT, stream=True),
+            lambda body: body,
+            retries=self.retries, gap=self.gap, sleep=self.sleep,
+            on_http_error=lambda code, r: _NOT_FOUND if code == 404 else REJECTED)
 
     @staticmethod
     def _parse_tx(tx: dict, address: str) -> Optional[tuple[int, int, str]]:

@@ -26,19 +26,23 @@ reviewer who has checked one client has checked them all:
   ``robustrep.sybil._validate_meta`` raise on every later ``score``/``report``
   run.
 
-The retry vocabulary is shared too: ``is_transient_http`` decides what is
-worth another attempt, ``retry_after_seconds`` reads (and caps) a 429's
-``Retry-After``, and ``raise_exhausted`` is the single terminal error for an
-address whose every attempt failed. ``ProfilePlanError`` is the one
-non-retryable failure every client may raise that ``enrich_raters`` treats
-specially: the configured plan/key/network cannot serve this chain at all, so
-it aborts on the first address instead of logging the same rejection once per
-rater.
+The retry loop itself is shared as well: ``fetch_with_retries`` is the one
+request/retry loop every client runs its HTTP call through, so the throttle
+sleep, the response close, the transient/permanent classification, the
+``Retry-After`` handling and the terminal error exist exactly once. Its
+vocabulary: ``is_transient_http`` decides what is worth another attempt,
+``retry_after_seconds`` reads (and caps) a 429's ``Retry-After``, ``RETRY`` /
+``REJECTED`` are the sentinels a client's callbacks answer with, and
+``raise_exhausted`` is the single terminal error for an address whose every
+attempt failed. ``ProfilePlanError`` is the one non-retryable failure every
+client may raise that ``enrich_raters`` treats specially: the configured
+plan/key/network cannot serve this chain at all, so it aborts on the first
+address instead of logging the same rejection once per rater.
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -59,6 +63,23 @@ MAX_PLAUSIBLE_TS = 4102444800
 # Longest backoff sleep honored from a 429 response's Retry-After header,
 # in seconds -- caps a misbehaving/adversarial server from stalling a run.
 RETRY_AFTER_CAP = 60.0
+
+# Longest exponential-backoff sleep between attempts, in seconds
+# (``min(2 ** attempt, BACKOFF_CAP)``).
+BACKOFF_CAP = 30
+
+# Per-attempt socket timeout handed to ``requests`` by every client, in seconds.
+REQUEST_TIMEOUT = 30
+
+# Sentinel an ``on_response``/``on_http_error`` callback returns to
+# ``fetch_with_retries`` to mean "transient -- try again", as opposed to a
+# real result (which may legitimately be ``None``). Not an exception, so the
+# throttle/backoff bookkeeping stays in the one loop.
+RETRY = object()
+
+# Sentinel an ``on_http_error`` callback returns to mean "no special
+# handling for this status -- raise the default permanent-rejection error".
+REJECTED = object()
 
 
 class ProfilePlanError(RuntimeError):
@@ -122,14 +143,21 @@ def capped_json(r, address: str, label: str):
 def raise_exhausted(label: str, address: str, last_kind: str, last_status, retries: int):
     """Raise the terminal error for an address whose every attempt failed.
 
-    ``ValueError`` when the last attempt's body never parsed as JSON,
-    ``RuntimeError`` otherwise (naming the last HTTP status, or ``n/a`` when
-    the failures never produced a response). Shared by every client so they
-    stay identical in the one respect that matters: the message carries only
-    the source label, the address and a status code -- never the request URL
-    or params (which carry the API key) and never any body text."""
+    ``last_kind`` names what the *last* attempt failed on: ``"json"`` (an
+    HTTP 200 whose body never parsed as JSON) raises ``ValueError``;
+    ``"body"`` (an HTTP 200 whose body the client's ``on_response`` judged
+    transient -- a JSON-RPC rate-limit error, Etherscan's "Max rate limit
+    reached") raises ``RuntimeError`` saying so, rather than a misleading
+    "HTTP error (status n/a)"; ``"http"`` raises ``RuntimeError`` naming the
+    last HTTP status, or ``n/a`` when the failures never produced a response.
+    Shared by every client so they stay identical in the one respect that
+    matters: the message carries only the source label, the address and a
+    status code -- never the request URL or params (which carry the API key)
+    and never any body text."""
     if last_kind == "json":
         raise ValueError(f"non-JSON {label} response for {address}")
+    if last_kind == "body":
+        raise RuntimeError(f"{label} body-level error for {address} after {retries} attempts")
     status_label = last_status if last_status is not None else "n/a"
     raise RuntimeError(f"{label} HTTP error for {address} after {retries} attempts "
                         f"(status {status_label})")
@@ -172,3 +200,109 @@ def retry_after_seconds(e: requests.RequestException) -> Optional[float]:
     if seconds < 0:
         return None
     return min(seconds, RETRY_AFTER_CAP)
+
+
+def fetch_with_retries(label: str, address: str, do_request: Callable[[], object],
+                       on_response: Callable[[dict], object], *, retries: int, gap: float,
+                       sleep: Callable[[float], None],
+                       on_http_error: Optional[Callable[[int, object], object]] = None):
+    """The one request/retry loop behind every rater-profile client's lookup.
+
+    ``do_request()`` performs the HTTP call (with ``stream=True`` -- M2) and
+    returns the response; ``on_response(body)`` interprets a decoded JSON
+    object body and returns the final value (``None`` is a legitimate
+    result), returns ``RETRY`` for a body-level transient failure, or raises.
+    ``on_http_error(code, response)``, when given, is consulted for a
+    non-transient HTTP status (any 4xx but 429) *before* the default
+    rejection: it returns a final value (Blockscout maps 404 to "unknown
+    address"), ``RETRY`` to treat the status as transient after all,
+    ``REJECTED`` to fall through to the default, or raises (Alchemy
+    classifies a 401/403 body as a configuration error). ``response`` is the
+    streamed response, still open, so the hook may read its body through
+    ``capped_json``; it may be ``None`` when the request itself raised.
+
+    What this loop owns, identically for every client:
+
+    - the response is closed and the throttle ``sleep(gap)`` is paid in
+      ``finally`` on **every** path -- success, retry, permanent rejection,
+      callback exception, even ``do_request`` raising -- so a storm of
+      errors cannot exceed the configured request rate;
+    - classification via ``status_code``/``is_transient_http``: 429/5xx and
+      no-response failures (connection error, timeout) are retried, any other
+      4xx is rejected at once as ``RuntimeError(f"{label} HTTP {code} for
+      {address}")`` raised ``from None``, so the ``requests`` exception (whose
+      text embeds the URL, hence the key -- M1) is never chained; the hook is
+      likewise called *outside* the ``except`` block, so nothing it raises
+      chains it either;
+    - backoff between attempts: a 429's numeric ``Retry-After`` (capped at
+      ``RETRY_AFTER_CAP``) when present, else ``min(2 ** attempt,
+      BACKOFF_CAP)``; no backoff after the final attempt;
+    - a non-JSON body (``capped_json`` raising ``ValueError``) counts as
+      transient of kind ``"json"``; an oversized one is the non-retryable
+      ``RuntimeError`` ``capped_json`` raises; a body that is JSON but not an
+      object raises ``ValueError`` at once (malformed, not transient);
+    - ``last_status`` is reset when a later attempt fails at body level, so
+      the terminal message never reports a status from an earlier attempt;
+    - the terminal ``raise_exhausted`` once ``retries`` attempts are spent.
+
+    Nothing raised here carries anything but ``label``, ``address`` and an
+    integer status (M1).
+    """
+    last_status: Optional[int] = None
+    last_kind = "http"
+    for attempt in range(retries):
+        transient = False
+        retry_after: Optional[float] = None
+        rejected: Optional[int] = None
+        r = None
+        try:
+            try:
+                r = do_request()
+                r.raise_for_status()
+            except requests.RequestException as e:
+                # The status code is the only thing read off the exception:
+                # its text embeds the request URL, hence the key (M1).
+                code = status_code(e)
+                if is_transient_http(code):
+                    transient, last_status, last_kind = True, code, "http"
+                    if code == 429:
+                        retry_after = retry_after_seconds(e)
+                else:
+                    rejected = code
+            else:
+                try:
+                    body = capped_json(r, address, label)
+                except ValueError:
+                    transient, last_kind, last_status = True, "json", None
+                else:
+                    if not isinstance(body, dict):
+                        raise ValueError(f"{label} response is not a JSON object for {address}")
+                    outcome = on_response(body)
+                    if outcome is not RETRY:
+                        return outcome
+                    transient, last_kind, last_status = True, "body", None
+            if rejected is not None:
+                # Deliberately outside the `except` above: the requests
+                # exception is no longer being handled, so neither the
+                # default error nor anything the hook raises chains it.
+                outcome = REJECTED if on_http_error is None else on_http_error(rejected, r)
+                if outcome is REJECTED:
+                    raise RuntimeError(f"{label} HTTP {rejected} for {address}") from None
+                if outcome is not RETRY:
+                    return outcome
+                transient, last_status, last_kind = True, rejected, "http"
+        finally:
+            # The body is streamed (M2), so the response must be closed
+            # explicitly -- on every path, including the error ones.
+            if r is not None:
+                r.close()
+            # Rate-limit throttle: always paid, success or failure, so a
+            # string of errors can't be used to blow past the configured rps.
+            sleep(gap)
+
+        if transient and attempt < retries - 1:
+            # Honor a 429's Retry-After header (capped) over the usual
+            # exponential backoff, when the server told us how long to wait.
+            sleep(retry_after if retry_after is not None else min(2 ** attempt, BACKOFF_CAP))
+
+    raise_exhausted(label, address, last_kind, last_status, retries)

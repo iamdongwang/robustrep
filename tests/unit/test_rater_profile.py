@@ -316,8 +316,9 @@ def test_first_tx_retries_body_rate_limit_then_raises():
         c.first_tx("0xA")
         assert False, "expected RuntimeError"
     except RuntimeError as e:
-        assert "0xa" in str(e).lower()
-        assert "n/a" in str(e)
+        # The failure was in the body (HTTP 200 every time), so the message
+        # says so rather than reporting a transport "status n/a".
+        assert str(e) == "Etherscan body-level error for 0xa after 3 attempts"
     assert len(http.calls) == 3
     # one rps-throttle sleep per attempt (in `finally`, always paid) plus backoff
     # sleeps between attempts 1->2 and 2->3 (none after the final, exhausted attempt).

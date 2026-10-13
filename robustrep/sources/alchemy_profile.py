@@ -63,13 +63,11 @@ import requests
 from . import blockscout_util
 from .http_util import install_key_redaction, short_for_log
 from .profile_http import (
+    REQUEST_TIMEOUT,
+    RETRY,
     ProfilePlanError,
-    capped_json,
+    fetch_with_retries,
     implausible,
-    is_transient_http,
-    raise_exhausted,
-    retry_after_seconds,
-    status_code,
     warn_bad_ts,
 )
 
@@ -100,11 +98,6 @@ _RATE_LIMIT_CODE = 429
 # (and nothing that could embed the key) reaches a log through it.
 CONFIG_REJECTED_MESSAGE = ("Alchemy rejected the API key or the Base network is not enabled for this "
                            "app -- check ALCHEMY_API_KEY, or use --profile-source blockscout/etherscan")
-
-# Sentinel returned by ``AlchemyClient._parse_body`` for a body-level error
-# that should be retried like a transport-level failure, as opposed to a real
-# result (which may legitimately be ``None``).
-_RETRY = object()
 
 
 class AlchemyConfigError(ProfilePlanError):
@@ -181,58 +174,16 @@ class AlchemyClient:
         contract."""
         address = address.lower()
         payload = _request_body(address)
-        last_status: Optional[int] = None
-        last_kind = "http"
-        for attempt in range(self.retries):
-            transient = False
-            retry_after: Optional[float] = None
-            r = None
-            try:
-                try:
-                    r = self.session.post(self._url, json=payload, timeout=30, stream=True)
-                    r.raise_for_status()
-                except requests.RequestException as e:
-                    # `from None`: the requests exception's text embeds the
-                    # URL, hence the key (M1) -- it must not be chained.
-                    code = status_code(e)
-                    if not is_transient_http(code):
-                        raise RuntimeError(f"Alchemy HTTP {code} for {address}") from None
-                    transient, last_status, last_kind = True, code, "http"
-                    if code == 429:
-                        retry_after = retry_after_seconds(e)
-                else:
-                    try:
-                        body = capped_json(r, address, "Alchemy")
-                    except ValueError:
-                        transient, last_kind = True, "json"
-                    else:
-                        if not isinstance(body, dict):
-                            raise ValueError(f"Alchemy response is not a JSON object for {address}")
-                        outcome = self._parse_body(body, address)
-                        if outcome is _RETRY:
-                            transient, last_kind = True, "body"
-                        else:
-                            return outcome
-            finally:
-                # The body is streamed (M2), so the response must be closed
-                # explicitly -- on every path, including the error ones.
-                if r is not None:
-                    r.close()
-                # Rate-limit throttle: always paid, success or failure, so a
-                # string of errors can't be used to blow past the configured rps.
-                self.sleep(self.gap)
-
-            if transient and attempt < self.retries - 1:
-                # Honor a 429's Retry-After header (capped) over the usual
-                # exponential backoff, when the server told us how long to wait.
-                self.sleep(retry_after if retry_after is not None else min(2 ** attempt, 30))
-
-        raise_exhausted("Alchemy", address, last_kind, last_status, self.retries)
+        return fetch_with_retries(
+            "Alchemy", address,
+            lambda: self.session.post(self._url, json=payload, timeout=REQUEST_TIMEOUT, stream=True),
+            lambda body: self._parse_body(body, address),
+            retries=self.retries, gap=self.gap, sleep=self.sleep)
 
     def _parse_body(self, body: dict, address: str):
         """Interpret one decoded JSON-RPC response body. Returns the
         ``first_tx`` result (a tuple, or ``None`` for "no transfers"), or
-        ``_RETRY`` for a transient body-level error. Raises ``ValueError``
+        ``RETRY`` for a transient body-level error. Raises ``ValueError``
         for a malformed body and ``RuntimeError``/``AlchemyConfigError`` for
         a non-transient JSON-RPC error (see ``first_tx``)."""
         if "error" in body:
@@ -275,7 +226,7 @@ def _request_body(address: str) -> dict:
 def _classify_error(error, address: str):
     """Map a JSON-RPC ``error`` member onto the retry contract. Key/network
     rejections raise ``AlchemyConfigError`` (fixed message); rate/capacity
-    limits -- by code 429 or by message -- return ``_RETRY``; anything else
+    limits -- by code 429 or by message -- return ``RETRY``; anything else
     raises ``RuntimeError`` naming only the address. The server's own text
     is remote-chosen, so it is logged at DEBUG only and length-bounded (and
     never interpolated into a raised message)."""
@@ -287,7 +238,7 @@ def _classify_error(error, address: str):
     if any(s in low for s in _CONFIG_REJECTED):
         raise AlchemyConfigError(CONFIG_REJECTED_MESSAGE)
     if code == _RATE_LIMIT_CODE or any(s in low for s in _RATE_LIMITED):
-        return _RETRY
+        return RETRY
     raise RuntimeError(f"Alchemy JSON-RPC error for {address}")
 
 
