@@ -40,6 +40,42 @@ and timestamp (12/12, 2026-10-13). Scoring is unchanged.
 
 ### Changed
 
+- **`--profile-source auto` now picks Alchemy** when `ALCHEMY_API_KEY` is
+  set and no Etherscan key is. A run that previously fell through to
+  keyless Blockscout profiles through Alchemy instead once the variable is
+  exported; with neither key it still uses Blockscout.
+- **One retry loop for all three profile clients**
+  (`profile_http.fetch_with_retries`). The response close, throttle sleep,
+  transient/permanent classification, `Retry-After` handling and terminal
+  error now exist once. A run of HTTP 200s whose bodies were all transient
+  (a JSON-RPC rate limit, Etherscan's "Max rate limit reached") is reported
+  as `<source> body-level error for <address> after N attempts` instead of
+  the misleading `HTTP error ... (status n/a)`.
+- **Alchemy HTTP 401/403 abort on the first address.** A rejected key
+  (HTTP 401, `Must be authenticated!`) or a network not enabled for the
+  app (HTTP 403, `BASE_MAINNET is not enabled for this app`) now raises
+  `AlchemyConfigError` instead of a per-address `RuntimeError` that would
+  have been repeated for every rater. `AlchemyConfigError`'s fixed message
+  now says to check that Base Mainnet is enabled for the app.
+- **Alchemy error classification:** a JSON-RPC error with code 429 (or a
+  rate-limit message) is transient even when its text mentions the API
+  key; the rate-limit substrings are `rate limit` / `rate-limit` /
+  `throughput` / `capacity` (the bare `rate` matched "enumerate" and
+  retried permanent errors); `"error": null` beside a result is a success.
+- **Funder addresses are validated from every profile source.** A funder
+  that is not a `0x` + 40-hex string is refused with one WARNING and the
+  address is left unprofiled, as for an implausible timestamp, instead of
+  being cached verbatim (security review L1).
+- **The API key is redacted from robustrep's own loggers too**
+  (`robustrep.sources.alchemy_profile`, `robustrep.sources.profile_http`),
+  which echo bounded server-chosen text at DEBUG/WARNING; previously only
+  urllib3's loggers were filtered (L2).
+- **`Retry-After: nan`/`inf` is ignored** (falls back to exponential
+  backoff) instead of failing the address on `time.sleep(nan)` (L4).
+- **CLI tracebacks never print local variables:** `pretty_exceptions_enable`
+  is off on the typer app, so an unexpected exception prints Python's
+  standard traceback rather than relying on typer's `show_locals` default
+  (I4). Expected errors still print one line and exit 1/2/3 as before.
 - **Shared profile-HTTP helpers moved to `robustrep/sources/profile_http.py`**
   (`capped_json`, `plausible_ts`/`implausible`/`warn_bad_ts`,
   `status_code`, `is_transient_http`, `retry_after_seconds`,

@@ -64,7 +64,11 @@ included) live in ``profile_http`` and are applied through its helpers:
   ``blockscout_util.safe_next_page_params``) rather than forwarded verbatim.
 
 ``MAX_PLAUSIBLE_TS``, ``MAX_PROFILE_RESPONSE_BYTES`` and ``ProfilePlanError``
-are re-exported here for callers that import them from this module.
+are re-exported here for callers that import them from this module. They are
+*names*, not the values the clients read: the clients look them up in
+``profile_http`` at call time, so a test that wants to lower
+``MAX_PROFILE_RESPONSE_BYTES`` or ``MAX_PLAUSIBLE_TS`` must monkeypatch
+``robustrep.sources.profile_http``, not this module.
 """
 from __future__ import annotations
 
@@ -213,7 +217,9 @@ class EtherscanClient:
         on a transient error (HTTP 429/5xx, connection/timeout, a non-JSON
         body, or a rate-limit message), or immediately -- without retrying --
         for a non-retryable one: any other HTTP 4xx, or an invalid/rejected
-        API key. Raises ``EtherscanPlanError`` (a ``RuntimeError`` subclass)
+        API key. Raises ``EtherscanPlanError`` (a ``profile_http.
+        ProfilePlanError``, itself a ``RuntimeError``; ``enrich_raters``
+        aborts on the first address for any ``ProfilePlanError``)
         immediately if the configured plan does not cover this chain (e.g.
         Etherscan's free plan on Base). Raises ``ValueError`` naming
         ``address`` for a malformed response: a body that isn't a JSON object

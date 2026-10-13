@@ -39,9 +39,9 @@ Blockscout closed its free Base API in 2026-10 and Etherscan's free plan never c
 is now the practical source. Pick one explicitly with
 `fetch --profile-source {auto,alchemy,blockscout,etherscan,none}`; `auto` prefers an Etherscan key, then
 an Alchemy key, then keyless Blockscout.
-The Alchemy key is read from the environment only (no flag), redacted from urllib3's debug log, and
-never appears in an error message — Alchemy puts it in the request URL's path, so nothing that quotes a
-URL is ever raised or logged.
+The Alchemy key is read from the environment only (no flag), redacted from urllib3's debug log and
+from robustrep's own log records that echo server text, and never appears in an error message —
+Alchemy puts it in the request URL's path, so nothing that quotes a URL is ever raised or logged.
 
 Latest scores: `reports/latest/scores.json`, also served at
 https://iamdongwang.github.io/robustrep/reports/latest/scores.json

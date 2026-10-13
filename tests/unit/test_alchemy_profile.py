@@ -459,9 +459,8 @@ def test_first_tx_jsonrpc_rate_error_retried_then_exhausted(err, debug_log):
         client(http, retries=3).first_tx(ADDR)
     assert not isinstance(exc.value, ProfilePlanError)
     assert len(http.calls) == 3
-    msg = str(exc.value)
-    assert ADDR.lower() in msg and "3 attempts" in msg
-    assert "capacity" not in msg and "rate" not in msg.lower().replace("rater", "")
+    # Exact: the fixed exhausted message -- no server text, no stale "status n/a".
+    assert str(exc.value) == f"Alchemy body-level error for {ADDR.lower()} after 3 attempts"
     _assert_key_hidden(exc.value, debug_log)
 
 
@@ -542,6 +541,9 @@ def test_first_tx_jsonrpc_error_server_text_is_length_bounded_in_debug_log(debug
     http = FakeAlchemyHttp([rpc_error(-32602, "x" * 100_000)])
     with pytest.raises(RuntimeError):
         client(http).first_tx(ADDR)
+    records = [r for r in debug_log.records if r.name == "robustrep.sources.alchemy_profile"]
+    assert records  # the server text was logged ...
+    assert all(len(r.getMessage()) < 200 for r in records)  # ... but bounded (short_for_log)
     assert len(debug_log.text) < 2_000
 
 

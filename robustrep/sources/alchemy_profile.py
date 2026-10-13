@@ -112,7 +112,8 @@ _HTTP_UNAUTHENTICATED = 401
 # The one message AlchemyConfigError ever carries: fixed, so no server text
 # (and nothing that could embed the key) reaches a log through it.
 CONFIG_REJECTED_MESSAGE = ("Alchemy rejected the API key or the Base network is not enabled for this "
-                           "app -- check ALCHEMY_API_KEY, or use --profile-source blockscout/etherscan")
+                           "app -- check ALCHEMY_API_KEY and that Base Mainnet is enabled for the app, "
+                           "or choose another --profile-source")
 
 
 class AlchemyConfigError(ProfilePlanError):
@@ -224,9 +225,10 @@ def _request_body(address: str) -> dict:
     """The JSON-RPC body for one lookup: the earliest (``order: asc``,
     ``maxCount: 1``) external transfer *to* ``address`` over the whole chain,
     with block metadata so the timestamp comes back in the same call.
-    ``excludeZeroValue: false`` so a zero-ETH funding transaction (a contract
-    deployment, say) still counts as the first incoming transfer, matching
-    Blockscout's ``filter=to`` definition."""
+    ``excludeZeroValue: false`` so a zero-value call to the address still
+    counts as its first incoming transfer, matching Blockscout's
+    ``filter=to`` definition (a contract deployment would not: it has
+    ``to = null`` and can never match ``toAddress``)."""
     return {
         "jsonrpc": "2.0",
         "id": 1,
