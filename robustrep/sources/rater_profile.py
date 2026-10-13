@@ -3,7 +3,10 @@
 Sybil clustering (see ``robustrep.sybil``) needs, per rater address, when it
 first appeared on-chain and who funded it (the ``from`` of its first outgoing
 transaction). Public RPC nodes expose no per-address index for this, so two
-HTTP clients are supported:
+HTTP clients live here (a third, Alchemy, lives in ``alchemy_profile`` and is
+what ``default_client("auto", ...)`` picks whenever ``ALCHEMY_API_KEY`` is set
+and no Etherscan key is -- since 2026-10 it is the only one whose free plan
+still serves Base):
 
 - **Blockscout** (``BlockscoutV2Client``): Base's free Blockscout v2 REST
   API (``GET /api/v2/addresses/{address}/transactions?filter=to``). No API
@@ -19,8 +22,10 @@ HTTP clients are supported:
   chain" error on every address -- so an Etherscan key here only helps with a
   paid plan.
 
-Rater profiles: Blockscout v2 (free, no key) by default; Etherscan V2
-requires a paid plan for Base.
+Rater profiles: Alchemy (free plan covers Base) whenever ``ALCHEMY_API_KEY``
+is set; Blockscout v2 (keyless, but its free tier dropped Base on
+2026-10-01) is the keyless fallback; Etherscan V2 requires a paid plan for
+Base.
 
 Without a client at all (``--profile-source none``), ``enrich_raters`` cannot
 determine a funder, and rather than writing placeholder rows it leaves the
@@ -68,6 +73,7 @@ import requests
 
 from ..store import Store
 from . import blockscout_util
+from .alchemy_profile import AlchemyClient
 from .http_util import install_key_redaction
 from .profile_http import (
     MAX_PLAUSIBLE_TS,
@@ -515,30 +521,39 @@ def client_from_env() -> Optional[EtherscanClient]:
 
 
 def default_client(source: str, key: Optional[str], rps: Optional[float] = None,
-                    retries: Optional[int] = None):
+                    retries: Optional[int] = None, alchemy_key: Optional[str] = None):
     """Build the rater-profile HTTP client for ``--profile-source source``,
     given ``key`` (an explicit ``--etherscan-key``/``ETHERSCAN_API_KEY``
-    value, or ``None``).
+    value, or ``None``) and ``alchemy_key`` (``ALCHEMY_API_KEY``, or
+    ``None``; whitespace-only counts as absent).
 
     - ``"none"``: no client -- ``enrich_raters`` runs its offline fallback
       (writes no rows). ``rps``/``retries`` are ignored -- there is no
       client to configure.
-    - ``"blockscout"``: ``BlockscoutV2Client()`` -- Base's free, keyless
-      Blockscout v2 REST API. (The legacy ``EtherscanClient.blockscout()``
-      Etherscan-compatible endpoint is rate-banned -- see its docstring --
-      so it is no longer the default; construct it explicitly if needed.)
+    - ``"blockscout"``: ``BlockscoutV2Client()`` -- Base's Blockscout v2
+      REST API, keyless. Since 2026-10 Blockscout's free tier no longer
+      serves Base (the API sits behind a Cloudflare challenge), so this only
+      works against a paid Blockscout plan or another instance. (The legacy
+      ``EtherscanClient.blockscout()`` Etherscan-compatible endpoint is
+      rate-banned -- see its docstring -- so it is not built here; construct
+      it explicitly if needed.)
     - ``"etherscan"``: Etherscan V2 using ``key``. Raises ``ValueError`` if
       ``key`` is falsy -- Etherscan V2 always needs a key, and unlike
       ``"auto"`` this source was requested explicitly, so silently falling
       back would hide the missing configuration.
-    - ``"auto"`` (the CLI default): Etherscan V2 when ``key`` is given
-      (presumably a paid plan, since the free plan doesn't cover Base -- see
-      the module docstring), else ``BlockscoutV2Client()``.
+    - ``"alchemy"``: ``alchemy_profile.AlchemyClient(alchemy_key)`` --
+      Alchemy's free plan covers Base. Raises ``ValueError`` if
+      ``alchemy_key`` is blank, for the same reason as ``"etherscan"``.
+    - ``"auto"`` (the CLI default), in precedence order: Etherscan V2 when
+      ``key`` is given (presumably a paid plan, since the free plan doesn't
+      cover Base -- see the module docstring); else Alchemy when
+      ``alchemy_key`` is given; else ``BlockscoutV2Client()``.
 
     ``rps``/``retries``, when given (not ``None``), are forwarded to
     whichever client is built, overriding its own default request rate /
-    retry count (``BlockscoutV2Client``'s 1.0 rps / 5 retries, or
-    ``EtherscanClient``'s ``DEFAULT_RPS`` (4.0) / 3 retries). ``None``
+    retry count (``BlockscoutV2Client``'s 1.0 rps / 5 retries,
+    ``EtherscanClient``'s ``DEFAULT_RPS`` (4.0) / 3 retries, or
+    ``AlchemyClient``'s ``DEFAULT_ALCHEMY_RPS`` (2.5) / 5 retries). ``None``
     (the default) leaves the client's own default in place -- so a caller
     that never asks about ``rps``/``retries`` (e.g. an existing test double)
     gets exactly the previous behavior.
@@ -550,6 +565,7 @@ def default_client(source: str, key: Optional[str], rps: Optional[float] = None,
         kw["rps"] = rps
     if retries is not None:
         kw["retries"] = retries
+    alchemy_key = (alchemy_key or "").strip() or None
 
     if source == "none":
         return None
@@ -559,8 +575,16 @@ def default_client(source: str, key: Optional[str], rps: Optional[float] = None,
         if not key:
             raise ValueError("--profile-source etherscan requires --etherscan-key or ETHERSCAN_API_KEY")
         return EtherscanClient(key, **kw)
+    if source == "alchemy":
+        if not alchemy_key:
+            raise ValueError("--profile-source alchemy requires ALCHEMY_API_KEY")
+        return AlchemyClient(alchemy_key, **kw)
     if source == "auto":
-        return EtherscanClient(key, **kw) if key else BlockscoutV2Client(**kw)
+        if key:
+            return EtherscanClient(key, **kw)
+        if alchemy_key:
+            return AlchemyClient(alchemy_key, **kw)
+        return BlockscoutV2Client(**kw)
     raise ValueError(f"unknown --profile-source: {source!r}")
 
 
@@ -575,7 +599,7 @@ def estimate_seconds(n_addresses: int, rps: float) -> float:
     return n_addresses / rps
 
 
-def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2Client"],
+def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2Client | AlchemyClient"],
                    addresses: Optional[list[str]] = None) -> int:
     """Fill the raters table for every client address not yet profiled.
 
@@ -584,8 +608,8 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
     successes are upserted, and if any failed a ``RuntimeError`` listing them
     (count + first 5) is raised at the end -- but only after the successful
     ones have been persisted and the mode recorded. Sets
-    ``rater_profile_mode`` to ``client.source`` (``"blockscout"`` or
-    ``"etherscan"``; ``"etherscan"`` for any client without a ``source``
+    ``rater_profile_mode`` to ``client.source`` (``"blockscout"``,
+    ``"etherscan"`` or ``"alchemy"``; ``"etherscan"`` for any client without a ``source``
     attribute, for compatibility with simple duck-typed test doubles) when
     every address succeeded, or ``"<source>-partial"`` when some failed.
 

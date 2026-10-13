@@ -225,7 +225,7 @@ def test_fetch_etherscan_key_overrides_env_and_is_not_echoed(tmp_path, monkeypat
         def __init__(self, api_key):
             pass
 
-    def _fake_default_client(source, key, rps=None, retries=None):
+    def _fake_default_client(source, key, rps=None, retries=None, alchemy_key=None):
         seen.append((source, key))
         return _FakeEtherscanClient(key)
 
@@ -256,7 +256,7 @@ def _patch_fetch_steps_except_raters(monkeypatch, capture):
         def __init__(self, key):
             pass
 
-    def _fake_default_client(source, key, rps=None, retries=None):
+    def _fake_default_client(source, key, rps=None, retries=None, alchemy_key=None):
         capture.append((source, key))
         return _FakeClient(key) if source != "none" else None
 
@@ -321,6 +321,131 @@ def test_fetch_profile_source_etherscan_without_key_exits_1_with_error(tmp_path,
     assert "etherscan" in r.output.lower()
 
 
+def _patch_fetch_steps_capturing_alchemy_key(monkeypatch, capture):
+    """Like ``_patch_fetch_steps_except_raters`` but captures default_client's
+    full ``(source, key, alchemy_key)`` triple."""
+    class _FakeClient:
+        source = "alchemy"
+        gap = 0.4
+
+    def _fake_default_client(source, key, rps=None, retries=None, alchemy_key=None):
+        capture.append((source, key, alchemy_key))
+        return _FakeClient() if source != "none" else None
+
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli, "default_client", _fake_default_client)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+
+def test_fetch_profile_source_alchemy_reaches_default_client_with_env_key(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "  alchemy-env-key-0123456789  ")  # stripped
+    seen = []
+    _patch_fetch_steps_capturing_alchemy_key(monkeypatch, seen)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-source", "alchemy"])
+    assert r.exit_code == 0, r.output
+    assert seen == [("alchemy", None, "alchemy-env-key-0123456789")]
+    assert "alchemy-env-key" not in r.output  # the key is never echoed
+
+
+def test_fetch_auto_passes_both_keys_to_default_client(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.setenv("ETHERSCAN_API_KEY", "etherscan-key")
+    monkeypatch.setenv("ALCHEMY_API_KEY", "alchemy-key-0123456789")
+    seen = []
+    _patch_fetch_steps_capturing_alchemy_key(monkeypatch, seen)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert seen == [("auto", "etherscan-key", "alchemy-key-0123456789")]
+
+
+def test_fetch_profile_source_alchemy_unset_env_passes_none(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.delenv("ALCHEMY_API_KEY", raising=False)
+    seen = []
+    _patch_fetch_steps_capturing_alchemy_key(monkeypatch, seen)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-source", "blockscout"])
+    assert r.exit_code == 0, r.output
+    assert seen[0][2] is None
+
+
+def test_fetch_profile_source_alchemy_without_key_exits_1_with_one_line_error(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.delenv("ALCHEMY_API_KEY", raising=False)
+    monkeypatch.setenv("ETHERSCAN_API_KEY", "etherscan-key")  # irrelevant to an explicit alchemy
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-source", "alchemy"])
+    assert r.exit_code == 1, r.output
+    assert "ERROR: --profile-source alchemy requires ALCHEMY_API_KEY" in r.output
+    assert "Traceback" not in r.output
+    assert isinstance(r.exception, SystemExit)
+
+
+def test_fetch_profile_source_alchemy_blank_env_key_exits_1(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "   ")
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    r = runner.invoke(app, ["fetch", "--db", str(db), "--profile-source", "alchemy"])
+    assert r.exit_code == 1, r.output
+    assert "ALCHEMY_API_KEY" in r.output
+
+
+def test_profile_source_enum_lists_alchemy():
+    assert cli.ProfileSource.alchemy.value == "alchemy"
+    assert cli.ProfileSource("alchemy") is cli.ProfileSource.alchemy
+
+
+def test_fetch_help_lists_alchemy_source_and_env_var():
+    r = runner.invoke(app, ["fetch", "--help"])
+    assert r.exit_code == 0
+    assert "alchemy" in r.output
+    assert "ALCHEMY_API_KEY" in r.output
+    assert "2.5" in r.output  # Alchemy's default rps is documented
+
+
+def test_step_raters_alchemy_builds_real_client_without_network(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALCHEMY_API_KEY", "alchemy-key-0123456789")
+    db = tmp_path / "t.db"
+    with Store(db) as store:
+        summary = cli._step_raters(store, None, profile_source="alchemy")
+    assert "raters profiled: 0" in summary
+
+
+def test_step_raters_alchemy_eta_line_names_alchemy(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_API_KEY", "alchemy-key-0123456789")
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 0)
+    with Store(db) as store:
+        cli._step_raters(store, None, profile_source="alchemy")
+    out = capsys.readouterr().out
+    assert "profiling 1 rater(s) via Alchemy" in out
+    assert "alchemy-key" not in out
+
+
 def test_fetch_profile_source_rejects_invalid_choice(tmp_path):
     r = runner.invoke(app, ["fetch", "--db", str(tmp_path / "t.db"), "--profile-source", "bogus", "--dry-run"])
     assert r.exit_code != 0
@@ -361,7 +486,7 @@ def test_fetch_profile_rps_and_retries_reach_default_client(tmp_path, monkeypatc
     _seed(db, n=1)
     seen = []
 
-    def _fake_default_client(source, key, rps=None, retries=None):
+    def _fake_default_client(source, key, rps=None, retries=None, alchemy_key=None):
         seen.append((source, key, rps, retries))
         return _RpsCapturingClient(key, rps=rps, retries=retries)
 
@@ -383,7 +508,7 @@ def test_fetch_profile_rps_and_retries_default_to_none(tmp_path, monkeypatch):
     _seed(db, n=1)
     seen = []
 
-    def _fake_default_client(source, key, rps=None, retries=None):
+    def _fake_default_client(source, key, rps=None, retries=None, alchemy_key=None):
         seen.append((source, key, rps, retries))
         return _RpsCapturingClient(key, rps=rps, retries=retries)
 
@@ -421,7 +546,7 @@ def test_fetch_eta_uses_effective_rps_from_profile_rps_flag(tmp_path, monkeypatc
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
     monkeypatch.setattr(
         cli, "default_client",
-        lambda source, key, rps=None, retries=None: _RpsCapturingClient(key, rps=rps, retries=retries))
+        lambda source, key, rps=None, retries=None, alchemy_key=None: _RpsCapturingClient(key, rps=rps, retries=retries))
 
     seen_rps = []
     orig_estimate = cli.estimate_seconds
@@ -448,7 +573,7 @@ def test_fetch_eta_uses_client_default_rps_when_flag_omitted(tmp_path, monkeypat
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
     monkeypatch.setattr(
         cli, "default_client",
-        lambda source, key, rps=None, retries=None: _RpsCapturingClient(key, rps=rps, retries=retries))
+        lambda source, key, rps=None, retries=None, alchemy_key=None: _RpsCapturingClient(key, rps=rps, retries=retries))
 
     seen_rps = []
     orig_estimate = cli.estimate_seconds
@@ -1032,7 +1157,7 @@ def test_fetch_eta_branch_prints_estimate(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         cli, "default_client",
-        lambda source, key, rps=None, retries=None: _FakeEtherscanClient(key, rps=rps, retries=retries))
+        lambda source, key, rps=None, retries=None, alchemy_key=None: _FakeEtherscanClient(key, rps=rps, retries=retries))
     monkeypatch.setattr(cli, "enrich_raters", lambda *a, **k: 1)
 
     r = runner.invoke(app, ["fetch", "--db", str(db), "--etherscan-key", "k"])

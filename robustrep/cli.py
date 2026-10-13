@@ -61,6 +61,7 @@ class ProfileSource(str, enum.Enum):
     strings (and so a raw ``"auto"``/etc. from a test compares equal)."""
 
     auto = "auto"
+    alchemy = "alchemy"
     blockscout = "blockscout"
     etherscan = "etherscan"
     none = "none"
@@ -181,15 +182,19 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
     offline (``profile_source="none"``).
 
     ``etherscan_key``, when given, overrides ``ETHERSCAN_API_KEY`` (the key
-    itself is never echoed). ``profile_source`` is one of ``auto`` (default:
-    Blockscout -- free, no key -- unless a key is available, in which case
-    Etherscan V2), ``blockscout``, ``etherscan`` (requires a key) or ``none``
-    (offline fallback). See ``rater_profile.default_client``. Raises
-    ``RuntimeError`` (from ``enrich_raters``) when some -- but not all --
-    addresses failed, or when the very first one hit a non-retryable
-    plan-configuration error; the caller decides how to handle it. Raises
-    ``ValueError`` when ``profile_source="etherscan"`` but no key is
-    available.
+    itself is never echoed). The Alchemy key is read from ``ALCHEMY_API_KEY``
+    only -- there is deliberately no CLI flag for it (a command-line argument
+    is visible to other local users via ``ps``) -- and is likewise never
+    echoed. ``profile_source`` is one of ``auto`` (default: Etherscan V2 if
+    an Etherscan key is available, else Alchemy if ``ALCHEMY_API_KEY`` is
+    set, else Blockscout), ``alchemy`` (requires ``ALCHEMY_API_KEY``),
+    ``blockscout``, ``etherscan`` (requires a key) or ``none`` (offline
+    fallback). See ``rater_profile.default_client``. Raises ``RuntimeError``
+    (from ``enrich_raters``) when some -- but not all -- addresses failed,
+    or when the very first one hit a non-retryable plan-configuration error;
+    the caller decides how to handle it. Raises ``ValueError`` when
+    ``profile_source`` is ``"etherscan"``/``"alchemy"`` but the matching key
+    is not available.
 
     ``profile_rps``/``profile_retries``, when given (not ``None``), override
     the chosen client's own default request rate / retry count -- see
@@ -199,12 +204,14 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
     given, else whatever the client itself defaulted to.
     """
     key = etherscan_key if etherscan_key is not None else os.environ.get("ETHERSCAN_API_KEY")
+    alchemy_key = (os.environ.get("ALCHEMY_API_KEY") or "").strip() or None
     # `profile_source` may be a ProfileSource (from the `fetch` CLI option) or
     # a plain string (direct callers, tests) -- normalize via `.value` rather
     # than `str(...)`, which on a `(str, Enum)` member yields "ProfileSource.
     # auto" rather than "auto".
     source = profile_source.value if isinstance(profile_source, ProfileSource) else profile_source
-    client = default_client(source, key, rps=profile_rps, retries=profile_retries)
+    client = default_client(source, key, rps=profile_rps, retries=profile_retries,
+                            alchemy_key=alchemy_key)
     # store.distinct_clients() computed exactly once here and handed to
     # enrich_raters(addresses=...) below, instead of letting it re-query the
     # store itself.
@@ -306,18 +313,21 @@ def fetch(
              "score/report fail on every run. Ignored together with --skip-raters."),
     profile_source: ProfileSource = typer.Option(
         ProfileSource.auto, "--profile-source",
-        help="Rater-profile HTTP source: 'auto' (default) uses Blockscout (free, no key) unless an "
-             "Etherscan key is available, in which case Etherscan V2; 'blockscout' always uses Base's "
-             "free Blockscout instance; 'etherscan' always uses Etherscan V2 (requires a key -- note "
-             "Etherscan's free plan does not cover Base); 'none' skips profiling (offline fallback)."),
+        help="Rater-profile HTTP source: 'auto' (default) uses Etherscan V2 if an Etherscan key is "
+             "available, else Alchemy if ALCHEMY_API_KEY is set, else Blockscout; 'alchemy' always "
+             "uses Alchemy (requires ALCHEMY_API_KEY in the environment -- there is no flag for it; "
+             "its free plan covers Base); 'blockscout' always uses Base's Blockscout instance (keyless, "
+             "but its free tier stopped serving Base in 2026-10); 'etherscan' always uses Etherscan V2 "
+             "(requires a key -- note Etherscan's free plan does not cover Base); 'none' skips "
+             "profiling (offline fallback)."),
     profile_rps: Optional[float] = typer.Option(
         None, "--profile-rps", min=0.1,
         help="Requests/sec against the rater-profile HTTP source (default: the chosen client's own "
-             "default -- 1.0 for Blockscout, 4.0 for Etherscan)."),
+             "default -- 2.5 for Alchemy, 1.0 for Blockscout, 4.0 for Etherscan)."),
     profile_retries: Optional[int] = typer.Option(
         None, "--profile-retries", min=1,
         help="Retry attempts for a transient rater-profile HTTP failure, per address (default: the "
-             "chosen client's own default -- 5 for Blockscout, 3 for Etherscan)."),
+             "chosen client's own default -- 5 for Alchemy, 5 for Blockscout, 3 for Etherscan)."),
     skip_evidence: bool = typer.Option(False, "--skip-evidence", help="Skip evidence URI classification."),
     evidence_workers: int = typer.Option(
         8, "--evidence-workers", min=1,
@@ -333,8 +343,8 @@ def fetch(
     timestamp, which otherwise fails score/report on every run.
 
     Exits 0 on full success; 1 for a bad-input error (an invalid option
-    combination that Config itself rejects, or --profile-source etherscan
-    with no key available); 2 when rater profiling partially failed (some
+    combination that Config itself rejects, or --profile-source etherscan/
+    alchemy with no key available); 2 when rater profiling partially failed (some
     addresses errored, the rest -- and every other step -- still completed;
     see _step_raters); 3 when an RPC call failed on every retry.
     --dry-run never opens or creates the store file when it does not already
