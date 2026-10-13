@@ -183,10 +183,27 @@ def _step_owners(store: Store, rpc: RpcClient, log_every: int = OWNER_LOG_EVERY,
     return f"agent owners resolved: {resolved}/{len(agents)}"
 
 
+def _funder_kinds_line(before: dict, after: dict) -> str:
+    """``funder kinds this run: transfer +n, owner +n, none +n, unknown +n`` --
+    what this run wrote per ``funder_kind`` (``Store.funder_kind_counts``
+    before vs after), so the owner pass's ``owner``/``none`` counts are visible
+    without a later report's provenance."""
+    parts = ", ".join(f"{kind} {after[kind] - before[kind]:+d}" for kind in after)
+    return f"funder kinds this run: {parts}"
+
+
 def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str = ProfileSource.auto,
-                  profile_rps: Optional[float] = None, profile_retries: Optional[int] = None) -> str:
+                  profile_rps: Optional[float] = None, profile_retries: Optional[int] = None,
+                  rpc: Optional[RpcClient] = None) -> str:
     """Profile not-yet-profiled raters via ``profile_source``, or fall back
     offline (``profile_source="none"``).
+
+    ``rpc``, when given, is handed to ``enrich_raters`` for its owner pass
+    (``rater_profile.enrich_raters``: raters with no incoming transfer are
+    linked by the smart account's controlling key); the summary line then
+    also reports how many rows of each ``funder_kind`` this run wrote.
+    With ``profile_source="none"`` there is no client, so neither pass runs
+    and no rows are written, whatever ``rpc`` is.
 
     ``etherscan_key``, when given, overrides ``ETHERSCAN_API_KEY`` (the key
     itself is never echoed). The Alchemy key is read from ``ALCHEMY_API_KEY``
@@ -228,10 +245,14 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
         eta_h = estimate_seconds(len(targets), effective_rps) / 3600
         source_label = getattr(client, "source", "etherscan").capitalize()
         typer.echo(f"profiling {len(targets)} rater(s) via {source_label}, ETA ~{eta_h:.1f}h")
-    n = enrich_raters(store, client, addresses=targets)
+    before = store.funder_kind_counts()
+    n = enrich_raters(store, client, addresses=targets, rpc=rpc)
     mode = store.get_sync("rater_profile_mode") or "unknown"
-    fallback_note = "" if client is not None else " (fallback: --profile-source none; rows not written)"
-    return f"raters profiled: {n}{fallback_note}; rater profile mode: {mode}"
+    if client is None:
+        return (f"raters profiled: {n} (fallback: --profile-source none; rows not written); "
+                f"rater profile mode: {mode}")
+    kinds = _funder_kinds_line(before, store.funder_kind_counts())
+    return f"raters profiled: {n}; {kinds}; rater profile mode: {mode}"
 
 
 def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
@@ -262,7 +283,8 @@ def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
 
 def _run_raters_step(store: Store, *, skip_raters: bool, reprofile_raters: bool,
                       etherscan_key: Optional[str], profile_source: str,
-                      profile_rps: Optional[float], profile_retries: Optional[int]) -> bool:
+                      profile_rps: Optional[float], profile_retries: Optional[int],
+                      rpc: Optional[RpcClient] = None) -> bool:
     """Run (or skip) the rater-profiling step of ``fetch`` and echo its summary
     line. Returns ``True`` when profiling partially failed -- some addresses
     errored while every other step completed -- which ``fetch`` turns into exit
@@ -284,7 +306,7 @@ def _run_raters_step(store: Store, *, skip_raters: bool, reprofile_raters: bool,
         typer.echo(f"rater profiles cleared: {n_cleared}")
     try:
         typer.echo(_step_raters(store, etherscan_key, profile_source=profile_source,
-                                profile_rps=profile_rps, profile_retries=profile_retries))
+                                profile_rps=profile_rps, profile_retries=profile_retries, rpc=rpc))
     except ValueError as e:
         typer.echo(f"ERROR: {e}")
         raise typer.Exit(1)
@@ -394,7 +416,7 @@ def fetch(
         partial_failure = _run_raters_step(
             store, skip_raters=skip_raters, reprofile_raters=reprofile_raters,
             etherscan_key=etherscan_key, profile_source=profile_source,
-            profile_rps=profile_rps, profile_retries=profile_retries)
+            profile_rps=profile_rps, profile_retries=profile_retries, rpc=rpc)
 
         with _rpc_guard():
             if skip_evidence:

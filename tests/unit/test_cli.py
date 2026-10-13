@@ -1637,7 +1637,7 @@ def test_fetch_reprofile_raters_clears_the_cache_before_profiling(tmp_path, monk
     _seed(db, n=2)  # both raters already profiled
     seen = {}
 
-    def _enrich(store, client, addresses=None):
+    def _enrich(store, client, addresses=None, *, rpc=None):
         seen["targets"] = list(addresses or [])
         return len(seen["targets"])
 
@@ -1655,7 +1655,7 @@ def test_fetch_without_reprofile_raters_keeps_the_cache(tmp_path, monkeypatch):
     _seed(db, n=2)
     seen = {}
 
-    def _enrich(store, client, addresses=None):
+    def _enrich(store, client, addresses=None, *, rpc=None):
         seen["targets"] = list(addresses or [])
         return 0
 
@@ -1859,3 +1859,78 @@ def test_step_evidence_uses_the_named_cap_keys(tmp_path, monkeypatch):
         assert all(store.get_sync(key) is not None for key in publish.EVIDENCE_CAP_KEYS)
         assert publish.evidence_caps_for_provenance(store) == {
             "evidence_max_lookups_per_uri": 8, "evidence_max_total_lookups": 20000}
+
+
+# --- owner pass wiring: the fetch RpcClient reaches enrich_raters -----------------
+
+
+def test_step_raters_passes_rpc_through_to_enrich_raters(tmp_path, monkeypatch):
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "ALCHEMY-TEST-KEY-VALUE-0123456789")
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    seen = {}
+
+    def _enrich(store, client, addresses=None, *, rpc=None):
+        seen["rpc"] = rpc
+        return 0
+
+    monkeypatch.setattr(cli, "enrich_raters", _enrich)
+    sentinel = object()
+    with Store(db) as store:
+        cli._step_raters(store, None, profile_source="alchemy", rpc=sentinel)
+    assert seen["rpc"] is sentinel
+
+
+def test_fetch_hands_its_rpc_client_to_the_raters_step(tmp_path, monkeypatch):
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "ALCHEMY-TEST-KEY-VALUE-0123456789")
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    seen = {}
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+
+    def _enrich(store, client, addresses=None, *, rpc=None):
+        seen["rpc"] = rpc
+        return 0
+
+    monkeypatch.setattr(cli, "enrich_raters", _enrich)
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert isinstance(seen["rpc"], _FakeRpc)
+
+
+def test_step_raters_line_reports_the_funder_kinds_written_this_run(tmp_path, monkeypatch):
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "ALCHEMY-TEST-KEY-VALUE-0123456789")
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=3)
+
+    def _enrich(store, client, addresses=None, *, rpc=None):
+        store.upsert_rater(addresses[0], 10, "0x" + "f" * 40, "transfer")
+        store.upsert_rater(addresses[1], None, "0x" + "e" * 40, "owner")
+        store.upsert_rater(addresses[2], None, None, "none")
+        store.set_sync("rater_profile_mode", "alchemy")
+        return 6
+
+    monkeypatch.setattr(cli, "enrich_raters", _enrich)
+    with Store(db) as store:
+        store.upsert_rater("0x" + "9" * 40, 1, "0x" + "8" * 40, "transfer")  # pre-existing: not "this run"
+        line = cli._step_raters(store, None, profile_source="alchemy", rpc=object())
+    assert "raters profiled: 6" in line
+    assert "funder kinds this run: transfer +1, owner +1, none +1, unknown +0" in line
+    assert "rater profile mode: alchemy" in line
+
+
+def test_step_raters_offline_fallback_line_has_no_funder_kinds(tmp_path, monkeypatch):
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    with Store(db) as store:
+        line = cli._step_raters(store, None, profile_source="none", rpc=object())
+    assert "funder kinds" not in line
+    assert "rows not written" in line

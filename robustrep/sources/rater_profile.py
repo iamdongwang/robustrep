@@ -1,8 +1,13 @@
 """First-seen time and funding source per rater.
 
 Sybil clustering (see ``robustrep.sybil``) needs, per rater address, when it
-first appeared on-chain and who funded it (the ``from`` of its first outgoing
-transaction). Public RPC nodes expose no per-address index for this, so two
+first appeared on-chain and who funded it (the ``from`` of its first incoming
+transfer) -- or, since 2026-10, who *controls* it: measured 2026-10-13 on live
+Base data, 230/230 sampled unprofiled raters were smart-contract accounts that
+never received a transfer at all, so ``enrich_raters`` runs a second pass over
+them that reads the account's controlling key (``account_owner``) and stores it
+in the same ``funder`` column with ``funder_kind = "owner"``. The first pass is
+unchanged. Public RPC nodes expose no per-address index for the transfer, so two
 HTTP clients live here (a third, Alchemy, lives in ``alchemy_profile`` and is
 what ``default_client("auto", ...)`` picks whenever ``ALCHEMY_API_KEY`` is set
 and no Etherscan key is -- since 2026-10 it is the only one whose free plan
@@ -75,13 +80,16 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import requests
 
-from ..store import Store
+from ..store import FUNDER_KIND_NONE, FUNDER_KIND_OWNER, FUNDER_KIND_TRANSFER, Store
 from . import blockscout_util
+from .account_owner import account_owners
 from .alchemy_profile import AlchemyClient
+from .base_erc8004 import BatchState
 from .http_util import install_key_redaction
 from .profile_http import (
     MAX_PLAUSIBLE_TS,
@@ -96,8 +104,18 @@ from .profile_http import (
     plausible_ts,
     warn_bad_ts,
 )
+from .rpc import RpcError
 
 logger = logging.getLogger(__name__)
+
+# Addresses per JSON-RPC batch in the owner pass (see ``account_owner.
+# account_owners``); also the unit of failure there -- an ``RpcError`` escaping
+# a chunk marks that whole chunk failed (its rows stay NULL for the next run).
+OWNER_PASS_BATCH = 50
+# What the owner pass asks Alchemy for when no owner resolved: a smart account
+# may have been funded only by an internal (contract-to-contract) transfer,
+# invisible to the external-only lookup of pass 1.
+INTERNAL_RETRY_CATEGORIES = ("external", "internal")
 
 ETHERSCAN_V2 = "https://api.etherscan.io/v2/api"
 # Base's Blockscout instance, exposing an Etherscan-compatible `?module=
@@ -528,51 +546,194 @@ def estimate_seconds(n_addresses: int, rps: float) -> float:
     return n_addresses / rps
 
 
-def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2Client | AlchemyClient"],
-                   addresses: Optional[list[str]] = None) -> int:
-    """Fill the raters table for every client address not yet profiled.
+@dataclass
+class _Progress:
+    """Bookkeeping for one ``enrich_raters`` run, shared by both passes:
+    addresses that failed (listed in the final ``RuntimeError``), rows written
+    (the returned count) and client calls attempted -- the first-address
+    abort rule for ``ProfilePlanError`` keys off the latter, so it holds
+    whichever pass makes the run's first client call."""
+    failures: list[str] = field(default_factory=list)
+    processed: int = 0
+    attempted: int = 0
 
-    With ``client``, looks up each address's first transaction. A failure on
+
+def _lookup(progress: _Progress, client, address: str, **kw) -> tuple[bool, Optional[tuple[int, int, str]]]:
+    """One ``client.first_tx(address, **kw)`` under the per-address failure
+    rules: returns ``(True, result)`` on success, ``(False, None)`` after
+    logging and recording a failure. A ``ProfilePlanError`` on the run's
+    very first client call is re-raised instead (see ``enrich_raters``)."""
+    try:
+        got = client.first_tx(address, **kw)
+    except ProfilePlanError:
+        if progress.attempted == 0:
+            raise
+        logger.error("rater_profile: failed to enrich %s: plan does not support this chain", address)
+        progress.failures.append(address)
+        return False, None
+    except Exception as e:
+        logger.error("rater_profile: failed to enrich %s: %s", address, e)
+        progress.failures.append(address)
+        return False, None
+    finally:
+        progress.attempted += 1
+    return True, got
+
+
+def _transfer_pass(store: Store, client, addrs: list[str], progress: _Progress) -> None:
+    """Pass 1: the first incoming transfer of every address in ``addrs``. A
+    found funder is written with ``funder_kind="transfer"``; an address with
+    no transfer gets a row with no funder and a NULL kind, which is exactly
+    what ``Store.raters_needing_owner_lookup`` hands to pass 2."""
+    found = 0
+    for a in addrs:
+        ok, got = _lookup(progress, client, a)
+        if not ok:
+            continue
+        if got is None:
+            store.upsert_rater(a, None, None)
+        else:
+            _, ts, funder = got
+            store.upsert_rater(a, ts, funder, FUNDER_KIND_TRANSFER)
+            found += 1
+        progress.processed += 1
+    logger.info("rater_profile: pass 1 (first transfer): %d address(es), %d funder(s) found, %d failed",
+                len(addrs), found, len(progress.failures))
+
+
+def _settle(store: Store, client, address: str, owner: Optional[str], progress: _Progress) -> Optional[str]:
+    """Write pass 2's verdict for one address and name it (``"owner"``,
+    ``"transfer-internal"``, ``"none"``), or ``None`` when the Alchemy retry
+    failed and the row is left for the next run.
+
+    An owner row keeps ``first_seen_ts`` NULL on purpose: the account's
+    creation time is not what the owner call returns, and
+    ``robustrep.sybil.profiles_from_records`` already falls back to the
+    rater's earliest feedback time for a NULL. Writing that derivable
+    approximation into the cache would make it indistinguishable from a
+    measured value and violate the M4 rule that the raters table never holds
+    an approximate timestamp."""
+    if owner is not None:
+        store.upsert_rater(address, None, owner, FUNDER_KIND_OWNER)
+        progress.processed += 1
+        return "owner"
+    if isinstance(client, AlchemyClient):
+        ok, got = _lookup(progress, client, address, categories=INTERNAL_RETRY_CATEGORIES)
+        if not ok:
+            return None
+        if got is not None:
+            _, ts, funder = got
+            store.upsert_rater(address, ts, funder, FUNDER_KIND_TRANSFER)
+            progress.processed += 1
+            return "transfer-internal"
+    store.upsert_rater(address, None, None, FUNDER_KIND_NONE)
+    progress.processed += 1
+    return "none"
+
+
+def _owner_pass(store: Store, client, rpc, progress: _Progress) -> None:
+    """Pass 2 over ``Store.raters_needing_owner_lookup()``: (a) the smart
+    account's controlling key via ``account_owners`` (batched, with the
+    ``owners_of``-style per-address fallback); (b) for the rest, when the
+    client is Alchemy, a retry of ``first_tx`` that also admits internal
+    transfers; (c) still nothing -> ``funder_kind="none"``, never retried.
+    An ``RpcError`` escaping a chunk of (a) marks every address in that chunk
+    failed (one ERROR line; their rows stay NULL for the next run) -- the
+    RPC client has already spent its own retries by then, so retrying each
+    address individually would only repeat the same outage 50 times."""
+    pending = store.raters_needing_owner_lookup()
+    if not pending:
+        return
+    counts = {"owner": 0, "transfer-internal": 0, "none": 0}
+    failed_before = len(progress.failures)
+    state = BatchState()
+    for i in range(0, len(pending), OWNER_PASS_BATCH):
+        chunk = pending[i:i + OWNER_PASS_BATCH]
+        try:
+            owners = account_owners(rpc, chunk, batch_size=OWNER_PASS_BATCH, state=state)
+        except RpcError as e:
+            logger.error("rater_profile: owner lookup failed for %d address(es) starting at %s: %s",
+                         len(chunk), chunk[0], e)
+            progress.failures.extend(chunk)
+            continue
+        for a in chunk:
+            verdict = _settle(store, client, a, owners.get(a), progress)
+            if verdict is not None:
+                counts[verdict] += 1
+    logger.info("rater_profile: pass 2 (owner): %d address(es) (owner: %d, transfer-internal: %d, none: %d), "
+                "%d failed", len(pending), counts["owner"], counts["transfer-internal"], counts["none"],
+                len(progress.failures) - failed_before)
+
+
+def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2Client | AlchemyClient"],
+                  addresses: Optional[list[str]] = None, *, rpc=None) -> int:
+    """Fill the raters table for every client address not yet profiled, in two
+    passes.
+
+    **Pass 1** (with ``client``) looks up each address's first incoming
+    transfer: a funder is written with ``funder_kind="transfer"``; an address
+    with no transfer gets a row with no funder and a NULL kind. A failure on
     one address does not lose the others: every address is attempted,
     successes are upserted, and if any failed a ``RuntimeError`` listing them
     (count + first 5) is raised at the end -- but only after the successful
-    ones have been persisted and the mode recorded. Sets
-    ``rater_profile_mode`` to ``client.source`` (``"blockscout"``,
-    ``"etherscan"`` or ``"alchemy"``; ``"etherscan"`` for any client without a ``source``
-    attribute, for compatibility with simple duck-typed test doubles) when
-    every address succeeded, or ``"<source>-partial"`` when some failed.
+    ones have been persisted and the mode recorded.
 
-    Exception: if the *first* address attempted raises ``ProfilePlanError``
+    **Pass 2** (with ``rpc``, an ``RpcClient``) runs over every row whose
+    funder is empty and whose kind is still NULL (``Store.
+    raters_needing_owner_lookup`` -- this run's pass-1 misses and any legacy
+    rows): since 2026-10 nearly every new ERC-8004 rater on Base is a
+    smart-contract account that never received a transfer (230/230 sampled
+    2026-10-13), so its *controlling key* is read instead
+    (``account_owner.account_owners``: ``ownerAtIndex``, then ``owner()``) and
+    stored as the funder with ``funder_kind="owner"`` and ``first_seen_ts``
+    left NULL (see ``_settle`` for why). Addresses with no owner are, when
+    ``client`` is an ``AlchemyClient``, retried with internal transfers
+    admitted (``INTERNAL_RETRY_CATEGORIES``) and written as ``"transfer"`` on
+    a hit; what is still unresolved is written as ``"none"`` so no later run
+    retries it. Per-address failures in pass 2 are collected like pass 1's
+    (an ``RpcError`` escaping a chunk fails that chunk -- see ``_owner_pass``).
+    Without ``rpc`` there is no pass 2 and pass-1 misses keep their NULL kind
+    for a later run that has one.
+
+    Sets ``rater_profile_mode`` to ``client.source`` (``"blockscout"``,
+    ``"etherscan"`` or ``"alchemy"``; ``"etherscan"`` for any client without a
+    ``source`` attribute, for compatibility with simple duck-typed test
+    doubles) when every address succeeded, or ``"<source>-partial"`` when some
+    failed.
+
+    Exception: if the run's *first* client call raises ``ProfilePlanError``
     (the configured plan/key/network cannot serve this chain -- see
-    ``profile_http.ProfilePlanError``; ``EtherscanPlanError`` is one), that error is re-raised immediately instead of being counted
-    as a per-address failure and continuing -- a plan-level rejection will
-    fail identically for every remaining address, so there is no reason to
-    burn through (and log an ERROR for) all of them just to say so 13,000
-    times. A plan error on any *later* address is still just one more
-    per-address failure, since by then real progress may have been made.
+    ``profile_http.ProfilePlanError``; ``EtherscanPlanError`` is one), that
+    error is re-raised immediately instead of being counted as a per-address
+    failure and continuing -- a plan-level rejection will fail identically
+    for every remaining address, so there is no reason to burn through (and
+    log an ERROR for) all of them just to say so 13,000 times. A plan error
+    on any *later* call is still just one more per-address failure, since by
+    then real progress may have been made.
 
-    Without ``client`` (offline fallback), writes *no* rows at all -- see the
-    module docstring for why sticky fallback rows would be worse than none.
-    Just records ``rater_profile_mode = "fallback"``, logs one WARNING if any
-    feedback still lacks a cached block timestamp (``Store.n_missing_block_ts()
-    > 0``, meaning ``robustrep.sources.base_erc8004.fill_block_timestamps``
-    should be run first), and returns the number of still-unprofiled
-    addresses as an informational count (nothing was written).
+    Without ``client`` (offline fallback), writes *no* rows at all and runs
+    no pass 2 whatever ``rpc`` is -- see the module docstring for why sticky
+    fallback rows would be worse than none. Just records
+    ``rater_profile_mode = "fallback"``, logs one WARNING if any feedback
+    still lacks a cached block timestamp (``Store.n_missing_block_ts() > 0``,
+    meaning ``robustrep.sources.base_erc8004.fill_block_timestamps`` should
+    be run first), and returns the number of still-unprofiled addresses as an
+    informational count (nothing was written).
 
     ``addresses``, when given, is used verbatim instead of calling
     ``store.distinct_clients()`` -- for a caller (e.g. the CLI) that already
     computed the target list, so it isn't queried from the store twice.
 
-    Returns the number of addresses successfully processed with a client, or
+    Returns the number of rows written across both passes with a client, or
     the number of still-unprofiled addresses in fallback mode; 0 (no HTTP
     calls, no store writes, no mode change) when every client address is
-    already profiled.
+    already profiled and nothing awaits the owner pass.
     """
     addrs = store.distinct_clients() if addresses is None else addresses
-    if not addrs:
-        return 0
 
     if client is None:
+        if not addrs:
+            return 0
         n_missing = store.n_missing_block_ts()
         if n_missing > 0:
             logger.warning(
@@ -583,32 +744,19 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
         return len(addrs)
 
     source = getattr(client, "source", "etherscan")
-    failures: list[str] = []
-    processed = 0
-    for idx, a in enumerate(addrs):
-        try:
-            got = client.first_tx(a)
-        except ProfilePlanError:
-            if idx == 0:
-                raise
-            logger.error("rater_profile: failed to enrich %s: plan does not support this chain", a)
-            failures.append(a)
-            continue
-        except Exception as e:
-            logger.error("rater_profile: failed to enrich %s: %s", a, e)
-            failures.append(a)
-            continue
-        if got is None:
-            store.upsert_rater(a, None, None)
-        else:
-            _, ts, funder = got
-            store.upsert_rater(a, ts, funder)
-        processed += 1
+    progress = _Progress()
+    if addrs:
+        _transfer_pass(store, client, addrs, progress)
+    if rpc is not None:
+        _owner_pass(store, client, rpc, progress)
 
-    if failures:
+    if progress.failures:
         store.set_sync("rater_profile_mode", f"{source}-partial")
+        failures = progress.failures
         shown = ", ".join(failures[:5])
         more = f" (+{len(failures) - 5} more)" if len(failures) > 5 else ""
         raise RuntimeError(f"rater_profile: {len(failures)} address(es) failed to enrich: {shown}{more}")
+    if progress.processed == 0:
+        return 0
     store.set_sync("rater_profile_mode", source)
-    return processed
+    return progress.processed

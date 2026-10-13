@@ -902,3 +902,23 @@ def test_first_tx_http_401_oversized_body_is_still_a_config_error(monkeypatch, d
     assert len(http.calls) == 1
     assert "SECRETBODY" not in debug_log.text
     assert http.responses_made[0].closed is True
+
+
+# --- categories: the owner pass's internal-transfer retry --------------------------
+
+
+def test_first_tx_categories_default_to_external_only():
+    import inspect
+
+    assert inspect.signature(AlchemyClient.first_tx).parameters["categories"].default == ("external",)
+
+
+def test_first_tx_retry_request_asks_for_external_and_internal_transfers():
+    http = FakeAlchemyHttp([ok([transfer()])])
+    got = client(http).first_tx(ADDR, categories=("external", "internal"))
+    assert got is not None
+    body = http.calls[0]["json"]
+    assert body["params"][0]["category"] == ["external", "internal"]
+    # Nothing else about the request changes.
+    assert body["params"][0]["toAddress"] == ADDR.lower()
+    assert body["params"][0]["order"] == "asc" and body["params"][0]["maxCount"] == "0x1"
