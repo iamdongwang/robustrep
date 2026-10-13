@@ -16,6 +16,7 @@ import requests
 from robustrep.sources import alchemy_profile, http_util, profile_http
 from robustrep.sources.alchemy_profile import (
     ALCHEMY_BASE_URL,
+    CONFIG_REJECTED_MESSAGE,
     DEFAULT_ALCHEMY_RPS,
     AlchemyClient,
     AlchemyConfigError,
@@ -54,6 +55,9 @@ class _FakeRaw:
 
 
 class _ExplodingRaw:
+    """A body that must never be read: a transient HTTP error (429/5xx) is
+    classified from its status alone, and a 4xx the test gave no body to."""
+
     def read(self, amt, decode_content=True):
         raise AssertionError("body must not be read when raise_for_status() raises")
 
@@ -61,8 +65,10 @@ class _ExplodingRaw:
 class _FakeResponse:
     def __init__(self, payload=None, *, body=None, status_code=200, error=None):
         self.status_code, self._error, self.closed = status_code, error, False
-        self.raw = _ExplodingRaw() if error is not None else _FakeRaw(
-            body if body is not None else json.dumps(payload).encode())
+        if error is not None and body is None:
+            self.raw = _ExplodingRaw()
+        else:
+            self.raw = _FakeRaw(body if body is not None else json.dumps(payload).encode())
 
     def raise_for_status(self):
         if self._error is not None:
@@ -82,11 +88,17 @@ def _http_error(status_code, url, headers=None):
     return err
 
 
+def _as_bytes(body) -> bytes:
+    return body if isinstance(body, bytes) else json.dumps(body).encode()
+
+
 class FakeAlchemyHttp:
     """Each item in ``responses`` is a dict body (200 OK), raw ``bytes`` (200
-    with that body), an int HTTP status (raised via ``raise_for_status``), a
-    ``(status, headers)`` tuple, or an exception instance (raised by ``post``
-    itself -- a connection error)."""
+    with that body), an int HTTP status (raised via ``raise_for_status``; the
+    body then must not be read), a ``(status, headers)`` tuple, a ``(status,
+    headers, body)`` tuple (an error status whose body -- ``bytes`` or a
+    dict -- the client may read, as it does for a non-transient 4xx), or an
+    exception instance (raised by ``post`` itself -- a connection error)."""
 
     def __init__(self, responses):
         self.responses, self.calls, self.responses_made = list(responses), [], []
@@ -97,8 +109,9 @@ class FakeAlchemyHttp:
         if isinstance(item, BaseException):
             raise item
         if isinstance(item, (int, tuple)):
-            status, headers = item if isinstance(item, tuple) else (item, {})
-            r = _FakeResponse(status_code=status, error=_http_error(status, url, headers))
+            status, headers, body = (item, {}, None) if isinstance(item, int) else (tuple(item) + (None,))[:3]
+            body = None if body is None else _as_bytes(body)  # `json` here is post()'s kwarg
+            r = _FakeResponse(status_code=status, body=body, error=_http_error(status, url, headers))
         elif isinstance(item, bytes):
             r = _FakeResponse(body=item)
         else:
@@ -114,6 +127,14 @@ def transfer(block_hex="0x1a2b", ts="2026-02-22T21:16:19.000Z", frm="0xFUNDER", 
 
 def ok(transfers):
     return {"jsonrpc": "2.0", "id": 1, "result": {"transfers": transfers}}
+
+
+# Bodies the live service answered with on 2026-10-13: HTTP 401 for a bad key,
+# HTTP 403 for a network the app has not enabled.
+BODY_401 = (b'{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Must be authenticated!"}}')
+BODY_403_NOT_ENABLED = (
+    b'{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"BASE_MAINNET is not enabled for this '
+    b'app. Visit this page to enable the network: https://dashboard.alchemy.com/apps/<id>/networks"}}')
 
 
 def rpc_error(code, message):
@@ -353,6 +374,56 @@ def test_first_tx_jsonrpc_rate_error_then_success():
     assert len(http.calls) == 2
 
 
+@pytest.mark.parametrize("err", [
+    rpc_error(429, "API key rate limit exceeded"),
+    rpc_error(429, "Must be authenticated!"),  # code 429 outranks any config-looking text
+    rpc_error(-32000, "API key throughput limit reached"),
+])
+def test_first_tx_rate_limit_outranks_config_rejected_text(err):
+    # "API key rate limit exceeded" names the key *and* a rate limit; it is a
+    # transient condition, not a rejected key, so it must be retried rather
+    # than aborting the whole profiling step.
+    http = FakeAlchemyHttp([err, ok([transfer()])])
+    assert client(http).first_tx(ADDR) is not None
+    assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize("message", [
+    "rate limit exceeded", "Rate-Limit hit", "RATE LIMITED", "Throughput limit reached", "over capacity",
+])
+def test_first_tx_rate_limit_substrings_are_transient(message):
+    http = FakeAlchemyHttp([rpc_error(-32000, message), ok([transfer()])])
+    assert client(http).first_tx(ADDR) is not None
+    assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize("message", [
+    "could not enumerate transfers", "cannot operate on this address", "moderate load", "integrate first",
+])
+def test_first_tx_message_merely_containing_rate_fails_fast(message, debug_log):
+    # A bare "rate" substring matched "enumerate"/"operate"/"moderate"; those
+    # are permanent errors that must not burn the retry budget.
+    http = FakeAlchemyHttp([rpc_error(-32000, message)] * 5)
+    with pytest.raises(RuntimeError) as exc:
+        client(http, retries=5).first_tx(ADDR)
+    assert not isinstance(exc.value, ProfilePlanError)
+    assert len(http.calls) == 1
+    assert str(exc.value) == f"Alchemy JSON-RPC error for {ADDR.lower()}"
+    _assert_key_hidden(exc.value, debug_log)
+
+
+def test_first_tx_null_error_member_beside_a_result_is_a_success():
+    body = {"jsonrpc": "2.0", "id": 1, "result": {"transfers": [transfer()]}, "error": None}
+    assert client(FakeAlchemyHttp([body])).first_tx(ADDR)[0] == 0x1a2b
+
+
+def test_first_tx_null_error_member_without_a_result_is_a_value_error():
+    body = {"jsonrpc": "2.0", "id": 1, "error": None}
+    with pytest.raises(ValueError) as exc:
+        client(FakeAlchemyHttp([body])).first_tx(ADDR)
+    assert ADDR.lower() in str(exc.value)
+
+
 def test_first_tx_other_jsonrpc_error_raises_runtime_error_without_server_text(debug_log):
     http = FakeAlchemyHttp([rpc_error(-32602, "SERVER-SAID-SOMETHING-SPECIFIC")] * 2)
     with pytest.raises(RuntimeError) as exc:
@@ -377,7 +448,7 @@ def test_first_tx_jsonrpc_error_server_text_is_length_bounded_in_debug_log(debug
     assert len(debug_log.text) < 2_000
 
 
-@pytest.mark.parametrize("error", ["just a string", 42, None, ["list"], {}])
+@pytest.mark.parametrize("error", ["just a string", 42, 0, False, ["list"], {}])
 def test_first_tx_jsonrpc_error_of_odd_shape_is_a_runtime_error(error, debug_log):
     http = FakeAlchemyHttp([{"jsonrpc": "2.0", "id": 1, "error": error}])
     with pytest.raises(RuntimeError) as exc:
@@ -439,16 +510,102 @@ def test_first_tx_429_exhausted_names_status_429(debug_log):
     _assert_key_hidden(exc.value, debug_log)
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404])
-def test_first_tx_non_transient_4xx_raises_immediately_with_status(status, debug_log):
-    http = FakeAlchemyHttp([status] * 3)
+@pytest.mark.parametrize("status,body", [
+    (400, b""), (404, b""), (400, b"<html>bad request</html>"), (404, rpc_error(-32601, "method not found")),
+    (403, b""), (403, b"<html>forbidden</html>"), (403, b"[1, 2]"), (403, b"null"),
+    (403, rpc_error(-32602, "SERVER-SAID-SOMETHING-SPECIFIC")),
+    (403, {"jsonrpc": "2.0", "id": 1, "error": "just a string"}),
+    (403, {"jsonrpc": "2.0", "id": 1, "error": None, "result": None}),
+    (403, rpc_error(429, "rate limited")),  # an HTTP 403 is permanent whatever the body claims
+])
+def test_first_tx_non_transient_4xx_raises_immediately_with_status(status, body, debug_log):
+    http = FakeAlchemyHttp([(status, {}, body)] * 3)
     with pytest.raises(RuntimeError) as exc:
         client(http, retries=3).first_tx(ADDR)
     assert not isinstance(exc.value, ProfilePlanError)
     assert len(http.calls) == 1
     assert str(exc.value) == f"Alchemy HTTP {status} for {ADDR.lower()}"
+    assert http.responses_made[0].closed is True
     _assert_key_hidden(exc.value, debug_log)
     assert exc.value.__suppress_context__  # the requests exception (URL + key) is not chained visibly
+    for text in ("forbidden", "bad request", "SERVER-SAID", "just a string"):
+        assert text not in str(exc.value)
+        assert not any(text in r.getMessage() for r in debug_log.records if r.levelno > logging.DEBUG)
+
+
+def test_first_tx_http_401_raises_config_error_on_the_first_attempt(debug_log):
+    http = FakeAlchemyHttp([(401, {}, BODY_401)] * 3)
+    with pytest.raises(AlchemyConfigError) as exc:
+        client(http, retries=3).first_tx(ADDR)
+    assert len(http.calls) == 1
+    assert str(exc.value) == CONFIG_REJECTED_MESSAGE
+    assert "authenticated" not in str(exc.value).lower()
+    assert exc.value.__context__ is None and exc.value.__cause__ is None
+    assert http.responses_made[0].closed is True
+    _assert_key_hidden(exc.value, debug_log)
+
+
+@pytest.mark.parametrize("body", [b"", b"<html>unauthorized</html>", b"[1]", b"null",
+                                  rpc_error(-32602, "unrelated"), {"jsonrpc": "2.0", "id": 1}])
+def test_first_tx_http_401_is_a_config_error_regardless_of_body(body, debug_log):
+    http = FakeAlchemyHttp([(401, {}, body)])
+    with pytest.raises(AlchemyConfigError):
+        client(http).first_tx(ADDR)
+    assert len(http.calls) == 1
+    assert "unauthorized" not in debug_log.text
+    assert KEY not in debug_log.text
+
+
+def test_first_tx_http_401_without_a_readable_response_is_still_a_config_error():
+    # The session itself raised the HTTPError (a response hook, say): there is
+    # no response object to read a body from, only the status.
+    err = _http_error(401, f"{ALCHEMY_BASE_URL}/{KEY}")
+    http = FakeAlchemyHttp([err])
+    with pytest.raises(AlchemyConfigError) as exc:
+        client(http).first_tx(ADDR)
+    assert KEY not in str(exc.value) and exc.value.__context__ is None
+
+
+def test_first_tx_http_403_not_enabled_body_raises_config_error(debug_log):
+    http = FakeAlchemyHttp([(403, {}, BODY_403_NOT_ENABLED)] * 3)
+    with pytest.raises(AlchemyConfigError) as exc:
+        client(http, retries=3).first_tx(ADDR)
+    assert len(http.calls) == 1
+    assert str(exc.value) == CONFIG_REJECTED_MESSAGE
+    # The server's text (which names a dashboard URL) is DEBUG-only.
+    assert "dashboard.alchemy.com" not in str(exc.value)
+    assert not any("dashboard" in r.getMessage() for r in debug_log.records if r.levelno > logging.DEBUG)
+    assert any("not enabled" in r.getMessage() for r in debug_log.records
+               if r.levelno == logging.DEBUG and r.name == "robustrep.sources.alchemy_profile")
+    _assert_key_hidden(exc.value, debug_log)
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 418])
+@pytest.mark.parametrize("message", ["Must be authenticated!", "Invalid API key",
+                                     "BASE_MAINNET is not enabled for this app."])
+def test_first_tx_any_non_transient_4xx_with_a_config_rejected_body_is_a_config_error(status, message):
+    http = FakeAlchemyHttp([(status, {}, rpc_error(-32600, message))])
+    with pytest.raises(AlchemyConfigError):
+        client(http).first_tx(ADDR)
+    assert len(http.calls) == 1
+
+
+def test_first_tx_http_403_oversized_body_raises_the_limit_error(monkeypatch, debug_log):
+    monkeypatch.setattr(profile_http, "MAX_PROFILE_RESPONSE_BYTES", 1024)
+    http = FakeAlchemyHttp([(403, {}, b'{"error": {"message": "' + b"SECRETBODY" * 2000 + b'"}}')] * 2)
+    with pytest.raises(RuntimeError) as exc:
+        client(http).first_tx(ADDR)
+    assert not isinstance(exc.value, ProfilePlanError)
+    assert "1024 byte limit" in str(exc.value) and "SECRETBODY" not in str(exc.value)
+    assert "SECRETBODY" not in debug_log.text
+    assert len(http.calls) == 1
+
+
+def test_first_tx_transient_statuses_never_read_the_body():
+    # 429/5xx are classified from the status alone; the fakes' _ExplodingRaw
+    # turns any read into an AssertionError.
+    http = FakeAlchemyHttp([429, 503, ok([transfer()])])
+    assert client(http).first_tx(ADDR) is not None
 
 
 def test_first_tx_connection_error_retried_then_success(debug_log):
@@ -527,6 +684,22 @@ def test_enrich_aborts_on_first_address_with_config_error(tmp_path):
         assert s.get_sync("rater_profile_mode") is None
 
 
+@pytest.mark.parametrize("item", [(401, {}, BODY_401), (403, {}, BODY_403_NOT_ENABLED)])
+def test_enrich_aborts_on_first_address_with_http_config_rejection(tmp_path, item, caplog):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1), fb("0xc", log_index=2)])
+        http = FakeAlchemyHttp([item] * 3)
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(AlchemyConfigError) as exc:
+                enrich_raters(s, client(http))
+        assert str(exc.value) == CONFIG_REJECTED_MESSAGE
+        assert len(http.calls) == 1
+        assert len(s.load_rater_meta()) == 0
+        assert s.get_sync("rater_profile_mode") is None
+        assert KEY not in caplog.text
+        assert not any("failed to enrich" in r.getMessage() for r in caplog.records)
+
+
 def test_enrich_config_error_on_later_address_is_a_regular_failure(tmp_path, caplog):
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1)])
@@ -544,11 +717,12 @@ def test_enrich_config_error_on_later_address_is_a_regular_failure(tmp_path, cap
 def test_enrich_partial_failure_log_never_carries_the_key(tmp_path, caplog):
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([fb("0xa", log_index=0), fb("0xb", log_index=1)])
-        http = FakeAlchemyHttp([403, ok([transfer()])])
+        http = FakeAlchemyHttp([(403, {}, b"<html>forbidden</html>"), ok([transfer()])])
         with caplog.at_level(logging.DEBUG):
             with pytest.raises(RuntimeError):
                 enrich_raters(s, client(http))
         assert KEY not in caplog.text
+        assert "forbidden" not in caplog.text
         assert any("failed to enrich" in r.getMessage() for r in caplog.records)
 
 

@@ -63,9 +63,11 @@ import requests
 from . import blockscout_util
 from .http_util import install_key_redaction, short_for_log
 from .profile_http import (
+    REJECTED,
     REQUEST_TIMEOUT,
     RETRY,
     ProfilePlanError,
+    capped_json,
     fetch_with_retries,
     implausible,
     warn_bad_ts,
@@ -86,13 +88,20 @@ DEFAULT_ALCHEMY_RPS = ALCHEMY_FREE_CU_PER_SECOND / ALCHEMY_CU_PER_GET_ASSET_TRAN
 
 # Substrings (case-insensitive) of a JSON-RPC error message meaning the key
 # or the app's network configuration is rejected -- a configuration problem
-# no retry or different address fixes (AlchemyConfigError).
+# no retry or different address fixes (AlchemyConfigError). Observed live
+# 2026-10-13: "Must be authenticated!" (HTTP 401, bad key) and "BASE_MAINNET
+# is not enabled for this app. ..." (HTTP 403).
 _CONFIG_REJECTED = ("authenticated", "not enabled", "api key")
 # Substrings meaning the app is over its compute-unit budget right now --
-# transient, retried with backoff like an HTTP 429.
-_RATE_LIMITED = ("rate", "capacity", "throughput")
+# transient, retried with backoff like an HTTP 429. Deliberately not the bare
+# "rate": it matched "enumerate", "operate", "moderate" and sent permanent
+# errors around the retry loop.
+_RATE_LIMITED = ("rate limit", "rate-limit", "throughput", "capacity")
 # JSON-RPC error code Alchemy uses for the same condition.
 _RATE_LIMIT_CODE = 429
+# HTTP status for a rejected key: a configuration error whatever the body
+# says (observed live 2026-10-13 with the "Must be authenticated!" body).
+_HTTP_UNAUTHENTICATED = 401
 
 # The one message AlchemyConfigError ever carries: fixed, so no server text
 # (and nothing that could embed the key) reaches a log through it.
@@ -128,10 +137,13 @@ class AlchemyClient:
     response carries a numeric ``Retry-After`` header uses that instead,
     capped at 60s -- see ``profile_http.retry_after_seconds``), then raise
     ``RuntimeError`` (or ``ValueError`` when the last body never parsed as
-    JSON) naming the address and the last HTTP status. Any other HTTP 4xx
-    raises ``RuntimeError`` immediately; a JSON-RPC error body that rejects
-    the key or the network raises ``AlchemyConfigError`` immediately; any
-    other JSON-RPC error raises ``RuntimeError`` immediately. None of those
+    JSON) naming the address and the last HTTP status. HTTP 401, or any
+    other non-transient 4xx whose body is a JSON-RPC error rejecting the key
+    or the network, raises ``AlchemyConfigError`` immediately (see
+    ``_classify_http_error``); any other HTTP 4xx raises ``RuntimeError``
+    immediately; a JSON-RPC error in an HTTP 200 body that rejects the key
+    or the network raises ``AlchemyConfigError`` immediately; any other
+    JSON-RPC error raises ``RuntimeError`` immediately. None of those
     consume a retry. A per-request throttle sleep (``gap = 1/rps``) runs
     after every attempt regardless of outcome (in ``finally``), same as the
     other clients, so the configured rate is respected even while erroring.
@@ -178,7 +190,8 @@ class AlchemyClient:
             "Alchemy", address,
             lambda: self.session.post(self._url, json=payload, timeout=REQUEST_TIMEOUT, stream=True),
             lambda body: self._parse_body(body, address),
-            retries=self.retries, gap=self.gap, sleep=self.sleep)
+            retries=self.retries, gap=self.gap, sleep=self.sleep,
+            on_http_error=lambda code, r: _classify_http_error(code, r, address))
 
     def _parse_body(self, body: dict, address: str):
         """Interpret one decoded JSON-RPC response body. Returns the
@@ -186,8 +199,9 @@ class AlchemyClient:
         ``RETRY`` for a transient body-level error. Raises ``ValueError``
         for a malformed body and ``RuntimeError``/``AlchemyConfigError`` for
         a non-transient JSON-RPC error (see ``first_tx``)."""
-        if "error" in body:
-            return _classify_error(body["error"], address)
+        error = body.get("error")
+        if error is not None:  # ``"error": null`` beside a result is a success
+            return _classify_error(error, address)
         result = body.get("result")
         if not isinstance(result, dict):
             raise ValueError(f"Alchemy response result is not an object for {address}")
@@ -223,23 +237,66 @@ def _request_body(address: str) -> dict:
     }
 
 
-def _classify_error(error, address: str):
-    """Map a JSON-RPC ``error`` member onto the retry contract. Key/network
-    rejections raise ``AlchemyConfigError`` (fixed message); rate/capacity
-    limits -- by code 429 or by message -- return ``RETRY``; anything else
-    raises ``RuntimeError`` naming only the address. The server's own text
-    is remote-chosen, so it is logged at DEBUG only and length-bounded (and
-    never interpolated into a raised message)."""
+def _error_kind(error, address: str) -> str:
+    """``"rate"``, ``"config"`` or ``"other"`` for a JSON-RPC ``error``
+    member of any shape. Rate limiting is checked *first*: Alchemy's own
+    throttling text can read "API key rate limit exceeded", which names the
+    key and so would otherwise be mistaken for a rejected one and abort the
+    whole profiling step over a transient condition. The server's text is
+    remote-chosen, so it is logged at DEBUG only, length-bounded, and never
+    interpolated into anything raised."""
     code = error.get("code") if isinstance(error, dict) else None
     message = error.get("message") if isinstance(error, dict) else None
     low = message.lower() if isinstance(message, str) else ""
     logger.debug("alchemy_profile: JSON-RPC error for %s (code %r): %r",
                  address, short_for_log(code), short_for_log(message))
-    if any(s in low for s in _CONFIG_REJECTED):
-        raise AlchemyConfigError(CONFIG_REJECTED_MESSAGE)
     if code == _RATE_LIMIT_CODE or any(s in low for s in _RATE_LIMITED):
+        return "rate"
+    if any(s in low for s in _CONFIG_REJECTED):
+        return "config"
+    return "other"
+
+
+def _classify_error(error, address: str):
+    """Map a JSON-RPC ``error`` member in an HTTP 200 body onto the retry
+    contract (see ``_error_kind``): rate/capacity limits return ``RETRY``;
+    key/network rejections raise ``AlchemyConfigError`` (fixed message);
+    anything else raises ``RuntimeError`` naming only the address."""
+    kind = _error_kind(error, address)
+    if kind == "rate":
         return RETRY
+    if kind == "config":
+        raise AlchemyConfigError(CONFIG_REJECTED_MESSAGE)
     raise RuntimeError(f"Alchemy JSON-RPC error for {address}")
+
+
+def _classify_http_error(code: int, r, address: str):
+    """``fetch_with_retries``' ``on_http_error`` hook: decide whether a
+    non-transient HTTP status is a configuration error. Alchemy answers a
+    rejected key with HTTP 401 and a network the app has not enabled with
+    HTTP 403, each carrying a JSON-RPC error body (observed live
+    2026-10-13); without this, the first address would fail as a plain
+    ``RuntimeError`` and ``enrich_raters`` would go on to fail every one of
+    the ~13,000 others the same way.
+
+    HTTP 401 raises ``AlchemyConfigError`` regardless of body. Any other
+    non-transient 4xx raises it when the body (streamed and capped like a
+    success body -- M2) is a JSON-RPC error ``_error_kind`` calls
+    ``"config"``; a body that is not JSON, not an object, or any other
+    error returns ``REJECTED`` so the loop raises its fixed ``Alchemy HTTP
+    {code} for {address}``. ``r`` may be ``None`` when the session itself
+    raised. The server text, as always, reaches only the DEBUG log."""
+    body = None
+    if r is not None:
+        try:
+            body = capped_json(r, address, "Alchemy")
+        except ValueError:
+            body = None  # not JSON: nothing to classify beyond the status
+    error = body.get("error") if isinstance(body, dict) else None
+    kind = _error_kind(error, address) if error is not None else "other"
+    if code == _HTTP_UNAUTHENTICATED or kind == "config":
+        raise AlchemyConfigError(CONFIG_REJECTED_MESSAGE)
+    return REJECTED
 
 
 def _parse_transfer(tx, address: str) -> Optional[tuple[int, int, str]]:
