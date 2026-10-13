@@ -48,14 +48,15 @@ A rater's `funder` is "who controls or funded it", by one of two rules, recorded
 rule). `owner`: since October 2026 nearly every new rater on Base is a smart-contract account that
 never received a transfer (230/230 sampled on 2026-10-13; 55/60 are Coinbase Smart Wallets), so
 `fetch` runs a second pass that reads the account's controlling key over plain RPC (`ownerAtIndex(0..3)`,
-then `owner()`) and stores it as the funder, in its own namespace (`owner:<address>`) — on the
-sampled wallets 55 accounts resolved to only 4 keys. Wallets sharing a key cluster exactly as wallets
-sharing a first funder do, but only among themselves: the key is whatever the rater's own contract
-reports, so it is never compared with a transfer-kind funder. The bundlers and paymaster behind their
-first transactions are shared infrastructure and are never used (nor are internal transfers, which
-would include a paymaster's gas advance). An account with no owner is marked `none`
-(passkey-controlled accounts land here) and not looked up again. The report's Provenance lists the
-row count per kind.
+then `owner()`; one 50-address batch per chunk, each entry's outcome its own, a reverting call never
+retried) and stores it as the funder in its own namespace (`owner:<address>`) — on the sampled wallets
+55 accounts resolved to only 4 keys. Wallets sharing a key cluster exactly as wallets sharing a first
+funder do, but only among themselves: the key is whatever the rater's own contract reports, so it is
+never compared with a transfer-kind funder. The bundlers and paymaster behind their first transactions
+are shared infrastructure and are never used (nor are internal transfers, which would include a
+paymaster's gas advance). An account with no owner is marked `none` (passkey-controlled accounts land
+here) and not looked up again; a legacy row's `first_seen_ts` is preserved. The report's Provenance
+lists the row count per kind.
 
 Latest scores: `reports/latest/scores.json`, also served at
 https://iamdongwang.github.io/robustrep/reports/latest/scores.json

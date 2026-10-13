@@ -23,31 +23,82 @@ changes is which raters the funder signal can link.
   account's controlling key over plain RPC -- `ownerAtIndex(0..3)` (Coinbase
   Smart Wallet; a 32-byte address payload is the owner, a 64-byte payload is
   a passkey and yields nothing, an empty slot moves to the next index), then
-  `owner()` -- batched 50 addresses per JSON-RPC batch with the same
-  per-address fallback as agent-owner resolution. A revert means the
-  selector is absent; any other RPC error fails the chunk and leaves its
-  rows for the next run. The key is stored in `raters.funder`, so sybil
-  clustering links wallets sharing a controlling key exactly as it links
-  wallets sharing a first funder; `first_seen_ts` stays NULL for such rows
-  (clustering falls back to the earliest feedback time; caching that
-  approximation would break the M4 rule).
+  `owner()`. One `ownerAtIndex(0)` batch of 50 addresses per chunk with
+  per-entry errors (`RpcClient.batch(..., per_entry_errors=True)`), so every
+  address's outcome is its own: an address is done; an empty/passkey slot
+  gets the per-address scan of indices 1..3 then `owner()`; a reverting
+  entry (selector absent) gets `owner()` once, batched with the chunk's
+  other reverters; an entry that fails without reverting (out of gas,
+  invalid opcode on the rater's own contract) is "no owner" at DEBUG and
+  never a failure; only a transport failure during an address's own lookup
+  fails that one address (its row stays NULL for the next run). The key is
+  stored in `raters.funder` as `owner:<address>`, so sybil clustering links
+  wallets sharing a controlling key exactly as it links wallets sharing a
+  first funder -- but only among themselves (see Security). `first_seen_ts`
+  is left as it is: NULL for a row written this run (clustering falls back
+  to the earliest feedback time; caching that approximation would break the
+  M4 rule), and a legacy row's measured timestamp is preserved
+  (`Store.set_funder`).
 - **`raters.funder_kind`:** `transfer` (first incoming transfer), `owner`
   (controlling key), `none` (every lookup tried, nothing found; never
   retried) or NULL (legacy row: only the transfer lookup ran). Opening a
   pre-0.2.2 store adds the column and marks existing funders `transfer`
-  once; `Store.upsert_rater` takes the kind, `raters_needing_owner_lookup`
-  and `funder_kind_counts` are new.
+  once; `Store.upsert_rater` takes the kind and refuses a funder without
+  one (the migration backfill is the only thing that labels legacy rows),
+  `Store.set_funder`, `raters_needing_owner_lookup` and `funder_kind_counts`
+  are new.
+- **`RpcRevertError` and per-entry batch errors (`robustrep/sources/rpc.py`).**
+  `execution reverted` is non-retryable: Base public nodes answer a
+  reverting `eth_call` with JSON-RPC code 3, and retrying it cost 5 POSTs
+  and 15 s of backoff per call -- per chunk inside a batch. A revert raises
+  `RpcRevertError` (an `RpcError`; `rpc.is_revert` for callers) on the
+  first attempt, single call and batch entry alike. `RpcClient.batch(...,
+  per_entry_errors=True)` returns an `RpcEntryError` (scrubbed message,
+  `reverted` flag) in a failed entry's slot instead of failing the batch;
+  the default keeps the all-or-raise contract. `scrub_rpc_text` /
+  `scrub_rpc_error` live in `rpc.py` now.
 - **Provenance `funder_kind_counts`** (in `scores.json` and as the
-  `Funder kinds` line of `report.md`), a `Controlling-key linking`
-  Limitations bullet, and the `fetch` summary line's per-run funder-kind
-  counts.
+  `Funder kinds` line of `report.md` -- exactly the four known keys, in a
+  fixed order), a `Controlling-key linking` Limitations bullet (mechanism
+  only, no dated counts), the `fetch` summary line's per-run funder-kind
+  counts and `owner pass: N address(es) pending` line. `raters profiled`
+  counts distinct addresses settled this run; the funder-kind line is
+  printed even when the step ends in a partial-failure WARNING.
 
 ### Changed
 
 - **Meaning of `funder`:** "who funded the address" becomes "who controls
-  or funded it". The sybil comparison (equality of the normalised funder)
+  or funded it". The sybil comparison (equality of the lowercased funder)
   is unchanged, so an existing store keeps its clusters and gains the
   owner-linked ones on the next `fetch`.
+- **The owner pass shares the `fetch` command's `BatchState`** with
+  agent-owner resolution, so batching found unsupported there is not
+  rediscovered.
+
+### Security
+
+- **Owner-kind funders live in their own namespace (`owner:<0x40hex>`).**
+  `ownerAtIndex` is whatever the rater's own contract answers, so a
+  registrant could name an honest rater's first funder as the "controlling
+  key" of N raters for the price of deployment and merge the two clusters.
+  Stored with a prefix, an owner can only ever equal another owner. An
+  operator who both funds EOAs and controls smart wallets from one key
+  forms two clusters -- accepted; the signature-verified owner (the signing
+  owner index read out of the UserOperation) is the planned replacement.
+- **No internal-transfer retry.** The first draft of the owner pass re-asked
+  Alchemy with `category: ["external", "internal"]` for an address with no
+  owner. A paymaster's gas advance to a smart account is an internal
+  transfer, so that retry could have bound passkey-controlled wallets to
+  shared ERC-4337 infrastructure as their funder; measured on 30 + 12 live
+  addresses it changed nothing. Dropped before release.
+- **A hostile contract cannot fail its neighbours.** One contract whose
+  `ownerAtIndex` failed inside a 50-address batch used to fail the whole
+  chunk, every run; now a non-reverting failure is "no owner" for that
+  address and a transport failure fails that address alone.
+- **RPC error text is scrubbed** (`scrub_rpc_error`) in every WARNING/ERROR
+  the owner pass and the batch fallback emit, so an endpoint URL carrying a
+  key never reaches a log; the `Funder kinds` line renders only known keys,
+  so a tampered store value cannot reach `report.md`.
 
 ## [0.2.1] — 2026-10-13
 
