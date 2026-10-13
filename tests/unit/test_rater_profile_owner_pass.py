@@ -14,7 +14,8 @@ from robustrep.sources.account_owner import OWNER_AT_INDEX_SELECTOR
 from robustrep.sources.alchemy_profile import AlchemyClient
 from robustrep.sources.profile_http import ProfilePlanError
 from robustrep.sources.rater_profile import enrich_raters
-from robustrep.sources.rpc import RpcError
+from robustrep.sources.base_erc8004 import BatchState
+from robustrep.sources.rpc import RpcBatchStructureError, RpcError
 from robustrep.store import Store
 
 FB = dict(chain="base", tx_hash="0x", value="1", value_decimals=0, tag1="", tag2="", endpoint="",
@@ -82,26 +83,31 @@ class RecordingAlchemy(AlchemyClient):
 class OwnerRpc:
     """Recording RPC: ``owners`` maps an address to its ``ownerAtIndex(0)``
     owner; every other eth_call answers ``"0x"`` (no code / empty). ``fail``
-    names addresses whose calls raise a non-revert ``RpcError``."""
+    names addresses whose *single* calls raise a transport-shaped
+    ``RpcError`` (a transport failure cannot be per-entry, so inside a batch
+    they answer ``"0x"`` and get the per-address scan, whose first call then
+    dies). ``batch_error`` makes every ``batch`` raise it."""
 
-    def __init__(self, owners=None, fail=()):
-        self.owners, self.fail = dict(owners or {}), set(fail)
+    def __init__(self, owners=None, fail=(), batch_error=None):
+        self.owners, self.fail, self.batch_error = dict(owners or {}), set(fail), batch_error
         self.calls, self.batches = [], []
 
     def _answer(self, params):
         to, data = params[0]["to"], params[0]["data"]
-        if to in self.fail:
-            raise RpcError("gave up after 5 attempts: HTTPError (HTTP 503) from https://rpc.example")
         if data == OWNER_AT_INDEX_SELECTOR + "0" * 64 and self.owners.get(to):
             return abi_address(self.owners[to])
         return "0x"
 
     def call(self, method, params):
         self.calls.append(params[0]["to"])
+        if params[0]["to"] in self.fail:
+            raise RpcError("gave up after 5 attempts: HTTPError (HTTP 503) from https://rpc.example")
         return self._answer(params)
 
-    def batch(self, calls):
+    def batch(self, calls, *, per_entry_errors=False):
         self.batches.append([p[0]["to"] for _, p in calls])
+        if self.batch_error is not None:
+            raise self.batch_error
         return [self._answer(p) for _, p in calls]
 
     def queried(self):
@@ -240,18 +246,51 @@ def test_pass_two_runs_for_legacy_rows_even_when_pass_one_is_idle(tmp_path):
 # --- pass 2: failures --------------------------------------------------------------
 
 
-def test_rpc_failure_in_pass_two_is_collected_as_partial(tmp_path, caplog):
+def test_rpc_failure_in_pass_two_fails_only_that_address(tmp_path, caplog):
     with Store(tmp_path / "t.db") as s:
-        seed(s, A, B)
+        seed(s, A, B, C)
         rpc = OwnerRpc({A: KEY}, fail=[B])
         with caplog.at_level(logging.ERROR, logger="robustrep.sources.rater_profile"):
-            with pytest.raises(RuntimeError, match="failed to enrich"):
+            with pytest.raises(RuntimeError, match="1 address") as e:
                 enrich_raters(s, TransferClient(), rpc=rpc)
-        # The whole chunk failed (the batch raised; so did B's per-address
-        # scan), so both rows stay NULL for the next run to retry.
-        assert rows(s) == {A: (None, None, None), B: (None, None, None)}
+        assert B in str(e.value) and A not in str(e.value) and C not in str(e.value)
+        # B's own per-address scan died, so B alone stays NULL for the next
+        # run; A (owner) and C (nothing anywhere) are settled.
+        assert rows(s) == {A: (None, KEY, "owner"), B: (None, None, None), C: (None, None, "none")}
         assert s.get_sync("rater_profile_mode") == "blockscout-partial"
-        assert any("owner lookup failed" in r.getMessage() for r in caplog.records)
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and B in errors[0] and "owner lookup failed" in errors[0]
+
+
+def test_whole_batch_failure_in_pass_two_still_settles_every_address_it_can(tmp_path, caplog):
+    # The batch endpoint is down (transport); per-address calls still work
+    # for everyone but B -> 49 of 50 settled, one WARNING for the fallback.
+    addrs = ["0x" + f"{i:040x}" for i in range(50)]
+    with Store(tmp_path / "t.db") as s:
+        seed(s, *addrs)
+        rpc = OwnerRpc({a: KEY for a in addrs}, fail=[addrs[7]], batch_error=RpcError("batch down"))
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(RuntimeError, match="1 address"):
+                enrich_raters(s, TransferClient(), rpc=rpc)
+        got = rows(s)
+        assert got[addrs[7]] == (None, None, None)
+        assert all(got[a] == (None, KEY, "owner") for a in addrs if a != addrs[7])
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_owner_pass_uses_the_callers_batch_state(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        seed(s, A, B)
+        state = BatchState()
+        rpc = OwnerRpc({A: KEY, B: KEY2}, batch_error=RpcBatchStructureError("not a list"))
+        enrich_raters(s, TransferClient(), rpc=rpc, batch_state=state)
+        assert state.batch_unsupported is True
+        assert rows(s) == {A: (None, KEY, "owner"), B: (None, KEY2, "owner")}
+        # A state that already knows batching is unsupported skips rpc.batch entirely.
+        s.upsert_rater(C, None, None)
+        again = OwnerRpc({C: KEY}, batch_error=RpcBatchStructureError("not a list"))
+        enrich_raters(s, TransferClient(), rpc=again, batch_state=state)
+        assert again.batches == [] and again.calls == [C]
 
 
 def test_retry_failure_in_pass_two_is_collected_and_the_rest_still_settle(tmp_path):

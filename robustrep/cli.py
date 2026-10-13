@@ -194,16 +194,19 @@ def _funder_kinds_line(before: dict, after: dict) -> str:
 
 def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str = ProfileSource.auto,
                   profile_rps: Optional[float] = None, profile_retries: Optional[int] = None,
-                  rpc: Optional[RpcClient] = None) -> str:
+                  rpc: Optional[RpcClient] = None, batch_state: Optional[base.BatchState] = None) -> str:
     """Profile not-yet-profiled raters via ``profile_source``, or fall back
     offline (``profile_source="none"``).
 
     ``rpc``, when given, is handed to ``enrich_raters`` for its owner pass
     (``rater_profile.enrich_raters``: raters with no incoming transfer are
-    linked by the smart account's controlling key); the summary line then
-    also reports how many rows of each ``funder_kind`` this run wrote.
-    With ``profile_source="none"`` there is no client, so neither pass runs
-    and no rows are written, whatever ``rpc`` is.
+    linked by the smart account's controlling key), together with
+    ``batch_state`` -- the run's shared ``base.BatchState``, the same one
+    ``_step_owners`` used, so batching found unsupported there is not
+    rediscovered here; the summary line then also reports how many rows of
+    each ``funder_kind`` this run wrote. With ``profile_source="none"``
+    there is no client, so neither pass runs and no rows are written,
+    whatever ``rpc`` is.
 
     ``etherscan_key``, when given, overrides ``ETHERSCAN_API_KEY`` (the key
     itself is never echoed). The Alchemy key is read from ``ALCHEMY_API_KEY``
@@ -246,7 +249,7 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
         source_label = getattr(client, "source", "etherscan").capitalize()
         typer.echo(f"profiling {len(targets)} rater(s) via {source_label}, ETA ~{eta_h:.1f}h")
     before = store.funder_kind_counts()
-    n = enrich_raters(store, client, addresses=targets, rpc=rpc)
+    n = enrich_raters(store, client, addresses=targets, rpc=rpc, batch_state=batch_state)
     mode = store.get_sync("rater_profile_mode") or "unknown"
     if client is None:
         return (f"raters profiled: {n} (fallback: --profile-source none; rows not written); "
@@ -284,7 +287,7 @@ def _step_evidence(store: Store, rpc: RpcClient, workers: int) -> str:
 def _run_raters_step(store: Store, *, skip_raters: bool, reprofile_raters: bool,
                       etherscan_key: Optional[str], profile_source: str,
                       profile_rps: Optional[float], profile_retries: Optional[int],
-                      rpc: Optional[RpcClient] = None) -> bool:
+                      rpc: Optional[RpcClient] = None, batch_state: Optional[base.BatchState] = None) -> bool:
     """Run (or skip) the rater-profiling step of ``fetch`` and echo its summary
     line. Returns ``True`` when profiling partially failed -- some addresses
     errored while every other step completed -- which ``fetch`` turns into exit
@@ -306,7 +309,8 @@ def _run_raters_step(store: Store, *, skip_raters: bool, reprofile_raters: bool,
         typer.echo(f"rater profiles cleared: {n_cleared}")
     try:
         typer.echo(_step_raters(store, etherscan_key, profile_source=profile_source,
-                                profile_rps=profile_rps, profile_retries=profile_retries, rpc=rpc))
+                                profile_rps=profile_rps, profile_retries=profile_retries, rpc=rpc,
+                                batch_state=batch_state))
     except ValueError as e:
         typer.echo(f"ERROR: {e}")
         raise typer.Exit(1)
@@ -416,7 +420,7 @@ def fetch(
         partial_failure = _run_raters_step(
             store, skip_raters=skip_raters, reprofile_raters=reprofile_raters,
             etherscan_key=etherscan_key, profile_source=profile_source,
-            profile_rps=profile_rps, profile_retries=profile_retries, rpc=rpc)
+            profile_rps=profile_rps, profile_retries=profile_retries, rpc=rpc, batch_state=batch_state)
 
         with _rpc_guard():
             if skip_evidence:

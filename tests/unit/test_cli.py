@@ -1637,7 +1637,7 @@ def test_fetch_reprofile_raters_clears_the_cache_before_profiling(tmp_path, monk
     _seed(db, n=2)  # both raters already profiled
     seen = {}
 
-    def _enrich(store, client, addresses=None, *, rpc=None):
+    def _enrich(store, client, addresses=None, *, rpc=None, **kw):
         seen["targets"] = list(addresses or [])
         return len(seen["targets"])
 
@@ -1655,7 +1655,7 @@ def test_fetch_without_reprofile_raters_keeps_the_cache(tmp_path, monkeypatch):
     _seed(db, n=2)
     seen = {}
 
-    def _enrich(store, client, addresses=None, *, rpc=None):
+    def _enrich(store, client, addresses=None, *, rpc=None, **kw):
         seen["targets"] = list(addresses or [])
         return 0
 
@@ -1871,7 +1871,7 @@ def test_step_raters_passes_rpc_through_to_enrich_raters(tmp_path, monkeypatch):
     _seed_unprofiled(db, n=1)
     seen = {}
 
-    def _enrich(store, client, addresses=None, *, rpc=None):
+    def _enrich(store, client, addresses=None, *, rpc=None, **kw):
         seen["rpc"] = rpc
         return 0
 
@@ -1894,7 +1894,7 @@ def test_fetch_hands_its_rpc_client_to_the_raters_step(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.base, "owners_of", lambda rpc, agent_ids, **k: {a: None for a in agent_ids})
     monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
 
-    def _enrich(store, client, addresses=None, *, rpc=None):
+    def _enrich(store, client, addresses=None, *, rpc=None, **kw):
         seen["rpc"] = rpc
         return 0
 
@@ -1910,7 +1910,7 @@ def test_step_raters_line_reports_the_funder_kinds_written_this_run(tmp_path, mo
     db = tmp_path / "t.db"
     _seed_unprofiled(db, n=3)
 
-    def _enrich(store, client, addresses=None, *, rpc=None):
+    def _enrich(store, client, addresses=None, *, rpc=None, **kw):
         store.upsert_rater(addresses[0], 10, "0x" + "f" * 40, "transfer")
         store.upsert_rater(addresses[1], None, "0x" + "e" * 40, "owner")
         store.upsert_rater(addresses[2], None, None, "none")
@@ -1947,3 +1947,48 @@ def test_report_publishes_the_store_funder_kind_counts(tmp_path):
     assert "- Funder kinds: transfer 0; owner 1; none 0; unknown 4" in md
     config = json.loads((out / "latest" / "scores.json").read_text())["config"]
     assert config["funder_kind_counts"] == {"transfer": 0, "owner": 1, "none": 0, "unknown": 4}
+
+
+def test_step_raters_passes_the_shared_batch_state_to_enrich_raters(tmp_path, monkeypatch):
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "ALCHEMY-TEST-KEY-VALUE-0123456789")
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    seen = {}
+
+    def _enrich(store, client, addresses=None, *, rpc=None, batch_state=None):
+        seen["state"] = batch_state
+        return 0
+
+    monkeypatch.setattr(cli, "enrich_raters", _enrich)
+    state = cli.base.BatchState()
+    with Store(db) as store:
+        cli._step_raters(store, None, profile_source="alchemy", rpc=object(), batch_state=state)
+    assert seen["state"] is state
+
+
+def test_fetch_shares_one_batch_state_between_owner_resolution_and_the_raters_step(tmp_path, monkeypatch):
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "ALCHEMY-TEST-KEY-VALUE-0123456789")
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+    seen = {}
+    monkeypatch.setattr(cli, "RpcClient", _FakeRpc)
+    monkeypatch.setattr(cli.base, "sync_feedback", lambda *a, **k: 0)
+    monkeypatch.setattr(cli.base, "fill_block_timestamps", lambda *a, **k: 0)
+
+    def _owners_of(rpc, agent_ids, **k):
+        seen["owners_state"] = k.get("state")
+        return {a: None for a in agent_ids}
+
+    def _enrich(store, client, addresses=None, *, rpc=None, batch_state=None):
+        seen["raters_state"] = batch_state
+        return 0
+
+    monkeypatch.setattr(cli.base, "owners_of", _owners_of)
+    monkeypatch.setattr(cli, "enrich_raters", _enrich)
+    monkeypatch.setattr(cli, "classify_all", lambda *a, **k: 0)
+    r = runner.invoke(app, ["fetch", "--db", str(db)])
+    assert r.exit_code == 0, r.output
+    assert isinstance(seen["raters_state"], cli.base.BatchState)
+    assert seen["raters_state"] is seen["owners_state"]

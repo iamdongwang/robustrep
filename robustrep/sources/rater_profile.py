@@ -104,13 +104,13 @@ from .profile_http import (
     plausible_ts,
     warn_bad_ts,
 )
-from .rpc import RpcError
+from .rpc import scrub_rpc_error
 
 logger = logging.getLogger(__name__)
 
 # Addresses per JSON-RPC batch in the owner pass (see ``account_owner.
-# account_owners``); also the unit of failure there -- an ``RpcError`` escaping
-# a chunk marks that whole chunk failed (its rows stay NULL for the next run).
+# account_owners``). Not a unit of failure: every address's outcome is its own
+# (a failed lookup leaves that one row NULL for the next run).
 OWNER_PASS_BATCH = 50
 # What the owner pass asks Alchemy for when no owner resolved: a smart account
 # may have been funded only by an internal (contract-to-contract) transfer,
@@ -631,33 +631,35 @@ def _settle(store: Store, client, address: str, owner: Optional[str], progress: 
     return "none"
 
 
-def _owner_pass(store: Store, client, rpc, progress: _Progress) -> None:
+def _owner_pass(store: Store, client, rpc, progress: _Progress, state: Optional[BatchState] = None) -> None:
     """Pass 2 over ``Store.raters_needing_owner_lookup()``: (a) the smart
-    account's controlling key via ``account_owners`` (batched, with the
-    ``owners_of``-style per-address fallback); (b) for the rest, when the
-    client is Alchemy, a retry of ``first_tx`` that also admits internal
-    transfers; (c) still nothing -> ``funder_kind="none"``, never retried.
-    An ``RpcError`` escaping a chunk of (a) marks every address in that chunk
-    failed (one ERROR line; their rows stay NULL for the next run) -- the
-    RPC client has already spent its own retries by then, so retrying each
-    address individually would only repeat the same outage 50 times."""
+    account's controlling key via ``account_owners`` (batched with per-entry
+    errors, so one contract's answer never decides its neighbours'); (b) for
+    the rest, when the client is Alchemy, a retry of ``first_tx`` that also
+    admits internal transfers; (c) still nothing -> ``funder_kind="none"``,
+    never retried. An address whose own lookup died on a transport error
+    (an ``RpcError`` in its ``account_owners`` slot) is recorded failed by
+    itself -- one ERROR line, its row stays NULL for the next run -- and
+    every other address of the chunk is still settled. ``state`` is the
+    ``fetch`` command's shared ``BatchState`` (as ``cli._step_owners`` gets
+    it), so batching found unsupported earlier in the run is not rediscovered
+    here."""
     pending = store.raters_needing_owner_lookup()
     if not pending:
         return
     counts = {"owner": 0, "transfer-internal": 0, "none": 0}
     failed_before = len(progress.failures)
-    state = BatchState()
+    state = state or BatchState()
     for i in range(0, len(pending), OWNER_PASS_BATCH):
         chunk = pending[i:i + OWNER_PASS_BATCH]
-        try:
-            owners = account_owners(rpc, chunk, batch_size=OWNER_PASS_BATCH, state=state)
-        except RpcError as e:
-            logger.error("rater_profile: owner lookup failed for %d address(es) starting at %s: %s",
-                         len(chunk), chunk[0], e)
-            progress.failures.extend(chunk)
-            continue
+        owners = account_owners(rpc, chunk, batch_size=OWNER_PASS_BATCH, state=state)
         for a in chunk:
-            verdict = _settle(store, client, a, owners.get(a), progress)
+            found = owners.get(a)
+            if isinstance(found, Exception):
+                logger.error("rater_profile: owner lookup failed for %s: %s", a, scrub_rpc_error(found))
+                progress.failures.append(a)
+                continue
+            verdict = _settle(store, client, a, found, progress)
             if verdict is not None:
                 counts[verdict] += 1
     logger.info("rater_profile: pass 2 (owner): %d address(es) (owner: %d, transfer-internal: %d, none: %d), "
@@ -666,7 +668,8 @@ def _owner_pass(store: Store, client, rpc, progress: _Progress) -> None:
 
 
 def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2Client | AlchemyClient"],
-                  addresses: Optional[list[str]] = None, *, rpc=None) -> int:
+                  addresses: Optional[list[str]] = None, *, rpc=None,
+                  batch_state: Optional[BatchState] = None) -> int:
     """Fill the raters table for every client address not yet profiled, in two
     passes.
 
@@ -690,10 +693,13 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
     ``client`` is an ``AlchemyClient``, retried with internal transfers
     admitted (``INTERNAL_RETRY_CATEGORIES``) and written as ``"transfer"`` on
     a hit; what is still unresolved is written as ``"none"`` so no later run
-    retries it. Per-address failures in pass 2 are collected like pass 1's
-    (an ``RpcError`` escaping a chunk fails that chunk -- see ``_owner_pass``).
-    Without ``rpc`` there is no pass 2 and pass-1 misses keep their NULL kind
-    for a later run that has one.
+    retries it. Per-address failures in pass 2 are collected like pass 1's:
+    an address whose own RPC lookup failed is recorded by itself and its
+    chunk-mates are still settled (see ``_owner_pass``). ``batch_state``, when
+    given, is the caller's shared ``base_erc8004.BatchState`` (the ``fetch``
+    command hands the one its agent-owner step used). Without ``rpc`` there
+    is no pass 2 and pass-1 misses keep their NULL kind for a later run that
+    has one.
 
     Sets ``rater_profile_mode`` to ``client.source`` (``"blockscout"``,
     ``"etherscan"`` or ``"alchemy"``; ``"etherscan"`` for any client without a
@@ -748,7 +754,7 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
     if addrs:
         _transfer_pass(store, client, addrs, progress)
     if rpc is not None:
-        _owner_pass(store, client, rpc, progress)
+        _owner_pass(store, client, rpc, progress, batch_state)
 
     if progress.failures:
         store.set_sync("rater_profile_mode", f"{source}-partial")

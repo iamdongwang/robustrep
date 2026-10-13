@@ -15,7 +15,7 @@ from robustrep.sources.account_owner import (
     decode_owner_address,
     decode_owner_bytes,
 )
-from robustrep.sources.rpc import RpcBatchStructureError, RpcError
+from robustrep.sources.rpc import RpcBatchStructureError, RpcClient, RpcEntryError, RpcError, RpcRevertError
 
 WALLET = "0x" + "a1" * 20
 WALLET_B = "0x" + "b2" * 20
@@ -52,36 +52,56 @@ def index_data(index: int) -> str:
     return OWNER_AT_INDEX_SELECTOR + word(index)
 
 
+TRANSPORT_ERROR = "gave up after 5 attempts: HTTPError (HTTP 503) from https://rpc.example"
+
+
 class FakeRpc:
     """Records every call/batch. ``answers`` maps ``(to, data)`` -> result; a
     pair not listed answers ``"0x"`` (what an address without code returns to
-    any eth_call). ``revert`` names ``(to, selector)`` pairs whose call raises a
-    revert ``RpcError``; ``fail`` names ``(to, selector)`` pairs that raise a
-    non-revert ``RpcError``; ``batch_error`` makes ``batch`` raise it."""
+    any eth_call). ``revert`` names ``(to, selector)`` pairs whose call
+    reverts (``RpcRevertError`` from ``call``; an ``RpcEntryError`` with
+    ``reverted=True`` inside a lenient batch); ``fail`` names ``(to,
+    selector)`` pairs whose *single* call raises a transport-shaped
+    ``RpcError`` (a transport failure cannot be per-entry, so inside a batch
+    those pairs answer ``"0x"``); ``entry_fail`` names ``(to, selector)``
+    pairs that fail without reverting inside a lenient batch (out of gas) and
+    raise a plain ``RpcError`` as a single call. ``batch_error`` makes
+    ``batch`` raise it."""
 
-    def __init__(self, answers=None, *, revert=(), fail=(), batch_error=None):
+    def __init__(self, answers=None, *, revert=(), fail=(), entry_fail=(), batch_error=None):
         self.answers = dict(answers or {})
-        self.revert, self.fail = set(revert), set(fail)
+        self.revert, self.fail, self.entry_fail = set(revert), set(fail), set(entry_fail)
         self.batch_error = batch_error
         self.calls, self.batches = [], []
 
     def _answer(self, params):
         to, data = params[0]["to"], params[0]["data"]
         if (to, data[:10]) in self.revert:
-            raise RpcError("gave up after 5 attempts: [3] execution reverted")
+            raise RpcRevertError("non-retryable error: [3] execution reverted")
         if (to, data[:10]) in self.fail:
-            raise RpcError("gave up after 5 attempts: HTTPError (HTTP 503) from https://rpc.example")
+            raise RpcError(TRANSPORT_ERROR)
+        if (to, data[:10]) in self.entry_fail:
+            raise RpcError("gave up after 5 attempts: [-32000] out of gas")
+        return self.answers.get((to, data), "0x")
+
+    def _entry(self, params):
+        to, data = params[0]["to"], params[0]["data"]
+        if (to, data[:10]) in self.revert:
+            return RpcEntryError(code=3, message="[3]", reverted=True)
+        if (to, data[:10]) in self.entry_fail:
+            return RpcEntryError(code=-32000, message="[-32000]", reverted=False)
         return self.answers.get((to, data), "0x")
 
     def call(self, method, params):
         self.calls.append((method, params))
         return self._answer(params)
 
-    def batch(self, calls):
+    def batch(self, calls, *, per_entry_errors=False):
         self.batches.append(calls)
         if self.batch_error is not None:
             raise self.batch_error
-        return [self._answer(p) for _, p in calls]
+        assert per_entry_errors, "account_owners must ask for per-entry errors"
+        return [self._entry(p) for _, p in calls]
 
 
 def _eth_calls(rpc):
@@ -234,11 +254,13 @@ def test_account_owners_batches_index_zero_and_scans_only_the_misses():
     assert len(rpc.batches) == 1
     assert rpc.batches[0] == [("eth_call", [{"to": a, "data": index_data(0)}, "latest"])
                               for a in (WALLET, WALLET_B, WALLET_C)]
-    # WALLET was settled by the batch; B and C got the full per-address scan.
-    scanned = [to for to, _, _ in _eth_calls(rpc)]
-    assert WALLET not in scanned
-    assert scanned.count(WALLET_B) == 2                      # index 0 (again), index 1
-    assert scanned.count(WALLET_C) == OWNER_INDEX_SCAN + 1   # every index, then owner()
+    # WALLET was settled by the batch; B and C got the per-address scan from
+    # index 1 on (the batch already answered index 0 for them).
+    scanned = [(to, d[:10] + d[10:].lstrip("0")) for to, d, _ in _eth_calls(rpc)]
+    assert WALLET not in {to for to, _ in scanned}
+    assert [d for to, d in scanned if to == WALLET_B] == [OWNER_AT_INDEX_SELECTOR + "1"]
+    assert [d for to, d in scanned if to == WALLET_C] == (
+        [OWNER_AT_INDEX_SELECTOR + str(i) for i in range(1, OWNER_INDEX_SCAN)] + [OWNER_SELECTOR])
 
 
 def test_account_owners_chunks_by_batch_size():
@@ -264,7 +286,7 @@ def test_account_owners_batch_size_one_never_batches():
 
 def test_account_owners_batch_failure_falls_back_per_address_with_one_warning(caplog):
     rpc = FakeRpc({(WALLET, index_data(0)): ADDRESS_RETURN, (WALLET_B, index_data(0)): abi_bytes(addr_payload(KEY2))},
-                  batch_error=RpcError("gave up after 5 attempts: [3] execution reverted"))
+                  batch_error=RpcError(TRANSPORT_ERROR))
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
         got = account_owners(rpc, [WALLET, WALLET_B])
     assert got == {WALLET: KEY, WALLET_B: KEY2}
@@ -298,10 +320,150 @@ def test_account_owners_shares_batch_state_across_calls():
     assert len(rpc.batches) == 1
 
 
-def test_account_owners_non_revert_error_in_fallback_propagates():
-    rpc = FakeRpc(fail=[(WALLET, OWNER_AT_INDEX_SELECTOR)], batch_error=RpcError("batch down"))
-    with pytest.raises(RpcError, match="503"):
-        account_owners(rpc, [WALLET])
+def test_account_owners_non_revert_error_in_fallback_is_recorded_for_that_address_only():
+    rpc = FakeRpc({(WALLET_B, index_data(0)): ADDRESS_RETURN},
+                  fail=[(WALLET, OWNER_AT_INDEX_SELECTOR)], batch_error=RpcError("batch down"))
+    got = account_owners(rpc, [WALLET, WALLET_B])
+    assert got[WALLET_B] == KEY
+    assert isinstance(got[WALLET], RpcError) and "503" in str(got[WALLET])
+
+
+# --- account_owners: per-entry errors, isolation ------------------------------------
+
+W = ["0x" + f"{i:040x}" for i in range(1, 7)]   # [address, empty, passkey, reverted, out-of-gas, address]
+
+
+def _mixed_rpc(**kw):
+    return FakeRpc({(W[0], index_data(0)): ADDRESS_RETURN,
+                    (W[1], index_data(0)): EMPTY_RETURN, (W[1], index_data(2)): abi_bytes(addr_payload(KEY2)),
+                    (W[2], index_data(0)): PASSKEY_RETURN, (W[2], OWNER_SELECTOR): OWNER_RETURN,
+                    (W[3], OWNER_SELECTOR): OWNER_RETURN,
+                    (W[5], index_data(0)): abi_bytes(addr_payload(KEY2))},
+                   revert=[(W[3], OWNER_AT_INDEX_SELECTOR)], entry_fail=[(W[4], OWNER_AT_INDEX_SELECTOR)], **kw)
+
+
+def test_account_owners_mixed_chunk_does_exactly_the_right_follow_ups(caplog):
+    rpc = _mixed_rpc()
+    with caplog.at_level(logging.DEBUG, logger="robustrep.sources.account_owner"):
+        got = account_owners(rpc, W)
+    assert got == {W[0]: KEY, W[1]: KEY2, W[2]: KEY, W[3]: KEY, W[4]: None, W[5]: KEY2}
+    # One index-0 batch for the chunk, then one owner() batch for the reverted entry.
+    assert [[p[0]["to"] for _, p in b] for b in rpc.batches] == [W, [W[3]]]
+    assert rpc.batches[1][0][1][0]["data"] == OWNER_SELECTOR
+    # Per-address calls: the empty slot scans 1, 2 (found); the passkey scans
+    # 1..3 then owner(); nothing else is asked anything.
+    scanned = [(to, d[:10] + d[10:].lstrip("0")) for to, d, _ in _eth_calls(rpc)]
+    assert scanned == [(W[1], OWNER_AT_INDEX_SELECTOR + "1"), (W[1], OWNER_AT_INDEX_SELECTOR + "2"),
+                       (W[2], OWNER_AT_INDEX_SELECTOR + "1"), (W[2], OWNER_AT_INDEX_SELECTOR + "2"),
+                       (W[2], OWNER_AT_INDEX_SELECTOR + "3"), (W[2], OWNER_SELECTOR)]
+    # The out-of-gas contract is "no owner" at DEBUG, never a failure.
+    assert any(r.levelno == logging.DEBUG and W[4] in r.getMessage() and "without reverting" in r.getMessage()
+               for r in caplog.records)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_account_owners_owner_batch_entry_errors_are_none():
+    # Both selectors absent (reverts twice) and an owner() that fails without
+    # reverting: each is "no owner", none fails the chunk or its neighbours.
+    rpc = FakeRpc({(WALLET_C, index_data(0)): ADDRESS_RETURN},
+                  revert=[(WALLET, OWNER_AT_INDEX_SELECTOR), (WALLET, OWNER_SELECTOR),
+                          (WALLET_B, OWNER_AT_INDEX_SELECTOR)],
+                  entry_fail=[(WALLET_B, OWNER_SELECTOR)])
+    assert account_owners(rpc, [WALLET, WALLET_B, WALLET_C]) == {WALLET: None, WALLET_B: None, WALLET_C: KEY}
+    assert len(rpc.batches) == 2 and rpc.calls == []
+
+
+def test_account_owners_owner_batch_transport_failure_falls_back_per_address(caplog):
+    class _SecondBatchFails(FakeRpc):
+        def batch(self, calls, *, per_entry_errors=False):
+            if self.batches:
+                self.batches.append(calls)
+                raise RpcError(TRANSPORT_ERROR)
+            return super().batch(calls, per_entry_errors=per_entry_errors)
+
+    rpc = _SecondBatchFails({(WALLET, OWNER_SELECTOR): OWNER_RETURN},
+                            revert=[(WALLET, OWNER_AT_INDEX_SELECTOR), (WALLET_B, OWNER_AT_INDEX_SELECTOR)],
+                            fail=[(WALLET_B, OWNER_SELECTOR)])
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.base_erc8004"):
+        got = account_owners(rpc, [WALLET, WALLET_B])
+    assert got[WALLET] == KEY
+    assert isinstance(got[WALLET_B], RpcError)
+    assert [d[:10] for _, d, _ in _eth_calls(rpc)] == [OWNER_SELECTOR, OWNER_SELECTOR]
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_account_owners_one_transport_error_fails_only_that_address():
+    addrs = ["0x" + f"{i:040x}" for i in range(50)]
+    answers = {(a, index_data(0)): ADDRESS_RETURN for a in addrs[1:]}
+    # addrs[0]: index 0 empty, so it gets the per-address scan, whose first call dies.
+    answers[(addrs[0], index_data(0))] = EMPTY_RETURN
+    rpc = FakeRpc(answers, fail=[(addrs[0], OWNER_AT_INDEX_SELECTOR)])
+    got = account_owners(rpc, addrs)
+    assert isinstance(got[addrs[0]], RpcError)
+    assert {a: got[a] for a in addrs[1:]} == {a: KEY for a in addrs[1:]}
+    assert len(rpc.batches) == 1 and len(rpc.calls) == 1
+
+
+def test_account_owners_per_address_mode_isolates_failures_too():
+    rpc = FakeRpc({(WALLET_B, index_data(0)): ADDRESS_RETURN}, fail=[(WALLET, OWNER_AT_INDEX_SELECTOR)])
+    got = account_owners(rpc, [WALLET, WALLET_B], batch_size=1)
+    assert got[WALLET_B] == KEY and isinstance(got[WALLET], RpcError)
+    assert rpc.batches == []
+
+
+def test_account_owners_scan_revert_after_an_empty_index_zero_goes_to_owner():
+    # index 0 empty (via the batch), index 1 reverts (a contract whose owner
+    # list is shorter than it says) -> owner() once, no more indices.
+    class _RevertFromIndexOne(FakeRpc):
+        def _answer(self, params):
+            if params[0]["data"] == index_data(1):
+                raise RpcRevertError("non-retryable error: [3] execution reverted")
+            return super()._answer(params)
+
+    rpc = _RevertFromIndexOne({(WALLET, index_data(0)): EMPTY_RETURN, (WALLET, OWNER_SELECTOR): OWNER_RETURN})
+    assert account_owners(rpc, [WALLET]) == {WALLET: KEY}
+    assert [d[:10] + d[10:].lstrip("0") for _, d, _ in _eth_calls(rpc)] == [OWNER_AT_INDEX_SELECTOR + "1",
+                                                                              OWNER_SELECTOR]
+
+
+# --- regression through a real RpcClient: a 50-chunk with code-3 reverts ----------
+
+
+class _NodeSession:
+    """A fake ``requests.Session`` playing a Base public node: every
+    ``ownerAtIndex``/``owner()`` eth_call on an address in ``reverting``
+    answers ``{"code": 3, "message": "execution reverted"}``; every other
+    ``ownerAtIndex(0)`` answers ``KEY``."""
+
+    def __init__(self, reverting):
+        self.reverting, self.posts = set(reverting), []
+
+    def _result(self, call):
+        to = call["params"][0]["to"]
+        if to in self.reverting:
+            return {"jsonrpc": "2.0", "id": call["id"], "error": {"code": 3, "message": "execution reverted"}}
+        return {"jsonrpc": "2.0", "id": call["id"], "result": ADDRESS_RETURN}
+
+    def post(self, url, json=None, headers=None, timeout=None, stream=None):
+        import json as jsonlib
+
+        from test_rpc import FakeResponse
+
+        self.posts.append(json)
+        body = [self._result(c) for c in json] if isinstance(json, list) else self._result(json)
+        return FakeResponse(jsonlib.dumps(body).encode())
+
+
+def test_fifty_chunk_with_reverting_entries_costs_two_posts_and_no_sleep():
+    addrs = ["0x" + f"{i:040x}" for i in range(50)]
+    reverting = addrs[::10]  # 5 of 50 do not implement ownerAtIndex
+    session, sleeps = _NodeSession(reverting), []
+    rpc = RpcClient(["http://a", "http://b"], user_agent="ua", session=session, sleep=sleeps.append)
+    got = account_owners(rpc, addrs, batch_size=50)
+    assert got == {a: (None if a in reverting else KEY) for a in addrs}
+    assert len(session.posts) == 2 and sleeps == []
+    assert len(session.posts[0]) == 50 and len(session.posts[1]) == 5
+    assert all(c["params"][0]["data"] == OWNER_SELECTOR for c in session.posts[1])
 
 
 def test_module_logger_is_named_after_the_module():
