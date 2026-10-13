@@ -16,6 +16,7 @@ from robustrep.sources.profile_http import (
     ProfilePlanError,
     capped_json,
     fetch_with_retries,
+    funder_address,
     implausible,
     is_transient_http,
     plausible_ts,
@@ -97,6 +98,42 @@ def test_plausible_ts_returns_none_with_one_warning_naming_address_and_value(val
 def test_warn_bad_ts_bounds_the_logged_value(caplog):
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         profile_http.warn_bad_ts("0xa", "x" * 10_000)
+    assert len(caplog.text) < 500
+
+
+# --- L1: funder_address --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("0x" + "a" * 40, "0x" + "a" * 40),
+    ("0x" + "A" * 40, "0x" + "a" * 40),
+    ("0xAbCdEf0123456789aBcDeF0123456789AbCdEf01", "0xabcdef0123456789abcdef0123456789abcdef01"),
+])
+def test_funder_address_accepts_a_40_hex_address_lowercased(value, expected, caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
+        assert funder_address(value, "0xabc") == expected
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("value", [
+    None, 7, 0, 1.5, True, {"hash": "0x" + "a" * 40}, ["0x" + "a" * 40], b"0x" + b"a" * 40,
+    "", "0x", "0x" + "Z" * 40, "0x" + "a" * 39, "0x" + "a" * 41, "a" * 40, "0X" + "a" * 40,
+    " 0x" + "a" * 40, "0x" + "a" * 40 + "\n", "0x" + "a" * 40 + "; drop table raters",
+])
+def test_funder_address_refuses_anything_else_with_one_warning(value, caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
+        assert funder_address(value, "0xabc") is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING
+                and r.name == "robustrep.sources.profile_http"]
+    assert len(warnings) == 1
+    msg = warnings[0].getMessage()
+    assert "0xabc" in msg and "funder" in msg
+    assert repr(value)[:20] in msg or str(value)[:20] in msg
+
+
+def test_funder_address_bounds_the_logged_value(caplog):
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
+        assert funder_address("0x" + "a" * 100_000, "0xabc") is None
     assert len(caplog.text) < 500
 
 

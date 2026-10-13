@@ -32,6 +32,9 @@ from robustrep.store import Store
 
 KEY = "ALCHEMY-SECRET-KEY-VALUE-0123456789"
 ADDR = "0xAbCdEf0000000000000000000000000000000001"
+# A funder as the server spells it (checksum-style mixed case) and as it is cached.
+FUNDER_UP = "0xF00D00000000000000000000000000000000BEEF"
+FUNDER = FUNDER_UP.lower()
 
 FB = dict(chain="base", tx_hash="0x", value="1", value_decimals=0, tag1="", tag2="", endpoint="",
           feedback_uri="", feedback_hash="")
@@ -120,7 +123,7 @@ class FakeAlchemyHttp:
         return r
 
 
-def transfer(block_hex="0x1a2b", ts="2026-02-22T21:16:19.000Z", frm="0xFUNDER", to=ADDR.lower()):
+def transfer(block_hex="0x1a2b", ts="2026-02-22T21:16:19.000Z", frm=FUNDER_UP, to=ADDR.lower()):
     return {"from": frm, "to": to, "blockNum": block_hex, "hash": "0xdeadbeef",
             "metadata": {"blockTimestamp": ts}}
 
@@ -218,7 +221,7 @@ def test_first_tx_parses_hex_block_iso_timestamp_and_lowercases_funder():
     http = FakeAlchemyHttp([ok([transfer()])])
     got = client(http).first_tx(ADDR)
     expected_ts = int(datetime(2026, 2, 22, 21, 16, 19, tzinfo=timezone.utc).timestamp())
-    assert got == (0x1a2b, expected_ts, "0xfunder")
+    assert got == (0x1a2b, expected_ts, FUNDER)
 
 
 def test_first_tx_request_shape():
@@ -277,6 +280,50 @@ def test_first_tx_implausible_or_unparseable_timestamp_returns_none_with_one_war
     assert KEY not in debug_log.text
 
 
+# --- L1: funder must be an address -------------------------------------------------------
+
+
+@pytest.mark.parametrize("frm", [
+    None, 7, {"hash": FUNDER}, ["x"], "0xZZ" + "Z" * 38, "0x" + "a" * 39, "0x" + "a" * 41,
+    "", "0xFUNDER", FUNDER + "<script>",
+])
+def test_first_tx_non_address_funder_returns_none_with_one_warning(frm, debug_log):
+    http = FakeAlchemyHttp([ok([transfer(frm=frm)])])
+    assert client(http).first_tx(ADDR) is None
+    warnings = [r for r in debug_log.records if r.levelno == logging.WARNING
+                and r.name == "robustrep.sources.profile_http"]
+    assert len(warnings) == 1
+    assert ADDR.lower() in warnings[0].getMessage() and "funder" in warnings[0].getMessage()
+    assert KEY not in debug_log.text
+    assert len(http.calls) == 1
+
+
+def test_first_tx_uppercase_funder_is_accepted_and_lowercased():
+    http = FakeAlchemyHttp([ok([transfer(frm="0x" + "A" * 40)])])
+    assert client(http).first_tx(ADDR)[2] == "0x" + "a" * 40
+
+
+def test_first_tx_implausible_timestamp_takes_precedence_over_a_bad_funder(debug_log):
+    # One WARNING, not two: the timestamp is checked first and the entry is
+    # already refused.
+    http = FakeAlchemyHttp([ok([transfer(ts="2200-01-01T00:00:00.000Z", frm=None)])])
+    assert client(http).first_tx(ADDR) is None
+    warnings = [r for r in debug_log.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "timestamp" in warnings[0].getMessage()
+
+
+def test_first_tx_non_address_funder_never_reaches_the_store(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        http = FakeAlchemyHttp([ok([transfer(frm="0x" + "a" * 40 + "; drop table raters")])])
+        assert enrich_raters(s, client(http)) == 1
+        meta = s.load_rater_meta()
+        # Same outcome as an implausible timestamp (M4): the address is
+        # recorded as unprofiled -- no funder value and no timestamp cached.
+        assert meta["funder"].isna().all() and meta["first_seen_ts"].isna().all()
+        assert s.get_sync("rater_profile_mode") == "alchemy"
+
+
 def test_first_tx_implausible_timestamp_never_reaches_the_store(tmp_path):
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([fb("0xa")])
@@ -289,12 +336,12 @@ def test_first_tx_implausible_timestamp_never_reaches_the_store(tmp_path):
 
 
 @pytest.mark.parametrize("body", [
-    ok([{"from": "0xf", "metadata": {"blockTimestamp": "2026-01-01T00:00:00Z"}}]),  # no blockNum
+    ok([{"from": FUNDER, "metadata": {"blockTimestamp": "2026-01-01T00:00:00Z"}}]),  # no blockNum
     ok([{"blockNum": "0x1", "metadata": {"blockTimestamp": "2026-01-01T00:00:00Z"}}]),  # no from
-    ok([{"blockNum": "0x1", "from": "0xf"}]),  # no metadata
-    ok([{"blockNum": "0x1", "from": "0xf", "metadata": "nope"}]),  # metadata not an object
-    ok([{"blockNum": "zz", "from": "0xf", "metadata": {"blockTimestamp": "2026-01-01T00:00:00Z"}}]),
-    ok([{"blockNum": 5, "from": "0xf", "metadata": {"blockTimestamp": "2026-01-01T00:00:00Z"}}]),
+    ok([{"blockNum": "0x1", "from": FUNDER}]),  # no metadata
+    ok([{"blockNum": "0x1", "from": FUNDER, "metadata": "nope"}]),  # metadata not an object
+    ok([{"blockNum": "zz", "from": FUNDER, "metadata": {"blockTimestamp": "2026-01-01T00:00:00Z"}}]),
+    ok([{"blockNum": 5, "from": FUNDER, "metadata": {"blockTimestamp": "2026-01-01T00:00:00Z"}}]),
     ok(["not-an-object"]),
     {"jsonrpc": "2.0", "id": 1, "result": {"transfers": "not-a-list"}},
     {"jsonrpc": "2.0", "id": 1, "result": {}},
@@ -665,10 +712,10 @@ def test_first_tx_closes_response_on_every_path():
 def test_enrich_records_alchemy_mode(tmp_path):
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([fb("0xa")])
-        http = FakeAlchemyHttp([ok([transfer(block_hex="0x3", ts="2026-01-01T00:00:00.000Z", frm="0xF")])])
+        http = FakeAlchemyHttp([ok([transfer(block_hex="0x3", ts="2026-01-01T00:00:00.000Z", frm=FUNDER_UP)])])
         assert enrich_raters(s, client(http)) == 1
         m = s.load_rater_meta().iloc[0]
-        assert m["funder"] == "0xf"
+        assert m["funder"] == FUNDER
         assert m["first_seen_ts"] == int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
         assert s.get_sync("rater_profile_mode") == "alchemy"
 

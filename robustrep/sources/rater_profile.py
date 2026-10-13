@@ -55,6 +55,10 @@ included) live in ``profile_http`` and are applied through its helpers:
   cached (``profile_http.plausible_ts``/``implausible``): one bad value written
   to the raters table makes ``robustrep.sybil._validate_meta`` raise on every
   later ``score``/``report`` run.
+- **L1** -- the funder (``from``) is cached verbatim and never revisited, so
+  it must be a ``0x`` + 40-hex address (``profile_http.funder_address``);
+  anything else is refused with one WARNING and the address is left
+  unprofiled, exactly as for an implausible timestamp.
 - **L5** -- Blockscout's ``next_page_params`` are echoed back as query params
   on the next request, so they are allowlisted (see
   ``blockscout_util.safe_next_page_params``) rather than forwarded verbatim.
@@ -83,6 +87,7 @@ from .profile_http import (
     RETRY,
     ProfilePlanError,
     fetch_with_retries,
+    funder_address,
     implausible,
     plausible_ts,
     warn_bad_ts,
@@ -274,17 +279,21 @@ class EtherscanClient:
         """``(block, ts, funder)`` for one Etherscan tx entry, or ``None`` when
         its ``timeStamp`` is unparseable or implausible (M4 -- see
         ``profile_http.plausible_ts``: refusing the profile keeps a poisoned value out of
-        the raters cache, where it would wedge every later scoring run).
+        the raters cache, where it would wedge every later scoring run) or
+        its ``from`` is not an address (L1 -- ``profile_http.funder_address``).
         Still raises ``ValueError`` for an entry missing the fields every tx
         has -- that is a malformed response, not a suspect value."""
         try:
             block = int(tx["blockNumber"])
             raw_ts = tx["timeStamp"]
-            frm = str(tx["from"]).lower()
+            raw_from = tx["from"]
         except (KeyError, TypeError, ValueError, OverflowError) as e:
             raise ValueError(f"malformed Etherscan tx entry for {address}: {e}") from e
         ts = plausible_ts(raw_ts, address)
-        return None if ts is None else (block, ts, frm)
+        if ts is None:
+            return None
+        funder = funder_address(raw_from, address)
+        return None if funder is None else (block, ts, funder)
 
 
 class BlockscoutV2Client:
@@ -398,16 +407,20 @@ class BlockscoutV2Client:
     def _parse_tx(tx: dict, address: str) -> Optional[tuple[int, int, str]]:
         """``(block, ts, funder)`` for one Blockscout tx entry, or ``None``
         when its ``timestamp`` is unparseable or implausible (M4 -- see
-        ``_parse_blockscout_timestamp``). Still raises ``ValueError`` for an
-        entry missing the fields every tx has."""
+        ``_parse_blockscout_timestamp``) or its ``from.hash`` is not an
+        address (L1 -- ``profile_http.funder_address``). Still raises
+        ``ValueError`` for an entry missing the fields every tx has."""
         try:
             block = int(tx["block_number"])
             raw_ts = tx["timestamp"]
-            frm = str(tx["from"]["hash"]).lower()
+            raw_from = tx["from"]["hash"]
         except (KeyError, TypeError, ValueError, OverflowError) as e:
             raise ValueError(f"malformed Blockscout tx entry for {address}: {e}") from e
         ts = _parse_blockscout_timestamp(raw_ts, address)
-        return None if ts is None else (block, ts, frm)
+        if ts is None:
+            return None
+        funder = funder_address(raw_from, address)
+        return None if funder is None else (block, ts, funder)
 
 
 def _parse_blockscout_timestamp(ts, address: str) -> Optional[int]:

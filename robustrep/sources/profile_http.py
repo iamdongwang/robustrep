@@ -25,6 +25,15 @@ reviewer who has checked one client has checked them all:
   rather than cached: one bad value in the raters table makes
   ``robustrep.sybil._validate_meta`` raise on every later ``score``/``report``
   run.
+- **L1** -- the funder (the ``from`` of the first incoming transaction) is
+  cached verbatim and never revisited, so it must be a real address:
+  ``funder_address`` accepts only a ``str`` matching ``^0x[0-9a-fA-F]{40}$``
+  (lowercased on the way in, the same shape ``base_erc8004._addr`` enforces
+  for raters) and refuses anything else -- ``null``, a number, an object, a
+  malformed or over-long string -- with one WARNING. The client then treats
+  the entry exactly like an implausible timestamp (M4): ``first_tx`` returns
+  ``None``, so the address is recorded as unprofiled (no funder, no
+  timestamp) rather than carrying an attacker-chosen value into the store.
 
 The retry loop itself is shared as well: ``fetch_with_retries`` is the one
 request/retry loop every client runs its HTTP call through, so the throttle
@@ -42,6 +51,7 @@ address instead of logging the same rejection once per rater.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable, Optional
 
 import requests
@@ -59,6 +69,11 @@ MAX_PROFILE_RESPONSE_BYTES = 8 * 1024 * 1024
 # (M4). Anything above this -- or at/below zero -- is a third-party bug or an
 # attempt to poison the raters cache, not a real epoch second.
 MAX_PLAUSIBLE_TS = 4102444800
+
+# The one shape a cached funder may have (L1): the lowercase form of what
+# ``base_erc8004._addr`` enforces for rater addresses, mixed case accepted on
+# input because explorers return checksum-cased addresses.
+_FUNDER_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 # Longest backoff sleep honored from a 429 response's Retry-After header,
 # in seconds -- caps a misbehaving/adversarial server from stalling a run.
@@ -98,6 +113,20 @@ def warn_bad_ts(address: str, value) -> None:
     so both are logged with ``%r``."""
     logger.warning("profile_http: implausible first-tx timestamp for %r: %r - leaving address unprofiled",
                     address, short_for_log(value))
+
+
+def funder_address(value, address: str) -> Optional[str]:
+    """``value`` as a lowercase ``0x`` + 40-hex address, or ``None`` (with one
+    WARNING) when it is not a string of that exact shape (L1). Both the
+    address and the offending value are attacker-influenced, so both are
+    logged with ``%r`` and the value is bounded through ``short_for_log``.
+    A ``None`` here must make the client's ``first_tx`` return ``None`` --
+    the same outcome as an implausible timestamp (M4)."""
+    if isinstance(value, str) and _FUNDER_RE.fullmatch(value):
+        return value.lower()
+    logger.warning("profile_http: funder for %r is not an address: %r - leaving address unprofiled",
+                    address, short_for_log(value))
+    return None
 
 
 def implausible(ts: Optional[int]) -> bool:

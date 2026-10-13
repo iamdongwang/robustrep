@@ -22,6 +22,15 @@ from robustrep.store import Store
 FB = dict(chain="base", tx_hash="0x", value="1", value_decimals=0, tag1="", tag2="", endpoint="",
           feedback_uri="", feedback_hash="")
 
+# Funders as a server spells them (mixed case) and as they are cached (lowercase).
+# A funder must be a full 0x + 40-hex address to be cached at all (L1).
+FUNDER_UP = "0xF00D00000000000000000000000000000000BEEF"
+FUNDER = FUNDER_UP.lower()
+FUNDER_6463_UP = "0x6463" + "0" * 36
+FUNDER_6463 = FUNDER_6463_UP.lower()
+NEWEST_UP, OLDEST_UP = "0x" + "A" * 40, "0x" + "B" * 40
+NEWEST, OLDEST = NEWEST_UP.lower(), OLDEST_UP.lower()
+
 
 def fb(client, block=1, log_index=0, agent_id="1", feedback_index=0):
     return dict(FB, block=block, log_index=log_index, agent_id=agent_id, client=client,
@@ -198,9 +207,9 @@ def bs_tx(hash_, block, ts, from_hash, to_hash="0x6974"):
 
 
 def test_first_tx_parses_etherscan_v2():
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "10", "timeStamp": "1700", "from": "0xF"}]}])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "10", "timeStamp": "1700", "from": FUNDER_UP}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
-    assert c.first_tx("0xA") == (10, 1700, "0xf")
+    assert c.first_tx("0xA") == (10, 1700, FUNDER)
     assert http.calls[0]["chainid"] == 8453 and http.calls[0]["apikey"] == "KEY"  # pragma: allowlist secret
 
 
@@ -221,14 +230,14 @@ def test_first_tx_none_when_no_transactions_found_message():
 
 
 def test_first_tx_lowercases_request_address():
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "1", "timeStamp": "1", "from": "0xf"}]}])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "1", "timeStamp": "1", "from": FUNDER_UP}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     c.first_tx("0xABCDEF")
     assert http.calls[0]["address"] == "0xabcdef"
 
 
 def test_first_tx_never_logs_params(caplog):
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "1", "timeStamp": "1", "from": "0xf"}]}])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "1", "timeStamp": "1", "from": FUNDER_UP}]}])
     c = EtherscanClient("SECRET-KEY", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.DEBUG):
         c.first_tx("0xA")
@@ -240,9 +249,9 @@ def test_first_tx_never_logs_params(caplog):
 
 def test_blockscout_request_has_no_chainid_or_apikey_and_hits_blockscout_url():
     http = FakeHttp([{"status": "1", "result": [{"blockNumber": "42502816", "timeStamp": "1771794979",
-                                                   "from": "0x6463"}]}])
+                                                   "from": FUNDER_6463_UP}]}])
     c = EtherscanClient.blockscout(session=http, sleep=lambda _: None)
-    assert c.first_tx("0xA") == (42502816, 1771794979, "0x6463")
+    assert c.first_tx("0xA") == (42502816, 1771794979, FUNDER_6463)
     assert http.calls[0] == {"module": "account", "action": "txlist", "address": "0xa",
                               "page": 1, "offset": 1, "sort": "asc"}
     assert "chainid" not in http.calls[0]
@@ -495,13 +504,34 @@ def test_first_tx_unparseable_timestamp_returns_none_with_one_warning(caplog):
     # M4: an unparseable third-party timestamp must not reach the raters cache
     # (a bad first_seen_ts there wedges every later score/report run), and must
     # not raise either -- the address simply goes unprofiled.
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "not-a-number", "from": "0xF"}]}])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "not-a-number", "from": FUNDER_UP}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
     warnings = _warnings(caplog, "robustrep.sources.profile_http")
     assert len(warnings) == 1
     assert "not-a-number" in warnings[0].getMessage() and "0xa" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("frm", [None, 7, "0xF", {"hash": FUNDER}])
+def test_etherscan_non_address_funder_returns_none_with_one_warning(frm, caplog):
+    # L1: the funder is cached verbatim and never revisited, so it must be a
+    # real address -- anything else leaves the address unprofiled (like M4).
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": frm}]}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
+        assert c.first_tx("0xA") is None
+    warnings = _warnings(caplog, "robustrep.sources.profile_http")
+    assert len(warnings) == 1 and "0xa" in warnings[0].getMessage() and "funder" in warnings[0].getMessage()
+
+
+def test_etherscan_non_address_funder_is_not_cached(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_feedback([fb("0xa")])
+        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+        assert enrich_raters(s, EtherscanClient("KEY", session=http, sleep=lambda _: None)) == 1
+        meta = s.load_rater_meta()
+        assert meta["funder"].isna().all() and meta["first_seen_ts"].isna().all()
 
 
 # --- estimate_seconds ---------------------------------------------------------------
@@ -527,11 +557,11 @@ def test_enrich_with_client(tmp_path):
         s.upsert_feedback([fb("0xa")])
         c = EtherscanClient(
             "K",
-            session=FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}]),
+            session=FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": FUNDER_UP}]}]),
             sleep=lambda _: None)
         assert enrich_raters(s, c) == 1
         m = s.load_rater_meta().iloc[0]
-        assert m["first_seen_ts"] == 99 and m["funder"] == "0xf"
+        assert m["first_seen_ts"] == 99 and m["funder"] == FUNDER
         assert s.get_sync("rater_profile_mode") == "etherscan"
 
 
@@ -553,7 +583,7 @@ def test_enrich_with_client_collects_failures_marks_partial_mode(tmp_path):
             def first_tx(self, address):
                 if address == "0xb":
                     raise RuntimeError("boom")
-                return (1, 100, "0xf")
+                return (1, 100, FUNDER)
 
         try:
             enrich_raters(s, FlakyClient())
@@ -606,7 +636,7 @@ def test_enrich_with_client_is_idempotent(tmp_path):
         s.upsert_feedback([fb("0xa")])
         c = EtherscanClient(
             "K",
-            session=FakeHttp([{"status": "1", "result": [{"blockNumber": "1", "timeStamp": "5", "from": "0xf"}]}]),
+            session=FakeHttp([{"status": "1", "result": [{"blockNumber": "1", "timeStamp": "5", "from": FUNDER_UP}]}]),
             sleep=lambda _: None)
         assert enrich_raters(s, c) == 1
         assert enrich_raters(s, c) == 0
@@ -618,11 +648,11 @@ def test_enrich_with_client_is_idempotent(tmp_path):
 def test_enrich_with_blockscout_client_sets_blockscout_mode(tmp_path):
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([fb("0xa")])
-        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": FUNDER_UP}]}])
         c = EtherscanClient.blockscout(session=http, sleep=lambda _: None)
         assert enrich_raters(s, c) == 1
         m = s.load_rater_meta().iloc[0]
-        assert m["first_seen_ts"] == 99 and m["funder"] == "0xf"
+        assert m["first_seen_ts"] == 99 and m["funder"] == FUNDER
         assert s.get_sync("rater_profile_mode") == "blockscout"
 
 
@@ -636,7 +666,7 @@ def test_enrich_with_blockscout_client_partial_failure_sets_blockscout_partial_m
             def first_tx(self, address):
                 if address == "0xb":
                     raise RuntimeError("boom")
-                return (1, 100, "0xf")
+                return (1, 100, FUNDER)
 
         try:
             enrich_raters(s, FlakyBlockscoutClient())
@@ -686,7 +716,7 @@ def test_enrich_plan_error_on_later_address_is_a_regular_failure(tmp_path):
             def first_tx(self, address):
                 if address == "0xb":
                     raise EtherscanPlanError(f"Etherscan plan does not support this chain for {address}")
-                return (1, 100, "0xf")
+                return (1, 100, FUNDER)
 
         try:
             enrich_raters(s, PlanRejectedOnSecondClient())
@@ -750,12 +780,12 @@ def test_keyed_run_after_fallback_upgrades_rows(tmp_path):
         assert len(s.load_rater_meta()) == 0
         assert s.get_sync("rater_profile_mode") == "fallback"
 
-        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": FUNDER_UP}]}])
         c = EtherscanClient("K", session=http, sleep=lambda _: None)
         assert enrich_raters(s, c) == 1
         assert len(http.calls) == 1
         m = s.load_rater_meta().iloc[0]
-        assert m["rater"] == "0xa" and m["first_seen_ts"] == 99 and m["funder"] == "0xf"
+        assert m["rater"] == "0xa" and m["first_seen_ts"] == 99 and m["funder"] == FUNDER
         assert s.get_sync("rater_profile_mode") == "etherscan"
 
 
@@ -904,8 +934,8 @@ def test_default_client_unknown_source_raises_value_error():
 def test_blockscout_v2_single_page_returns_oldest_and_lowercases_funder():
     body = {
         "items": [
-            bs_tx("0x2", 42502820, "2026-02-22T21:20:19.000000Z", "0x6463AAA"),
-            bs_tx("0x1", 42502816, "2026-02-22T21:16:19.000000Z", "0x6463BBB"),
+            bs_tx("0x2", 42502820, "2026-02-22T21:20:19.000000Z", NEWEST_UP),
+            bs_tx("0x1", 42502816, "2026-02-22T21:16:19.000000Z", OLDEST_UP),
         ],
         "next_page_params": None,
     }
@@ -913,13 +943,13 @@ def test_blockscout_v2_single_page_returns_oldest_and_lowercases_funder():
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
     block, ts, funder = c.first_tx("0xA")
     assert block == 42502816
-    assert funder == "0x6463bbb"
+    assert funder == OLDEST
     assert ts == int(datetime(2026, 2, 22, 21, 16, 19, tzinfo=timezone.utc).timestamp())
     assert http.calls[0]["filter"] == "to"
 
 
 def test_blockscout_v2_hits_v2_addresses_transactions_url():
-    body = {"items": [bs_tx("0x1", 1, "2026-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    body = {"items": [bs_tx("0x1", 1, "2026-01-01T00:00:00Z", FUNDER_UP)], "next_page_params": None}
     http = FakeV2Http([body])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
     c.first_tx("0xABCDEF")
@@ -928,17 +958,17 @@ def test_blockscout_v2_hits_v2_addresses_transactions_url():
 
 def test_blockscout_v2_two_pages_passes_next_page_params_through_and_returns_oldest():
     page1 = {
-        "items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+        "items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", NEWEST_UP)],
         "next_page_params": {"block_number": 100, "index": 5},
     }
     page2 = {
-        "items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+        "items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", OLDEST_UP)],
         "next_page_params": None,
     }
     http = FakeV2Http([page1, page2])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
     block, ts, funder = c.first_tx("0xA")
-    assert block == 100 and funder == "0xoldest"
+    assert block == 100 and funder == OLDEST
     assert len(http.calls) == 2
     assert http.calls[1]["block_number"] == 100
     assert http.calls[1]["index"] == 5
@@ -957,7 +987,7 @@ def test_blockscout_v2_default_max_pages_and_rps():
 
 
 def test_blockscout_v2_exceeds_max_pages_returns_none():
-    pages = [{"items": [bs_tx(f"0x{i}", i, "2026-01-01T00:00:00Z", "0xf")],
+    pages = [{"items": [bs_tx(f"0x{i}", i, "2026-01-01T00:00:00Z", FUNDER_UP)],
                "next_page_params": {"block_number": i}} for i in range(3)]
     http = FakeV2Http(pages)
     c = BlockscoutV2Client(session=http, max_pages=3, sleep=lambda _: None)
@@ -985,12 +1015,12 @@ def test_blockscout_v2_404_returns_none_without_retry():
 
 
 def test_blockscout_v2_429_then_200_succeeds_after_retry():
-    body = {"items": [bs_tx("0x1", 5, "2026-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    body = {"items": [bs_tx("0x1", 5, "2026-01-01T00:00:00Z", FUNDER_UP)], "next_page_params": None}
     http = FakeV2Http([429, body])
     sleeps = []
     c = BlockscoutV2Client(session=http, sleep=sleeps.append)
     block, ts, funder = c.first_tx("0xA")
-    assert block == 5 and funder == "0xf"
+    assert block == 5 and funder == FUNDER
     assert len(http.calls) == 2
     assert len(sleeps) >= 2  # throttle sleep(s) plus >=1 backoff sleep
 
@@ -1082,6 +1112,16 @@ def test_blockscout_v2_missing_items_key_raises_value_error():
         assert "0xa" in str(e).lower()
 
 
+@pytest.mark.parametrize("from_hash", [None, 7, "0xf", "0x" + "a" * 39])
+def test_blockscout_v2_non_address_funder_returns_none_with_one_warning(from_hash, caplog):
+    body = {"items": [bs_tx("0x1", 1, "2026-01-01T00:00:00Z", from_hash)], "next_page_params": None}
+    c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
+        assert c.first_tx("0xA") is None
+    warnings = _warnings(caplog, "robustrep.sources.profile_http")
+    assert len(warnings) == 1 and "0xa" in warnings[0].getMessage() and "funder" in warnings[0].getMessage()
+
+
 def test_blockscout_v2_malformed_tx_entry_raises_value_error():
     http = FakeV2Http([{"items": [{"hash": "0x1", "block_number": 1}], "next_page_params": None}])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
@@ -1096,14 +1136,14 @@ def test_blockscout_v2_malformed_tx_entry_raises_value_error():
 
 
 def test_blockscout_v2_parses_timestamp_with_fractional_seconds():
-    body = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19.123456Z", "0xf")], "next_page_params": None}
+    body = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19.123456Z", FUNDER_UP)], "next_page_params": None}
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     _, ts, _ = c.first_tx("0xA")
     assert ts == int(datetime(2026, 2, 22, 21, 16, 19, tzinfo=timezone.utc).timestamp())
 
 
 def test_blockscout_v2_parses_timestamp_without_fractional_seconds():
-    body = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19Z", "0xf")], "next_page_params": None}
+    body = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19Z", FUNDER_UP)], "next_page_params": None}
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     _, ts, _ = c.first_tx("0xA")
     assert ts == int(datetime(2026, 2, 22, 21, 16, 19, tzinfo=timezone.utc).timestamp())
@@ -1124,12 +1164,12 @@ def test_default_client_blockscout_returns_blockscout_v2_client():
 def test_enrich_with_blockscout_v2_client_records_blockscout_mode(tmp_path):
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([fb("0xa")])
-        body = {"items": [bs_tx("0x1", 3, "2026-01-01T00:00:00Z", "0xF")], "next_page_params": None}
+        body = {"items": [bs_tx("0x1", 3, "2026-01-01T00:00:00Z", FUNDER_UP)], "next_page_params": None}
         http = FakeV2Http([body])
         c = BlockscoutV2Client(session=http, sleep=lambda _: None)
         assert enrich_raters(s, c) == 1
         m = s.load_rater_meta().iloc[0]
-        assert m["funder"] == "0xf"
+        assert m["funder"] == FUNDER
         assert m["first_seen_ts"] == int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
         assert s.get_sync("rater_profile_mode") == "blockscout"
 
@@ -1180,10 +1220,10 @@ def test_api_key_is_redacted_from_connectionpool_log_during_a_real_call(caplog, 
                 f"/v2/api?module=account&apikey={params['apikey']}", "HTTP/1.1", 200, 512)
             return super().get(url, params=params, timeout=timeout, stream=stream)
 
-    http = LoggingHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+    http = LoggingHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": FUNDER_UP}]}])
     c = EtherscanClient("SECRET-KEY-VALUE", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.DEBUG, logger="urllib3.connectionpool"):
-        assert c.first_tx("0xA") == (3, 99, "0xf")
+        assert c.first_tx("0xA") == (3, 99, FUNDER)
     assert "SECRET-KEY-VALUE" not in caplog.text
     assert "[redacted]" in caplog.text
 
@@ -1209,7 +1249,7 @@ def test_keyless_client_installs_no_redactor(clean_urllib3_filters):
 
 
 def test_etherscan_streams_the_response():
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": "0xF"}]}])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "99", "from": FUNDER_UP}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     c.first_tx("0xA")
     assert http.streams == [True]
@@ -1243,7 +1283,7 @@ def test_etherscan_oversized_body_is_not_retried(monkeypatch):
 
 
 def test_blockscout_v2_streams_the_response():
-    body = {"items": [bs_tx("0x1", 1, "2026-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    body = {"items": [bs_tx("0x1", 1, "2026-01-01T00:00:00Z", FUNDER_UP)], "next_page_params": None}
     http = FakeV2Http([body])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
     c.first_tx("0xA")
@@ -1264,7 +1304,7 @@ def test_blockscout_v2_oversized_body_raises_without_leaking_body(monkeypatch):
 
 
 def test_etherscan_negative_timestamp_returns_none_with_one_warning(caplog):
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-1", "from": "0xF"}]}])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-1", "from": FUNDER_UP}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
@@ -1273,14 +1313,14 @@ def test_etherscan_negative_timestamp_returns_none_with_one_warning(caplog):
 
 
 def test_etherscan_zero_timestamp_returns_none():
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "0", "from": "0xF"}]}])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "0", "from": FUNDER_UP}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     assert c.first_tx("0xA") is None
 
 
 def test_etherscan_absurd_future_timestamp_returns_none():
     absurd = str(rater_profile.MAX_PLAUSIBLE_TS + 1)
-    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": absurd, "from": "0xF"}]}])
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": absurd, "from": FUNDER_UP}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     assert c.first_tx("0xA") is None
 
@@ -1290,7 +1330,7 @@ def test_max_plausible_ts_is_2100_01_01():
 
 
 def test_blockscout_pre_1970_timestamp_returns_none_with_one_warning(caplog):
-    body = {"items": [bs_tx("0x1", 1, "1900-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    body = {"items": [bs_tx("0x1", 1, "1900-01-01T00:00:00Z", FUNDER_UP)], "next_page_params": None}
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
@@ -1299,7 +1339,7 @@ def test_blockscout_pre_1970_timestamp_returns_none_with_one_warning(caplog):
 
 
 def test_blockscout_far_future_timestamp_returns_none_with_one_warning(caplog):
-    body = {"items": [bs_tx("0x1", 1, "2200-01-01T00:00:00Z", "0xf")], "next_page_params": None}
+    body = {"items": [bs_tx("0x1", 1, "2200-01-01T00:00:00Z", FUNDER_UP)], "next_page_params": None}
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
@@ -1308,7 +1348,7 @@ def test_blockscout_far_future_timestamp_returns_none_with_one_warning(caplog):
 
 
 def test_blockscout_garbage_timestamp_returns_none_with_one_warning(caplog):
-    body = {"items": [bs_tx("0x1", 1, "garbage", "0xf")], "next_page_params": None}
+    body = {"items": [bs_tx("0x1", 1, "garbage", FUNDER_UP)], "next_page_params": None}
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
@@ -1321,7 +1361,7 @@ def test_implausible_timestamp_never_reaches_upsert_rater(tmp_path):
     # score/report run cannot be wedged by one hostile third-party row.
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([fb("0xa")])
-        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-99", "from": "0xF"}]}])
+        http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "-99", "from": FUNDER_UP}]}])
         c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
         assert enrich_raters(s, c) == 1
         meta = s.load_rater_meta()
@@ -1332,10 +1372,10 @@ def test_implausible_timestamp_never_reaches_upsert_rater(tmp_path):
 
 
 def test_next_page_params_drops_unsafe_keys_and_values():
-    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", NEWEST_UP)],
              "next_page_params": {"block_number": 100, "index": 5, "../../etc/passwd": "x",
                                   "Uppercase": "y", "nested": {"a": 1}, "listy": [1, 2]}}
-    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", OLDEST_UP)],
              "next_page_params": None}
     http = FakeV2Http([page1, page2])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
@@ -1346,7 +1386,7 @@ def test_next_page_params_drops_unsafe_keys_and_values():
 
 
 def test_next_page_params_with_nothing_safe_stops_paging(caplog):
-    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", NEWEST_UP)],
              "next_page_params": {"BAD/KEY": "x"}}
     http = FakeV2Http([page1])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
@@ -1357,7 +1397,7 @@ def test_next_page_params_with_nothing_safe_stops_paging(caplog):
 
 
 def test_next_page_params_non_dict_stops_paging():
-    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", NEWEST_UP)],
              "next_page_params": ["not", "a", "dict"]}
     http = FakeV2Http([page1])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
@@ -1366,9 +1406,9 @@ def test_next_page_params_non_dict_stops_paging():
 
 
 def test_next_page_params_key_length_is_bounded():
-    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", NEWEST_UP)],
              "next_page_params": {"a" * 33: 1, "index": 5}}
-    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", OLDEST_UP)],
              "next_page_params": None}
     http = FakeV2Http([page1, page2])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
@@ -1383,7 +1423,7 @@ def test_etherscan_overflowing_timestamp_returns_none_with_one_warning(caplog):
     # 1e400 is standards-conformant JSON that float() renders as inf, and
     # int(inf) raises OverflowError -- outside first_tx's documented contract.
     http = FakeHttp([b'{"status": "1", "result": [{"blockNumber": "3", "timeStamp": 1e400, '
-                     b'"from": "0xF"}]}'])
+                     b'"from": "' + FUNDER_UP.encode() + b'"}]}'])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
@@ -1392,7 +1432,7 @@ def test_etherscan_overflowing_timestamp_returns_none_with_one_warning(caplog):
 
 def test_etherscan_infinity_string_timestamp_returns_none_with_one_warning(caplog):
     http = FakeHttp([{"status": "1", "result": [{"blockNumber": "3", "timeStamp": "Infinity",
-                                                  "from": "0xF"}]}])
+                                                  "from": FUNDER_UP}]}])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     with caplog.at_level(logging.WARNING, logger="robustrep.sources.profile_http"):
         assert c.first_tx("0xA") is None
@@ -1402,7 +1442,7 @@ def test_etherscan_infinity_string_timestamp_returns_none_with_one_warning(caplo
 
 def test_etherscan_overflowing_block_number_raises_value_error():
     http = FakeHttp([b'{"status": "1", "result": [{"blockNumber": 1e400, "timeStamp": "99", '
-                     b'"from": "0xF"}]}'])
+                     b'"from": "' + FUNDER_UP.encode() + b'"}]}'])
     c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
     with pytest.raises(ValueError) as exc:
         c.first_tx("0xA")
@@ -1411,7 +1451,7 @@ def test_etherscan_overflowing_block_number_raises_value_error():
 
 def test_blockscout_overflowing_block_number_raises_value_error():
     body = b'{"items": [{"hash": "0x1", "block_number": 1e400, "timestamp": "2026-01-01T00:00:00Z", ' \
-           b'"from": {"hash": "0xf"}}], "next_page_params": null}'
+           b'"from": {"hash": "' + FUNDER_UP.encode() + b'"}}], "next_page_params": null}'
     c = BlockscoutV2Client(session=FakeV2Http([body]), sleep=lambda _: None)
     with pytest.raises(ValueError):
         c.first_tx("0xA")
@@ -1430,8 +1470,8 @@ def test_infinity_json_constant_is_refused_before_parsing(caplog):
 
 
 def test_blockscout_naive_timestamp_is_read_as_utc():
-    naive = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19", "0xf")], "next_page_params": None}
-    zulu = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19Z", "0xf")], "next_page_params": None}
+    naive = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19", FUNDER_UP)], "next_page_params": None}
+    zulu = {"items": [bs_tx("0x1", 1, "2026-02-22T21:16:19Z", FUNDER_UP)], "next_page_params": None}
     c1 = BlockscoutV2Client(session=FakeV2Http([naive]), sleep=lambda _: None)
     c2 = BlockscoutV2Client(session=FakeV2Http([zulu]), sleep=lambda _: None)
     assert c1.first_tx("0xA") == c2.first_tx("0xA")
@@ -1441,9 +1481,9 @@ def test_blockscout_naive_timestamp_is_read_as_utc():
 
 
 def test_next_page_params_drops_an_over_long_value():
-    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", NEWEST_UP)],
              "next_page_params": {"block_number": 100, "index": "x" * 129}}
-    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", OLDEST_UP)],
              "next_page_params": None}
     http = FakeV2Http([page1, page2])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)
@@ -1452,9 +1492,9 @@ def test_next_page_params_drops_an_over_long_value():
 
 
 def test_next_page_params_caps_the_number_of_keys():
-    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", "0xnewest")],
+    page1 = {"items": [bs_tx("0x2", 200, "2026-02-01T00:00:00Z", NEWEST_UP)],
              "next_page_params": {f"k{chr(ord('a') + i)}": i for i in range(12)}}
-    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", "0xoldest")],
+    page2 = {"items": [bs_tx("0x1", 100, "2026-01-01T00:00:00Z", OLDEST_UP)],
              "next_page_params": None}
     http = FakeV2Http([page1, page2])
     c = BlockscoutV2Client(session=http, sleep=lambda _: None)

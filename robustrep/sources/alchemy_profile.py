@@ -51,6 +51,11 @@ review's rules, plus one twist of Alchemy's own:
   parse_timestamp`` (Alchemy serves the same ISO8601 shape,
   ``2026-02-22T21:16:19.000Z``) and refused via ``profile_http.implausible``
   rather than cached when it is not a plausible epoch second.
+- **L1** -- the funder (``from``) must be a ``0x`` + 40-hex address
+  (``profile_http.funder_address``); anything else is refused with one
+  WARNING and ``first_tx`` returns ``None``, exactly as for an implausible
+  timestamp -- the address is recorded as unprofiled, never with a
+  server-chosen string as its funder.
 """
 from __future__ import annotations
 
@@ -69,6 +74,7 @@ from .profile_http import (
     ProfilePlanError,
     capped_json,
     fetch_with_retries,
+    funder_address,
     implausible,
     warn_bad_ts,
 )
@@ -176,8 +182,9 @@ class AlchemyClient:
 
     def first_tx(self, address: str) -> Optional[tuple[int, int, str]]:
         """Return ``(block, timestamp, funder_from_address)`` for the earliest
-        incoming external transfer to ``address``, or ``None`` if it has none
-        or its block timestamp is implausible (M4, logged once). Raises
+        incoming external transfer to ``address``, or ``None`` if it has none,
+        its block timestamp is implausible (M4, logged once) or its ``from``
+        is not an address (L1, logged once). Raises
         ``ValueError`` naming ``address`` for a malformed body -- not a JSON
         object, ``result`` not an object, ``transfers`` not a list, an entry
         missing ``blockNum``/``from``/``metadata.blockTimestamp`` or with a
@@ -302,19 +309,23 @@ def _classify_http_error(code: int, r, address: str):
 def _parse_transfer(tx, address: str) -> Optional[tuple[int, int, str]]:
     """``(block, ts, funder)`` for one ``transfers`` entry, or ``None`` when
     its ``metadata.blockTimestamp`` is unparseable or implausible (M4 -- see
-    ``profile_http.implausible``; the WARNING is ``warn_bad_ts``). Raises
-    ``ValueError`` naming only the address for an entry missing the fields
-    every transfer has, or whose ``blockNum`` is not a hex string -- that is
-    a malformed response, not a suspect value. The cause is chained for a
-    debugger but deliberately not interpolated: it may quote server text."""
+    ``profile_http.implausible``; the WARNING is ``warn_bad_ts``) or its
+    ``from`` is not an address (L1 -- ``profile_http.funder_address``; the
+    timestamp is checked first, so a refused entry logs one WARNING, not
+    two). Raises ``ValueError`` naming only the address for an entry
+    missing the fields every transfer has, or whose ``blockNum`` is not a
+    hex string -- that is a malformed response, not a suspect value. The
+    cause is chained for a debugger but deliberately not interpolated: it
+    may quote server text."""
     try:
         block = int(tx["blockNum"], 16)
         raw_ts = tx["metadata"]["blockTimestamp"]
-        frm = str(tx["from"]).lower()
+        raw_from = tx["from"]
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"malformed Alchemy transfer entry for {address}") from e
     epoch = blockscout_util.parse_timestamp(raw_ts)
     if epoch is None or implausible(epoch):
         warn_bad_ts(address, raw_ts)
         return None
-    return (block, epoch, frm)
+    funder = funder_address(raw_from, address)
+    return None if funder is None else (block, epoch, funder)
