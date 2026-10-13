@@ -294,7 +294,7 @@ class EtherscanClient:
             raw_ts = tx["timeStamp"]
             raw_from = tx["from"]
         except (KeyError, TypeError, ValueError, OverflowError) as e:
-            raise ValueError(f"malformed Etherscan tx entry for {address}: {e}") from e
+            raise ValueError(f"malformed Etherscan tx entry for {address}") from e
         ts = plausible_ts(raw_ts, address)
         if ts is None:
             return None
@@ -421,7 +421,7 @@ class BlockscoutV2Client:
             raw_ts = tx["timestamp"]
             raw_from = tx["from"]["hash"]
         except (KeyError, TypeError, ValueError, OverflowError) as e:
-            raise ValueError(f"malformed Blockscout tx entry for {address}: {e}") from e
+            raise ValueError(f"malformed Blockscout tx entry for {address}") from e
         ts = _parse_blockscout_timestamp(raw_ts, address)
         if ts is None:
             return None

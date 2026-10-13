@@ -887,3 +887,18 @@ def test_default_client_blockscout_and_etherscan_ignore_alchemy_key():
 
 def test_module_exposes_source_label_used_by_enrich_raters():
     assert alchemy_profile.AlchemyClient.source == "alchemy"
+
+
+def test_first_tx_http_401_oversized_body_is_still_a_config_error(monkeypatch, debug_log):
+    # I-1: 401 means "bad key" whatever the body says, so the body must not be
+    # read at all -- an oversized one must not turn the abort into a per-address
+    # limit error (which would make enrich_raters fail ~13,000 addresses one by
+    # one, reading up to 8 MiB each).
+    monkeypatch.setattr(profile_http, "MAX_PROFILE_RESPONSE_BYTES", 1024)
+    http = FakeAlchemyHttp([(401, {}, b'{"error": {"message": "' + b"SECRETBODY" * 2000 + b'"}}')] * 2)
+    with pytest.raises(AlchemyConfigError) as exc:
+        client(http).first_tx(ADDR)
+    assert str(exc.value) == CONFIG_REJECTED_MESSAGE
+    assert len(http.calls) == 1
+    assert "SECRETBODY" not in debug_log.text
+    assert http.responses_made[0].closed is True

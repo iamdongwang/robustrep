@@ -184,9 +184,28 @@ def short_for_log(value, limit: int = 40) -> str:
     chose. A log topic, a pagination key or an API error string can be
     arbitrarily long, and a WARNING that echoes megabytes of it is its own
     denial of service. Non-strings are ``repr``-ed first, so this is safe to
-    hand any value; callers still log the result with ``%r``."""
+    hand any value; callers still log the result with ``%r``.
+
+    Every API key registered through ``install_key_redaction`` is scrubbed
+    *here*, before the cut (L2): the ``ApiKeyRedactor`` filter only matches
+    the exact key, so a key the server echoed back at offset 9 or more of a
+    value this function had already truncated to 40 characters would reach
+    the log as a 30-character prefix."""
     s = value if isinstance(value, str) else repr(value)
+    s = scrub_installed_keys(s)
     return s if len(s) <= limit else f"{s[:limit]}...({len(s)} chars)"
+
+
+def scrub_installed_keys(text: str) -> str:
+    """``text`` with every key that has a redactor installed replaced by
+    ``REDACTED``. Keys registered as ``None`` (too short to redact safely)
+    are left alone, exactly as the logger filter leaves them."""
+    with _redactor_lock:
+        keys = [k for k, redactor in _installed_redactors.items() if redactor is not None]
+    for key in keys:
+        if key in text:
+            text = text.replace(key, REDACTED)
+    return text
 
 
 def install_key_redaction(key: Optional[str]) -> None:
@@ -209,7 +228,7 @@ def install_key_redaction(key: Optional[str]) -> None:
         if len(key) < MIN_REDACTABLE_KEY_CHARS:
             # Remembered (as None) so this warns once per key, not per client.
             _installed_redactors[key] = None
-            logger.warning("http_util: not redacting a %d-character API key from urllib3 logs "
+            logger.warning("http_util: not redacting a %d-character API key from the redacted loggers "
                             "(under the %d-character minimum) - it would match unrelated log text",
                             len(key), MIN_REDACTABLE_KEY_CHARS)
             return

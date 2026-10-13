@@ -303,3 +303,32 @@ def test_install_key_redaction_warns_once_per_short_key(caplog):
 def test_redaction_covers_every_urllib3_logger_that_echoes_a_url():
     assert set(http_util._URLLIB3_LOGGERS) >= {
         "urllib3", "urllib3.connectionpool", "urllib3.util.retry", "urllib3.poolmanager"}
+
+
+def test_short_for_log_scrubs_installed_keys_before_truncating():
+    # I-2: the redactor filter replaces the *exact* key in a record's args, but
+    # short_for_log has already cut the value to 40 chars by then -- a key at
+    # offset >= 9 survived as a 30+ char prefix. Installed keys are therefore
+    # scrubbed inside short_for_log itself, before the cut.
+    restore = _isolated_redaction(http_util._REDACTED_LOGGERS)
+    try:
+        key = "K" * 32
+        http_util.install_key_redaction(key)
+        for value in ("x" * 10 + key, key, key + "tail", "a" + key + "b" + key):
+            out = http_util.short_for_log(value)
+            assert key not in out and key[:12] not in out, out
+            assert http_util.REDACTED in out
+        # Unrelated text and the limit are untouched.
+        assert http_util.short_for_log("plain") == "plain"
+        assert http_util.short_for_log("y" * 50).startswith("y" * 40)
+    finally:
+        restore()
+
+
+def test_short_for_log_leaves_a_short_unredactable_key_alone():
+    restore = _isolated_redaction(http_util._REDACTED_LOGGERS)
+    try:
+        http_util.install_key_redaction("KEY")  # under the minimum: registered as None
+        assert http_util.short_for_log("MONKEY") == "MONKEY"
+    finally:
+        restore()

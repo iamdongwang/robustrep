@@ -39,6 +39,12 @@ and timestamp (12/12, 2026-10-13). Scoring is unchanged.
   profiled through Alchemy.
 
 ### Changed
+- Re-review follow-ups: HTTP 401 from Alchemy aborts before the body is read (an oversized
+  body can no longer demote the abort into a per-address limit error); `short_for_log`
+  scrubs every installed API key before truncating, so a key echoed at any offset of a
+  server-chosen value is redacted rather than surviving as a prefix; the Etherscan and
+  Blockscout malformed-entry errors no longer interpolate the parser's own message, which
+  could carry server text.
 
 - **`--profile-source auto` now picks Alchemy** when `ALCHEMY_API_KEY` is
   set and no Etherscan key is. A run that previously fell through to

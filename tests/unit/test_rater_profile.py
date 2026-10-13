@@ -1502,3 +1502,27 @@ def test_next_page_params_caps_the_number_of_keys():
     sent = dict(http.calls[1])
     sent.pop("filter")
     assert len(sent) == 8
+
+
+# --- N-1: a malformed entry's ValueError must not echo server-chosen text -------------
+
+
+def test_etherscan_malformed_entry_error_carries_no_server_text():
+    http = FakeHttp([{"status": "1", "result": [{"blockNumber": "SERVERTEXT-zz", "timeStamp": "99",
+                                                 "from": FUNDER}]}])
+    c = EtherscanClient("KEY", session=http, sleep=lambda _: None)
+    with pytest.raises(ValueError) as exc:
+        c.first_tx("0xA")
+    assert "0xa" in str(exc.value).lower()
+    assert "SERVERTEXT" not in str(exc.value)
+
+
+def test_blockscout_v2_malformed_entry_error_carries_no_server_text():
+    http = FakeV2Http([{"items": [{"hash": "0x1", "block_number": "SERVERTEXT-zz",
+                                   "timestamp": "2026-02-22T21:16:19Z", "from": {"hash": FUNDER}}],
+                        "next_page_params": None}])
+    c = BlockscoutV2Client(session=http, sleep=lambda _: None)
+    with pytest.raises(ValueError) as exc:
+        c.first_tx("0xA")
+    assert "0xa" in str(exc.value).lower()
+    assert "SERVERTEXT" not in str(exc.value)

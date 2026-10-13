@@ -288,13 +288,19 @@ def _classify_http_error(code: int, r, address: str):
     ``RuntimeError`` and ``enrich_raters`` would go on to fail every one of
     the ~13,000 others the same way.
 
-    HTTP 401 raises ``AlchemyConfigError`` regardless of body. Any other
+    HTTP 401 raises ``AlchemyConfigError`` regardless of body -- and without
+    reading it. Any other
     non-transient 4xx raises it when the body (streamed and capped like a
     success body -- M2) is a JSON-RPC error ``_error_kind`` calls
     ``"config"``; a body that is not JSON, not an object, or any other
     error returns ``REJECTED`` so the loop raises its fixed ``Alchemy HTTP
     {code} for {address}``. ``r`` may be ``None`` when the session itself
     raised. The server text, as always, reaches only the DEBUG log."""
+    if code == _HTTP_UNAUTHENTICATED:
+        # Decided on the status alone, *before* touching the body: a bad key is
+        # a bad key whatever the server attached, and an oversized body must
+        # not demote this abort into a per-address limit error (I-1).
+        raise AlchemyConfigError(CONFIG_REJECTED_MESSAGE)
     body = None
     if r is not None:
         try:
@@ -303,7 +309,7 @@ def _classify_http_error(code: int, r, address: str):
             body = None  # not JSON: nothing to classify beyond the status
     error = body.get("error") if isinstance(body, dict) else None
     kind = _error_kind(error, address) if error is not None else "other"
-    if code == _HTTP_UNAUTHENTICATED or kind == "config":
+    if kind == "config":
         raise AlchemyConfigError(CONFIG_REJECTED_MESSAGE)
     return REJECTED
 
