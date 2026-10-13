@@ -43,7 +43,14 @@ from .sources.rpc import RpcClient, RpcError
 from .store import Store
 from .sybil import cluster_raters_with_stats, profiles_from_records
 
-app = typer.Typer(add_completion=False, help="Robust, transport-agnostic reputation scoring for AI agents.")
+# pretty_exceptions_enable=False: an exception no step expects (a locked
+# SQLite file, say) escapes to typer's excepthook, and the frames it would
+# render hold the Etherscan and Alchemy keys as locals (_step_raters, fetch).
+# typer's pretty traceback omits local values only while its
+# pretty_exceptions_show_locals default stays False; Python's standard
+# traceback never prints them, and loses nothing an operator needs.
+app = typer.Typer(add_completion=False, pretty_exceptions_enable=False,
+                  help="Robust, transport-agnostic reputation scoring for AI agents.")
 
 logger = logging.getLogger(__name__)
 

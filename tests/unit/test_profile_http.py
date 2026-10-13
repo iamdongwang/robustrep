@@ -208,6 +208,14 @@ def test_retry_after_seconds_honors_numeric_header_and_caps_it():
     assert retry_after_seconds(_http_error(429, {"Retry-After": "3600"})) == RETRY_AFTER_CAP
 
 
+@pytest.mark.parametrize("value", ["nan", "NaN", "-nan", "inf", "Infinity", "-inf", "1e999"])
+def test_retry_after_seconds_rejects_non_finite_values(value):
+    # L4: float("nan") passes `< 0` and survives min(nan, cap) as nan, and
+    # time.sleep(nan) raises ValueError -- turning a retryable 429 into an
+    # immediate per-address failure. Non-finite means "no usable hint".
+    assert retry_after_seconds(_http_error(429, {"Retry-After": value})) is None
+
+
 def test_retry_after_seconds_none_without_response_header_or_numeric_value():
     assert retry_after_seconds(requests.ConnectionError("no response")) is None
     assert retry_after_seconds(_http_error(429)) is None

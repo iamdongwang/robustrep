@@ -214,6 +214,56 @@ def test_redactor_scrubs_a_path_embedded_key(caplog):
     assert "[redacted]" in caplog.text
 
 
+def test_server_text_starting_with_the_key_is_redacted_from_the_debug_log(debug_log):
+    # L2: the JSON-RPC message is server-chosen and logged (bounded) at DEBUG
+    # on robustrep's own logger, which urllib3's redactors do not cover. The
+    # key is the first 34 characters of the message so that it survives the
+    # 40-character bound whole.
+    http = FakeAlchemyHttp([rpc_error(-32602, f"{KEY} was rejected")])
+    with pytest.raises(RuntimeError):
+        client(http).first_tx(ADDR)
+    records = [r for r in debug_log.records if r.name == "robustrep.sources.alchemy_profile"]
+    assert records and any("[redacted]" in r.getMessage() for r in records)
+    assert KEY not in debug_log.text
+
+
+def test_server_chosen_timestamp_equal_to_the_key_is_redacted_from_the_warning(debug_log):
+    http = FakeAlchemyHttp([ok([transfer(ts=KEY)])])
+    assert client(http).first_tx(ADDR) is None
+    warnings = [r for r in debug_log.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "[redacted]" in warnings[0].getMessage()
+    assert KEY not in debug_log.text
+
+
+def test_server_chosen_funder_equal_to_the_key_is_redacted_from_the_warning(debug_log):
+    http = FakeAlchemyHttp([ok([transfer(frm=KEY)])])
+    assert client(http).first_tx(ADDR) is None
+    warnings = [r for r in debug_log.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "[redacted]" in warnings[0].getMessage()
+    assert KEY not in debug_log.text
+
+
+def test_constructor_installs_redaction_once_per_key_on_the_robustrep_loggers():
+    names = ("robustrep.sources.alchemy_profile", "robustrep.sources.profile_http")
+    before = {n: list(logging.getLogger(n).filters) for n in names}
+    saved = dict(http_util._installed_redactors)
+    for n in names:
+        logging.getLogger(n).filters = []
+    http_util._installed_redactors.clear()
+    try:
+        client(FakeAlchemyHttp([]))
+        client(FakeAlchemyHttp([]))
+        for n in names:
+            redactors = [f for f in logging.getLogger(n).filters
+                         if isinstance(f, http_util.ApiKeyRedactor) and f.key == KEY]
+            assert len(redactors) == 1, n
+    finally:
+        for n, filters in before.items():
+            logging.getLogger(n).filters = filters
+        http_util._installed_redactors.clear()
+        http_util._installed_redactors.update(saved)
+
+
 # --- happy path --------------------------------------------------------------------------
 
 

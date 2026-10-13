@@ -51,6 +51,7 @@ address instead of logging the same rejection once per rater.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import Callable, Optional
 
@@ -212,10 +213,12 @@ def is_transient_http(code: Optional[int]) -> bool:
 def retry_after_seconds(e: requests.RequestException) -> Optional[float]:
     """Seconds named by the response's ``Retry-After`` header, capped at
     ``RETRY_AFTER_CAP``, or ``None`` if there is no response, no such
-    header, or its value isn't a non-negative number. Only the numeric
-    (seconds) form of the header is honored -- the HTTP-date form is
+    header, or its value isn't a finite non-negative number. Only the
+    numeric (seconds) form of the header is honored -- the HTTP-date form is
     ignored rather than trusted to `sleep()` against a possibly-skewed
-    remote clock."""
+    remote clock. ``nan``/``inf`` parse as floats but are refused too (L4):
+    ``nan`` survives both the sign check and ``min()``, and ``time.sleep(nan)``
+    raises, which would turn a retryable 429 into a per-address failure."""
     resp = getattr(e, "response", None)
     if resp is None:
         return None
@@ -226,7 +229,7 @@ def retry_after_seconds(e: requests.RequestException) -> Optional[float]:
         seconds = float(value)
     except (TypeError, ValueError):
         return None
-    if seconds < 0:
+    if not math.isfinite(seconds) or seconds < 0:
         return None
     return min(seconds, RETRY_AFTER_CAP)
 

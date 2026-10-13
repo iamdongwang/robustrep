@@ -169,6 +169,63 @@ def test_redactor_passes_through_non_string_args():
     assert record.getMessage() == "200 None"
 
 
+# L2: robustrep's own loggers that echo server-chosen text (a JSON-RPC error
+# message at DEBUG, an implausible timestamp or a refused funder at WARNING)
+# must be scrubbed too -- a logger-level filter is not consulted for child or
+# sibling loggers, so each one needs its own copy.
+ROBUSTREP_ECHO_LOGGERS = ("robustrep.sources.alchemy_profile", "robustrep.sources.profile_http")
+
+
+def _isolated_redaction(names):
+    """Snapshot the filters on ``names`` and the install registry, clear both,
+    and return a restore callable -- other tests leak redactors for their own
+    keys into these process-wide loggers."""
+    before = {n: list(logging.getLogger(n).filters) for n in names}
+    saved = dict(http_util._installed_redactors)
+    for n in names:
+        logging.getLogger(n).filters = []
+    http_util._installed_redactors.clear()
+
+    def restore():
+        for n, filters in before.items():
+            logging.getLogger(n).filters = filters
+        http_util._installed_redactors.clear()
+        http_util._installed_redactors.update(saved)
+    return restore
+
+
+def test_install_key_redaction_covers_the_robustrep_loggers_that_echo_server_text(caplog):
+    restore = _isolated_redaction(ROBUSTREP_ECHO_LOGGERS)
+    try:
+        install_key_redaction("SECRET-KEY-VALUE")
+        for name in ROBUSTREP_ECHO_LOGGERS:
+            installed = [f for f in logging.getLogger(name).filters
+                         if isinstance(f, ApiKeyRedactor) and f.key == "SECRET-KEY-VALUE"]
+            assert len(installed) == 1, name
+        with caplog.at_level(logging.DEBUG):
+            logging.getLogger("robustrep.sources.alchemy_profile").debug(
+                "JSON-RPC error for %s (code %r): %r", "0xa", -32602, "echo SECRET-KEY-VALUE back")
+            logging.getLogger("robustrep.sources.profile_http").warning(
+                "implausible first-tx timestamp for 0xa: 'SECRET-KEY-VALUE'")
+        assert "SECRET-KEY-VALUE" not in caplog.text
+        assert caplog.text.count("[redacted]") == 2
+    finally:
+        restore()
+
+
+def test_install_key_redaction_is_idempotent_on_the_robustrep_loggers_too():
+    restore = _isolated_redaction(ROBUSTREP_ECHO_LOGGERS)
+    try:
+        install_key_redaction("SAME-KEY-VALUE")
+        install_key_redaction("SAME-KEY-VALUE")
+        install_key_redaction("OTHER-KEY-VALUE")
+        for name in ROBUSTREP_ECHO_LOGGERS:
+            redactors = [f for f in logging.getLogger(name).filters if isinstance(f, ApiKeyRedactor)]
+            assert sorted(f.key for f in redactors) == ["OTHER-KEY-VALUE", "SAME-KEY-VALUE"]
+    finally:
+        restore()
+
+
 def test_install_key_redaction_ignores_a_falsy_key():
     before = list(logging.getLogger("urllib3").filters)
     install_key_redaction("")

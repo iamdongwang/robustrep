@@ -1,5 +1,7 @@
 import json
 import logging
+import subprocess
+import sys
 
 import pandas as pd
 import pytest
@@ -705,6 +707,50 @@ def test_fetch_partial_rater_failure_continues_and_exits_2(tmp_path, monkeypatch
     assert r.exit_code == 2, r.output
     assert evidence_calls == [1]  # evidence step still ran after the partial rater failure
     assert "WARNING" in r.output
+
+
+def test_pretty_exceptions_are_disabled_on_the_app():
+    # I4: the no-locals guarantee for an unexpected traceback must not rest on
+    # typer's default for pretty_exceptions_show_locals.
+    assert app.pretty_exceptions_enable is False
+
+
+def test_unexpected_exception_traceback_never_prints_local_values(tmp_path):
+    # I4: _step_raters holds the Etherscan and Alchemy keys as locals, and an
+    # exception it does not expect (sqlite3.OperationalError, say) escapes
+    # fetch() to typer's excepthook. CliRunner swallows the exception before
+    # any excepthook runs, so this drives cli.app() in a subprocess, forces
+    # the condition the review warned about (frame locals switched on) and
+    # requires the sentinel local to stay off stdout/stderr regardless.
+    db = tmp_path / "t.db"
+    _seed(db, n=1)
+    sentinel = "LOCAL-VALUE-THAT-MUST-NOT-PRINT-0123456789"
+    script = f"""
+import sqlite3, sys
+from robustrep import cli
+
+class FakeRpc:
+    def __init__(self, *a, **k):
+        pass
+
+cli.RpcClient = FakeRpc
+cli.base.sync_feedback = lambda *a, **k: 0
+cli.base.fill_block_timestamps = lambda *a, **k: 0
+cli.base.owners_of = lambda rpc, agent_ids, **k: {{a: None for a in agent_ids}}
+
+def boom(*a, **k):
+    alchemy_key = {sentinel!r}
+    raise sqlite3.OperationalError("database is locked")
+
+cli._step_raters = boom
+cli.app.pretty_exceptions_show_locals = True
+sys.argv = ["robustrep", "fetch", "--db", {str(db)!r}]
+cli.app()
+"""
+    r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "OperationalError" in r.stderr and "database is locked" in r.stderr
+    assert sentinel not in r.stdout and sentinel not in r.stderr
 
 
 def test_fetch_keyboard_interrupt_propagates(tmp_path, monkeypatch):

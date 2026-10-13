@@ -117,6 +117,17 @@ REDACTED = "[redacted]"
 _URLLIB3_LOGGERS = ("urllib3", "urllib3.connectionpool", "urllib3.util.retry",
                      "urllib3.poolmanager")
 
+# robustrep's own loggers that echo *server-chosen* text: a JSON-RPC error
+# message at DEBUG (alchemy_profile), an implausible timestamp or a refused
+# funder at WARNING (profile_http). The only party that can put the key into
+# a response body is the one that received it in the request, but that is
+# exactly the party these clients treat as hostile, so the same redactor is
+# attached here (L2). Named as strings: these modules import this one.
+_ROBUSTREP_ECHO_LOGGERS = ("robustrep.sources.alchemy_profile", "robustrep.sources.profile_http")
+
+# Every logger that gets a copy of each installed redactor.
+_REDACTED_LOGGERS = _URLLIB3_LOGGERS + _ROBUSTREP_ECHO_LOGGERS
+
 # Installed redactors, keyed by the API key they scrub, so constructing many
 # clients with the same key does not stack duplicate filters on a process-wide
 # logger. Guarded by ``_redactor_lock``: a client may be built from
@@ -127,7 +138,8 @@ _redactor_lock = threading.Lock()
 
 class ApiKeyRedactor(logging.Filter):
     """Replaces an exact API key value with ``[redacted]`` in every log record
-    passing through urllib3's loggers (M1).
+    passing through urllib3's loggers (M1) and through the robustrep loggers
+    that echo server-chosen text (L2 -- see ``_ROBUSTREP_ECHO_LOGGERS``).
 
     urllib3 logs each request at DEBUG as ``'%s://%s:%s "%s %s %s" %s %s'``
     with the full path+query string among its ``args`` -- so a run with root
@@ -178,8 +190,9 @@ def short_for_log(value, limit: int = 40) -> str:
 
 
 def install_key_redaction(key: Optional[str]) -> None:
-    """Install an ``ApiKeyRedactor`` for ``key`` on urllib3's loggers, once per
-    distinct key (M1).
+    """Install an ``ApiKeyRedactor`` for ``key`` on urllib3's loggers and on
+    the robustrep loggers that echo server-chosen text
+    (``_REDACTED_LOGGERS``), once per distinct key (M1, L2).
 
     A falsy key (Blockscout, or an unconfigured Etherscan client) installs
     nothing -- there is no secret to hide, and an empty-string match would
@@ -201,6 +214,6 @@ def install_key_redaction(key: Optional[str]) -> None:
                             len(key), MIN_REDACTABLE_KEY_CHARS)
             return
         redactor = ApiKeyRedactor(key)
-        for name in _URLLIB3_LOGGERS:
+        for name in _REDACTED_LOGGERS:
             logging.getLogger(name).addFilter(redactor)
         _installed_redactors[key] = redactor
