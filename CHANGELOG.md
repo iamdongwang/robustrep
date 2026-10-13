@@ -67,6 +67,15 @@ changes is which raters the funder signal can link.
 
 ### Changed
 
+- **Re-review follow-ups (owner pass).** A reverted batch entry is never read as
+  the endpoint rate-limiting the batch, so a contract's revert reason cannot switch
+  batching off for the rest of a run; a JSON-RPC error with no numeric code renders
+  as `[?]` so its server text is scrubbed like any other; `is_revert` is a type check
+  only (`RpcRevertError`), so a transport failure whose text mentions "revert" is a
+  per-address failure retried next run, not a sticky `none`; the store validates the
+  funder's shape per kind (`0x`+40-hex for `transfer`, `owner:0x`+40-hex lowercase
+  for `owner`, none for `none`) at write time.
+
 - **Meaning of `funder`:** "who funded the address" becomes "who controls
   or funded it". The sybil comparison (equality of the lowercased funder)
   is unchanged, so an existing store keeps its clusters and gains the

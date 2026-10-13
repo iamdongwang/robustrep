@@ -10,6 +10,7 @@ and, in a batch, per *chunk*. Split from ``test_rpc.py`` for file size.
 import pytest
 
 from robustrep.sources.rpc import (
+    is_revert,
     NON_RETRYABLE,
     RpcBatchRateLimitError,
     RpcBatchStructureError,
@@ -112,9 +113,50 @@ def test_per_entry_error_message_is_scrubbed_of_server_text():
 
 
 def test_per_entry_error_without_a_code_has_none_code_and_scrubbed_message():
-    s = FakeSession([[{"id": 1, "error": {"message": "execution reverted: nope"}}]])
+    # I-2: with no numeric code there is no "[code]" token to keep, so the
+    # server text must be dropped entirely rather than kept verbatim.
+    userinfo_url = "https://attacker.example/v2/SECRET?x=1"  # pragma: allowlist secret
+    s = FakeSession([[{"id": 1, "error": {"message": f"execution reverted: {userinfo_url}"}}]])
     got = _client(s, []).batch([("m", [1])], per_entry_errors=True)
-    assert got == [RpcEntryError(code=None, message="execution reverted: nope", reverted=True)]
+    assert got == [RpcEntryError(code=None, message="[?]", reverted=True)]
+    assert "SECRET" not in got[0].message
+
+
+def test_code_less_single_call_error_is_scrubbed_in_the_give_up_message():
+    # I-2 on the single-call path: the final RpcError text must not carry
+    # server-chosen text either when the server omitted a code.
+    s = FakeSession([{"id": 1, "error": {"message": "invalid params: https://x.example/v2/KEY"}}])
+    with pytest.raises(RpcError) as exc:
+        _client(s, []).call("m", [1])
+    assert "KEY" not in scrub_rpc_error(exc.value)
+    assert "[?]" in scrub_rpc_error(exc.value)
+
+
+def test_reverted_batch_entry_mentioning_a_rate_limit_phrase_is_still_just_a_revert():
+    # I-1: the revert reason is the contract's own text; it must never be read
+    # as the endpoint rate-limiting the batch (which would switch batching off
+    # for the rest of the run through BatchState).
+    body = [{"id": 1, "result": "a"},
+            {"id": 2, "error": {"code": 3, "message": "execution reverted: over rate limit -32016"}}]
+    s = FakeSession([body])
+    got = _client(s, []).batch([("m", [1]), ("m", [2])], per_entry_errors=True)
+    assert got[0] == "a" and got[1] == RpcEntryError(code=3, message="[3]", reverted=True)
+    s2 = FakeSession([body])
+    with pytest.raises(RpcRevertError):
+        _client(s2, []).batch([("m", [1]), ("m", [2])])
+
+
+@pytest.mark.parametrize("text", [
+    "gave up after 5 attempts: [-32000] the node reverted to a backup",
+    "ConnectionError contacting https://revert-node.example",
+    "non-retryable error: [-32602] invalid params for revertible call",
+])
+def test_is_revert_is_the_type_check_only(text):
+    # I-3: a plain RpcError that merely mentions "revert" is a transport or
+    # parameter failure, not the contract's answer -- treating it as a revert
+    # would write a sticky "none" verdict for a transiently failing address.
+    assert is_revert(RpcError(text)) is False
+    assert is_revert(RpcRevertError(text)) is True
 
 
 def test_per_entry_error_ignores_a_non_integer_code():
@@ -189,8 +231,8 @@ class _RevertingRpc:
 
 @pytest.mark.parametrize("exc", [
     RpcRevertError("non-retryable error: [3] execution reverted"),
-    RpcError("gave up after 5 attempts: execution reverted: ERC721: nonexistent"),  # legacy text shape
-], ids=["typed", "substring"])
+    RpcRevertError("non-retryable error: batch entry id=2: [3] execution reverted: ERC721: nonexistent"),
+], ids=["single", "batch-entry"])
 def test_owner_of_and_account_owner_treat_a_revert_as_none(exc):
     from robustrep.sources.account_owner import account_owner
     from robustrep.sources.base_erc8004 import owner_of

@@ -6,7 +6,7 @@ from eth_abi import encode
 from robustrep.config import Config
 from robustrep.sources import base_erc8004 as b
 from robustrep.sources.log_fetcher import FetchResult, Served
-from robustrep.sources.rpc import RpcBatchRateLimitError, RpcBatchStructureError, RpcError
+from robustrep.sources.rpc import RpcRevertError, RpcBatchRateLimitError, RpcBatchStructureError, RpcError
 from robustrep.store import Store
 
 
@@ -501,7 +501,7 @@ def test_owner_of_revert_returns_none():
     class RevertingRpc(FakeRpc):
         def call(self, method, params):
             if method == "eth_call":
-                raise RpcError("execution reverted: ERC721: owner query for nonexistent token")
+                raise RpcRevertError("execution reverted: ERC721: owner query for nonexistent token")
             return super().call(method, params)
 
     rpc = RevertingRpc({})
@@ -563,7 +563,7 @@ class OwnerBatchRpc(FakeRpc):
         for _method, params in calls:
             agent_id = self._agent_id_from_data(params[0]["data"])
             if agent_id in self.revert_agents:
-                raise RpcError(f"execution reverted for agent {agent_id}")
+                raise RpcRevertError(f"execution reverted for agent {agent_id}")
             results.append(self._result_for(agent_id))
         return results
 
@@ -572,7 +572,7 @@ class OwnerBatchRpc(FakeRpc):
             self.calls.append((method, params))
             agent_id = self._agent_id_from_data(params[0]["data"])
             if agent_id in self.revert_agents:
-                raise RpcError("execution reverted: nonexistent token")
+                raise RpcRevertError("execution reverted: nonexistent token")
             return self._result_for(agent_id)
         return super().call(method, params)
 

@@ -1912,7 +1912,7 @@ def test_step_raters_line_reports_the_funder_kinds_written_this_run(tmp_path, mo
 
     def _enrich(store, client, addresses=None, *, rpc=None, **kw):
         store.upsert_rater(addresses[0], 10, "0x" + "f" * 40, "transfer")
-        store.upsert_rater(addresses[1], None, "0x" + "e" * 40, "owner")
+        store.upsert_rater(addresses[1], None, "owner:0x" + "e" * 40, "owner")
         store.upsert_rater(addresses[2], None, None, "none")
         store.set_sync("rater_profile_mode", "alchemy")
         return 6
@@ -1940,7 +1940,7 @@ def test_report_publishes_the_store_funder_kind_counts(tmp_path):
     db, out = tmp_path / "t.db", tmp_path / "reports"
     _seed(db, n=4)  # four raters profiled with a timestamp and no funder: legacy NULL kind
     with Store(db) as store:
-        store.upsert_rater("0x" + "e" * 40, None, "0x" + "f" * 40, "owner")
+        store.upsert_rater("0x" + "e" * 40, None, "owner:0x" + "f" * 40, "owner")
     r = runner.invoke(app, ["report", "--db", str(db), "--out-dir", str(out), "--bootstrap-n", "5"])
     assert r.exit_code == 0, r.output
     md = (out / "latest" / "report.md").read_text()

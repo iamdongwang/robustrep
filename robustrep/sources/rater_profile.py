@@ -560,13 +560,13 @@ class _Progress:
         return len(self.written)
 
 
-def _lookup(progress: _Progress, client, address: str, **kw) -> tuple[bool, Optional[tuple[int, int, str]]]:
-    """One ``client.first_tx(address, **kw)`` under the per-address failure
+def _lookup(progress: _Progress, client, address: str) -> tuple[bool, Optional[tuple[int, int, str]]]:
+    """One ``client.first_tx(address)`` under the per-address failure
     rules: returns ``(True, result)`` on success, ``(False, None)`` after
     logging and recording a failure. A ``ProfilePlanError`` on the run's
     very first client call is re-raised instead (see ``enrich_raters``)."""
     try:
-        got = client.first_tx(address, **kw)
+        got = client.first_tx(address)
     except ProfilePlanError:
         if progress.attempted == 0:
             raise

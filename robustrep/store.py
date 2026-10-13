@@ -24,6 +24,7 @@ histories should page or filter at the SQL level instead.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -95,6 +96,28 @@ FUNDER_KIND_OWNER = "owner"
 FUNDER_KIND_NONE = "none"
 FUNDER_KINDS = (FUNDER_KIND_TRANSFER, FUNDER_KIND_OWNER, FUNDER_KIND_NONE)
 FUNDER_KIND_UNKNOWN = "unknown"
+
+
+# The two funder shapes the store accepts, by kind: a bare lowercase-or-not
+# address for "transfer" (what every profile client's ``funder_address`` gate
+# emits) and the ``owner:`` namespace for "owner" (what
+# ``account_owner.owner_funder`` emits -- lowercase by construction). Checked
+# at the store boundary so no caller can persist a value the sybil comparison
+# would silently treat as a funder.
+TRANSFER_FUNDER_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+OWNER_FUNDER_RE = re.compile(r"^owner:0x[0-9a-f]{40}$")
+
+
+def _check_funder_shape(funder, kind) -> None:
+    """Raise ``ValueError`` when ``funder`` is present but not the shape its
+    ``kind`` requires (``kind`` already validated)."""
+    if funder is None or funder == "":
+        return
+    ok = (TRANSFER_FUNDER_RE.fullmatch(funder) if kind == FUNDER_KIND_TRANSFER
+          else OWNER_FUNDER_RE.fullmatch(funder) if kind == FUNDER_KIND_OWNER
+          else None)
+    if ok is None:
+        raise ValueError(f"raters: funder of kind {kind!r} has the wrong shape")
 
 
 def _check_funder_kind(kind, allow_none: bool) -> None:
@@ -329,6 +352,7 @@ class Store:
         _check_funder_kind(funder_kind, allow_none=True)
         if funder and funder_kind is None:
             raise ValueError("raters: a non-empty funder needs a funder_kind (None is for rows with no funder)")
+        _check_funder_shape(funder, funder_kind)
         try:
             with self.conn:
                 self.conn.execute(
@@ -349,6 +373,7 @@ class Store:
         _check_funder_kind(funder_kind, allow_none=False)
         if bool(funder) == (funder_kind == FUNDER_KIND_NONE):
             raise ValueError(f"raters: funder {funder!r} does not go with funder_kind {funder_kind!r}")
+        _check_funder_shape(funder, funder_kind)
         with self.conn:
             cur = self.conn.execute("UPDATE raters SET funder=?, funder_kind=? WHERE address=?",
                                     (funder, funder_kind, address))

@@ -208,14 +208,21 @@ def _is_revert(message: str) -> bool:
 
 
 def is_revert(e: BaseException) -> bool:
-    """True when ``e`` says the call reverted: an ``RpcRevertError``, or --
-    for an ``RpcError`` built elsewhere (test doubles, pre-0.2.2 message
-    shapes) -- one whose text mentions "revert". The type check is the
-    contract; the substring is compatibility."""
-    return isinstance(e, RpcRevertError) or (isinstance(e, RpcError) and "revert" in str(e).lower())
+    """True when ``e`` says the call reverted -- an ``RpcRevertError``, which
+    only ``_raise_if_fatal`` builds from a JSON-RPC error carrying the revert
+    marker. Deliberately a type check and nothing else: an ``RpcError`` whose
+    *text* merely mentions "revert" (a provider's prose after the retries
+    are exhausted, an endpoint hostname) is a transport failure, and reading
+    it as the contract's answer would turn a transient outage into a sticky
+    "no owner" verdict for that address (re-review I-3)."""
+    return isinstance(e, RpcRevertError)
 
 
-_RPC_CODE_TOKEN = re.compile(r"\[-?\d{1,10}\]")
+# ``[<int>]`` for a numeric JSON-RPC code, or the ``[?]`` placeholder
+# ``_error_message`` emits when the server sent none -- so a message always
+# carries a token and ``scrub_rpc_text`` can always drop the server text.
+_RPC_CODE_TOKEN = re.compile(r"\[(?:-?\d{1,10}|\?)\]")
+NO_CODE_TOKEN = "[?]"
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _ERROR_TEXT_CAP = 200
 
@@ -224,9 +231,9 @@ def scrub_rpc_text(text: str) -> str:
     """The part of an RPC error message that is safe to log and store.
 
     Server text in this module's messages only ever follows a ``[code]``
-    token (``"gave up after 5 attempts: [-32016] <server text>"``), so keep
-    our own prefix before the first ``[`` plus that token when it is an
-    integer JSON-RPC code, and drop everything after it. Control characters
+    token (``"gave up after 5 attempts: [-32016] <server text>"``; ``[?]``
+    when the server sent no code), so keep our own prefix before the first
+    ``[`` plus that token, and drop everything after it. Control characters
     become spaces (no log-line or CI workflow-command injection), whitespace
     runs collapse, and the result is capped at 200 characters."""
     head, bracket, rest = text.partition("[")
@@ -422,7 +429,10 @@ class RpcClient:
             return str(err)
         msg = err.get("message", "error")
         code = err.get("code")
-        return f"[{code}] {msg}" if code is not None else msg
+        # Always a token, so ``scrub_rpc_text`` has something to keep and a
+        # code-less server message can never survive scrubbing (I-2).
+        token = f"[{code}]" if code is not None else NO_CODE_TOKEN
+        return f"{token} {msg}"
 
     @classmethod
     def _check_single(cls, body) -> Optional[str]:
@@ -467,7 +477,11 @@ class RpcClient:
             err = item.get("error")
             if err is not None:
                 msg = cls._error_message(err)
-                if _is_batch_rate_limited(msg):
+                # A reverted entry is the contract's own answer (its revert
+                # reason is attacker-chosen text), never the endpoint saying
+                # the batch is rate-limited -- so it is not allowed to switch
+                # batching off for the rest of the run (re-review I-1).
+                if not _is_revert(msg) and _is_batch_rate_limited(msg):
                     raise RpcBatchRateLimitError(f"batch entry id={item.get('id')}: {msg}")
                 if not per_entry_errors:
                     return f"batch entry id={item.get('id')}: {msg}"

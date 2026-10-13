@@ -79,6 +79,7 @@ import re
 from typing import Callable, Optional, Union
 
 from .base_erc8004 import ZERO_ADDRESS, BatchState, _decode_owner_result, _warn_batch_fallback
+from ..store import OWNER_FUNDER_RE
 from .profile_http import funder_address
 from .rpc import RpcEntryError, RpcError, is_revert, scrub_rpc_error
 
@@ -96,7 +97,7 @@ OWNER_INDEX_SCAN = 4
 # The namespace an owner-kind funder is stored under (``owner_funder``). A
 # transfer-kind funder is a bare address, so the two can never compare equal.
 OWNER_FUNDER_PREFIX = "owner:"
-_OWNER_FUNDER_RE = re.compile(r"^owner:0x[0-9a-f]{40}$")
+_OWNER_FUNDER_RE = OWNER_FUNDER_RE  # one definition, shared with the store's write-time check
 
 
 def owner_funder(address) -> str:
