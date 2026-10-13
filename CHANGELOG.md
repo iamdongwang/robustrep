@@ -4,7 +4,7 @@ All notable changes to robustrep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0,
 so a `0.x` bump may change published numbers without changing the API.
 
-## [Unreleased]
+## [0.2.1] — 2026-10-13
 
 Blockscout's free tier stopped serving Base: its developer portal states
 "Starting October 1, 2026, Base, Polygon and ZkSync will no longer be
@@ -39,12 +39,6 @@ and timestamp (12/12, 2026-10-13). Scoring is unchanged.
   profiled through Alchemy.
 
 ### Changed
-- Re-review follow-ups: HTTP 401 from Alchemy aborts before the body is read (an oversized
-  body can no longer demote the abort into a per-address limit error); `short_for_log`
-  scrubs every installed API key before truncating, so a key echoed at any offset of a
-  server-chosen value is redacted rather than surviving as a prefix; the Etherscan and
-  Blockscout malformed-entry errors no longer interpolate the parser's own message, which
-  could carry server text.
 
 - **`--profile-source auto` now picks Alchemy** when `ALCHEMY_API_KEY` is
   set and no Etherscan key is. A run that previously fell through to
@@ -98,6 +92,13 @@ and timestamp (12/12, 2026-10-13). Scoring is unchanged.
   holds rows from both, while `rater_profile_mode` names only the last run's
   source. Acceptable because the two definitions were verified equivalent
   (above); the report's mode line describes the method, not the host per row.
+- **Re-review follow-ups.** HTTP 401 from Alchemy aborts before the body
+  is read, so an oversized body can no longer demote the abort into a
+  per-address limit error; `short_for_log` scrubs every installed API key
+  before truncating, so a key echoed at any offset of a server-chosen value
+  is redacted rather than surviving as a prefix; the Etherscan and
+  Blockscout malformed-entry errors no longer interpolate the parser's own
+  message, which could carry server text.
 
 ## [0.2.0] — 2026-10-12
 
