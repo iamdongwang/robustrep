@@ -156,3 +156,24 @@ def test_controlling_key_bullet_precedes_the_log_source_limitation(records_facto
     idx = next(i for i, b in enumerate(bullets) if "Controlling-key linking" in b)
     assert idx == 2  # right after the two clustering bullets
     assert bullets[-1].startswith("- **Log sources not cross-checked.**")
+
+
+def test_render_funder_kinds_line_renders_only_the_four_known_keys_in_fixed_order(records_factory):
+    tampered = {"owner": 1, "bogus": 2, "0x" + "ab" * 20: 3, "transfer": 4, "unknown": 1}
+    md = _render_with_config(records_factory, {"funder_kind_counts": tampered})
+    assert "- Funder kinds: transfer 4; owner 1; none 0; unknown 6" in md
+    assert "bogus" not in md and "abababab" not in md
+
+
+def test_render_funder_kinds_line_ignores_non_integer_counts(records_factory):
+    md = _render_with_config(records_factory, {"funder_kind_counts": {"owner": "x", "none": None, "weird": "y"}})
+    assert "- Funder kinds: transfer 0; owner 0; none 0; unknown 0" in md
+
+
+def test_controlling_key_bullet_states_mechanism_only_without_dated_counts(records_factory):
+    md = _render_with_config(records_factory, {})
+    bullet = next(line for line in md.splitlines() if "Controlling-key linking" in line)
+    for stale in ("230/230", "2026-10-13", "55/60"):
+        assert stale not in bullet, stale
+    for phrase in ("reported by the rater's own contract", "among themselves", "owner:"):
+        assert phrase in bullet, phrase

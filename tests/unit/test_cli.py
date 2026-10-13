@@ -1956,7 +1956,7 @@ def test_step_raters_passes_the_shared_batch_state_to_enrich_raters(tmp_path, mo
     _seed_unprofiled(db, n=1)
     seen = {}
 
-    def _enrich(store, client, addresses=None, *, rpc=None, batch_state=None):
+    def _enrich(store, client, addresses=None, *, rpc=None, batch_state=None, echo=None):
         seen["state"] = batch_state
         return 0
 
@@ -1981,7 +1981,7 @@ def test_fetch_shares_one_batch_state_between_owner_resolution_and_the_raters_st
         seen["owners_state"] = k.get("state")
         return {a: None for a in agent_ids}
 
-    def _enrich(store, client, addresses=None, *, rpc=None, batch_state=None):
+    def _enrich(store, client, addresses=None, *, rpc=None, batch_state=None, echo=None):
         seen["raters_state"] = batch_state
         return 0
 
@@ -1992,3 +1992,45 @@ def test_fetch_shares_one_batch_state_between_owner_resolution_and_the_raters_st
     assert r.exit_code == 0, r.output
     assert isinstance(seen["raters_state"], cli.base.BatchState)
     assert seen["raters_state"] is seen["owners_state"]
+
+
+def test_step_raters_prints_the_owner_pass_pending_line_through_echo(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "ALCHEMY-TEST-KEY-VALUE-0123456789")
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=1)
+
+    def _enrich(store, client, addresses=None, *, rpc=None, batch_state=None, echo=None):
+        echo("owner pass: 2 address(es) pending")
+        return 1
+
+    monkeypatch.setattr(cli, "enrich_raters", _enrich)
+    with Store(db) as store:
+        line = cli._step_raters(store, None, profile_source="alchemy", rpc=object())
+    assert capsys.readouterr().out.splitlines()[-1] == "owner pass: 2 address(es) pending"
+    assert "raters profiled: 1" in line
+
+
+def test_partial_raters_run_prints_the_funder_kinds_delta_before_the_warning(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", "ALCHEMY-TEST-KEY-VALUE-0123456789")
+    db = tmp_path / "t.db"
+    _seed_unprofiled(db, n=3)
+
+    def _enrich(store, client, addresses=None, **kw):
+        store.upsert_rater(addresses[0], None, "owner:" + "0x" + "e" * 40, "owner")
+        store.upsert_rater(addresses[1], None, None, "none")
+        store.set_sync("rater_profile_mode", "alchemy-partial")
+        raise RuntimeError("rater_profile: 1 address(es) failed to enrich: " + addresses[2])
+
+    monkeypatch.setattr(cli, "enrich_raters", _enrich)
+    with Store(db) as store:
+        partial = cli._run_raters_step(store, skip_raters=False, reprofile_raters=False, etherscan_key=None,
+                                       profile_source="alchemy", profile_rps=None, profile_retries=None,
+                                       rpc=object())
+    assert partial is True
+    out = capsys.readouterr().out.splitlines()
+    kinds = next(i for i, l in enumerate(out) if l.startswith("funder kinds this run:"))
+    warning = next(i for i, l in enumerate(out) if l.startswith("WARNING: rater_profile: 1 address(es)"))
+    assert kinds < warning
+    assert out[kinds] == "funder kinds this run: transfer +0, owner +1, none +1, unknown +0"

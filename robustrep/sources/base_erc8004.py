@@ -460,13 +460,17 @@ def _warn_batch_fallback(op: str, exc: RpcError, state: BatchState) -> None:
     batch-specific rate limit, not an ordinary transient/per-call failure),
     also flip ``state.batch_unsupported`` so every *remaining* chunk in this
     run skips ``rpc.batch`` entirely rather than re-attempting (and
-    re-failing) an identical, doomed batch call."""
+    re-failing) an identical, doomed batch call. ``exc`` is logged through
+    ``scrub_rpc_error``: when the batch ended on a JSON-RPC error its text is
+    server-chosen, and an endpoint URL may carry a key for some operators
+    (L1)."""
+    err = scrub_rpc_error(exc)
     if isinstance(exc, RpcBatchUnsupportedError):
         state.batch_unsupported = True
         logger.warning("%s: batch fetch failed (%s); batching unsupported by this endpoint, falling back "
-                        "to per-item calls for the rest of this run (%s)", op, exc, _BATCH_FALLBACK_HINT)
+                        "to per-item calls for the rest of this run (%s)", op, err, _BATCH_FALLBACK_HINT)
     else:
-        logger.warning("%s: batch fetch failed (%s), falling back to per-item calls", op, exc)
+        logger.warning("%s: batch fetch failed (%s), falling back to per-item calls", op, err)
 
 
 def fill_block_timestamps(store: Store, rpc, batch_size: int = 100, state: Optional[BatchState] = None) -> int:

@@ -241,6 +241,10 @@ _LOG_SOURCE_LIMITATION = (
 _RPC_SOURCES_KEY = "rpc_sources"
 _FUNDER_KIND_COUNTS_KEY = "funder_kind_counts"
 _RENDERED_SEPARATELY = frozenset({_RPC_SOURCES_KEY, _FUNDER_KIND_COUNTS_KEY})
+# The closed key set of the Funder kinds line (`store.FUNDER_KINDS` plus the
+# label for NULL), in display order.
+_FUNDER_KIND_UNKNOWN = "unknown"
+_FUNDER_KINDS_RENDERED = ("transfer", "owner", "none", _FUNDER_KIND_UNKNOWN)
 
 
 def _funder_kind_lines(config: dict) -> list[str]:
@@ -249,11 +253,19 @@ def _funder_kind_lines(config: dict) -> list[str]:
     _funder_kind_counts_for_provenance`): how many rater rows were linked by
     each funder rule -- `transfer` (first incoming transfer), `owner` (the
     smart account's controlling key), `none` (neither found) and `unknown`
-    (rows the owner pass has not reached)."""
+    (rows the owner pass has not reached). Exactly those four keys are
+    rendered, in that order; a count under any other key is added to
+    `unknown` and the key itself never reaches the page (L3: a tampered
+    store value must not be able to put an address, or anything else, into
+    `report.md`), and a count that is not an integer counts as 0."""
     counts = config.get(_FUNDER_KIND_COUNTS_KEY)
     if not isinstance(counts, dict):
         return ["- Funder kinds: not recorded."]
-    return ["- Funder kinds: " + "; ".join(f"{kind} {int(n):,}" for kind, n in counts.items())]
+    shown = {kind: 0 for kind in _FUNDER_KINDS_RENDERED}
+    for kind, n in counts.items():
+        key = kind if kind in shown else _FUNDER_KIND_UNKNOWN
+        shown[key] += n if isinstance(n, int) and not isinstance(n, bool) else 0
+    return ["- Funder kinds: " + "; ".join(f"{kind} {n:,}" for kind, n in shown.items())]
 
 
 def _log_source_lines(config: dict) -> list[str]:
@@ -419,13 +431,16 @@ _LARGE_RATEE_GROUP_BULLET = (
 
 
 # The funder signal has two rules since 0.2.2 (see `robustrep.sources.account_owner`);
-# this bullet describes the mechanism and its reach, nothing about anyone's purpose.
+# this bullet describes the mechanism and its reach, nothing about anyone's purpose,
+# and carries no dated sample counts -- the live counts are on the Funder kinds line.
 _CONTROLLING_KEY_BULLET = (
     "- **Controlling-key linking.** Most new raters are smart-contract accounts with no "
-    "incoming transfer (230/230 sampled 2026-10-13), so no first funder exists for them. "
-    "Such a rater is linked instead by the key that controls the account (`ownerAtIndex`, "
-    "then `owner()`), stored as its funder with `funder_kind` = `owner`: wallets sharing a "
-    "controlling key count as one cluster, exactly as wallets sharing a first funder do. "
+    "incoming transfer, so no first funder exists for them. Such a rater is linked instead "
+    "by the key that controls the account (`ownerAtIndex`, then `owner()`), stored as its "
+    "funder in its own namespace (`owner:<address>`) with `funder_kind` = `owner`: wallets "
+    "sharing a controlling key count as one cluster, exactly as wallets sharing a first "
+    "funder do. The key is reported by the rater's own contract and is not verified, so "
+    "owner-linked raters cluster only among themselves, never with transfer-linked ones. "
     "The bundlers and paymaster that carry these accounts' first transactions are "
     "deliberately not used -- they are shared infrastructure common to unrelated raters. "
     "Accounts controlled by a passkey expose no comparable key and stay unlinked "

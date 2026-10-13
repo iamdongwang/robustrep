@@ -67,7 +67,7 @@ def test_failed_ranges_reads_without_clearing(tmp_path):
 
 def test_raters_and_agents(tmp_path):
     with Store(tmp_path / "t.db") as s:
-        s.upsert_rater("0xc", first_seen_ts=5, funder="0xf")
+        s.upsert_rater("0xc", first_seen_ts=5, funder="0xf", funder_kind="transfer")
         s.upsert_agent_owner("7", "0xowner")
         assert s.load_rater_meta().iloc[0]["funder"] == "0xf"
         assert s.agent_owner("7") == "0xowner" and s.agent_owner("8") is None
@@ -303,7 +303,7 @@ def test_upsert_evidence_rejects_none_uri(tmp_path):
 def test_upsert_rater_rejects_none_address(tmp_path):
     with Store(tmp_path / "t.db") as s:
         with pytest.raises(ValueError, match="raters"):
-            s.upsert_rater(None, first_seen_ts=1, funder="f")
+            s.upsert_rater(None, first_seen_ts=1, funder="f", funder_kind="transfer")
 
 
 def test_upsert_agent_owner_rejects_none_agent_id(tmp_path):
@@ -402,7 +402,7 @@ def test_stale_schema_guard(tmp_path):
 def test_clear_raters_empties_the_table_and_returns_the_row_count(tmp_path):
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([FB])
-        s.upsert_rater("0xc", 1_700_000_000, "0xf")
+        s.upsert_rater("0xc", 1_700_000_000, "0xf", "transfer")
         s.upsert_rater("0xd", None, None)
         assert s.clear_raters() == 2
         assert len(s.load_rater_meta()) == 0
@@ -430,7 +430,7 @@ def test_clear_raters_lets_a_wedging_timestamp_be_reprofiled(tmp_path):
     # ._validate_meta raises on it); clear_raters is the escape hatch.
     with Store(tmp_path / "t.db") as s:
         s.upsert_feedback([FB])
-        s.upsert_rater("0xc", -1, "0xf")
+        s.upsert_rater("0xc", -1, "0xf", "transfer")
         assert s.distinct_clients() == []
         s.clear_raters()
         assert s.distinct_clients() == ["0xc"]
@@ -559,11 +559,28 @@ def test_funder_kind_migration_is_idempotent_and_keeps_later_kinds(tmp_path):
                                       "0xc": (None, None, "none"), "0xd": (None, None, None)}
 
 
-@pytest.mark.parametrize("kind", [None, "transfer", "owner", "none"])
+@pytest.mark.parametrize("kind", ["transfer", "owner", "none"])
 def test_upsert_rater_accepts_each_funder_kind(tmp_path, kind):
     with Store(tmp_path / "t.db") as s:
         s.upsert_rater("0xa", 1, "0xf", kind)
         assert _rater_rows(s)["0xa"] == (1, "0xf", kind)
+
+
+@pytest.mark.parametrize("funder", ["0xf", "owner:0xf", " "])
+def test_upsert_rater_rejects_a_funder_without_a_kind(tmp_path, funder):
+    # Invariant: a row that holds a funder says which rule produced it. Only
+    # the migration backfill labels legacy rows, and it does so once.
+    with Store(tmp_path / "t.db") as s:
+        with pytest.raises(ValueError, match="raters: .*funder_kind"):
+            s.upsert_rater("0xa", 1, funder)
+        assert _rater_rows(s) == {}
+
+
+@pytest.mark.parametrize("funder", [None, ""])
+def test_upsert_rater_allows_no_funder_with_a_null_kind(tmp_path, funder):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xa", 1, funder)
+        assert _rater_rows(s)["0xa"] == (1, funder, None)
 
 
 @pytest.mark.parametrize("kind", ["", "TRANSFER", "funder", 1, "unknown"])
@@ -589,7 +606,7 @@ def test_raters_needing_owner_lookup_selects_only_unfunded_rows_of_unknown_kind(
         s.upsert_rater("0xa", 100, "0xf", "transfer")      # has a funder -> no
         s.upsert_rater("0xc", None, None, "none")          # already tried everything -> no
         s.upsert_rater("0xe", None, "0xkey", "owner")      # has an owner -> no
-        s.upsert_rater("0xf", 7, "0xg")                    # funder but NULL kind (legacy) -> no
+        s.conn.execute("INSERT INTO raters VALUES('0xf', 7, '0xg', NULL)")  # funder, NULL kind (legacy) -> no
         assert s.raters_needing_owner_lookup() == ["0xb", "0xd"]
 
 
@@ -617,3 +634,55 @@ def test_load_rater_meta_and_clear_raters_are_unchanged_by_funder_kind(tmp_path)
         assert list(meta.columns) == ["rater", "first_seen_ts", "funder"]
         assert s.clear_raters() == 2
         assert s.funder_kind_counts() == {"transfer": 0, "owner": 0, "none": 0, "unknown": 0}
+
+
+# --- set_funder: pass 2 writes the verdict without touching first_seen_ts ---------
+
+
+def test_set_funder_updates_funder_and_kind_and_keeps_first_seen_ts(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xa", 1234, None)
+        s.set_funder("0xa", "owner:" + "0x" + "ab" * 20, "owner")
+        assert _rater_rows(s)["0xa"] == (1234, "owner:" + "0x" + "ab" * 20, "owner")
+        s.upsert_rater("0xb", 99, None)
+        s.set_funder("0xb", None, "none")
+        assert _rater_rows(s)["0xb"] == (99, None, "none")
+
+
+@pytest.mark.parametrize("kind", [None, "", "TRANSFER", "unknown", 1])
+def test_set_funder_rejects_an_unknown_kind_before_writing(tmp_path, kind):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xa", 1, None)
+        with pytest.raises(ValueError, match="funder_kind"):
+            s.set_funder("0xa", "0xf", kind)
+        assert _rater_rows(s)["0xa"] == (1, None, None)
+
+
+def test_set_funder_rejects_a_funder_without_a_matching_kind(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xa", 1, None)
+        with pytest.raises(ValueError, match="raters"):
+            s.set_funder("0xa", "0xf", "none")      # "none" means no funder
+        with pytest.raises(ValueError, match="raters"):
+            s.set_funder("0xa", None, "owner")      # "owner" needs one
+        assert _rater_rows(s)["0xa"] == (1, None, None)
+
+
+def test_set_funder_raises_for_an_unknown_address(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        with pytest.raises(ValueError, match="no raters row"):
+            s.set_funder("0xzz", "0xf", "transfer")
+
+
+# --- funder_kind_counts: a closed key set --------------------------------------------
+
+
+def test_funder_kind_counts_folds_values_outside_the_enum_into_unknown(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        s.upsert_rater("0xa", None, "0xkey", "owner")
+        s.upsert_rater("0xb", None, None)
+        # Only a locally tampered store can hold these; upsert_rater refuses them.
+        s.conn.executemany("INSERT INTO raters VALUES(?,?,?,?)", [
+            ("0xc", None, "0xf", "bogus"), ("0xd", None, "0xf", 7), ("0xe", None, "0xf", "0x" + "ab" * 20)])
+        assert s.funder_kind_counts() == {"transfer": 0, "owner": 1, "none": 0, "unknown": 4}
+        assert list(s.funder_kind_counts()) == ["transfer", "owner", "none", "unknown"]

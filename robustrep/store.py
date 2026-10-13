@@ -97,6 +97,16 @@ FUNDER_KINDS = (FUNDER_KIND_TRANSFER, FUNDER_KIND_OWNER, FUNDER_KIND_NONE)
 FUNDER_KIND_UNKNOWN = "unknown"
 
 
+def _check_funder_kind(kind, allow_none: bool) -> None:
+    """Raise ``ValueError`` unless ``kind`` is one of ``FUNDER_KINDS`` (or
+    ``None`` when ``allow_none``)."""
+    if kind is None and allow_none:
+        return
+    if kind not in FUNDER_KINDS:
+        suffix = " or None" if allow_none else ""
+        raise ValueError(f"raters: funder_kind must be one of {FUNDER_KINDS}{suffix}, got {kind!r}")
+
+
 def _row_values(row: dict, cols: list[str], what: str) -> list:
     """Pull ``cols`` out of ``row`` in order, raising ``ValueError`` naming the
     first missing column instead of letting a bare ``KeyError`` escape."""
@@ -310,12 +320,15 @@ class Store:
         transfer lookup has run: a caller that writes ``(None, None)`` for "no
         transfer found" leaves the kind NULL *on purpose*, so
         ``raters_needing_owner_lookup`` picks the address up for the owner
-        pass. A caller that writes a found transfer funder must pass
-        ``"transfer"``. Raises ``ValueError`` for any other kind, before
-        anything is written.
+        pass. A caller that writes a funder must say which rule produced it:
+        a non-empty ``funder`` with ``funder_kind=None`` is refused
+        (``ValueError``) -- the migration backfill is the only thing that
+        labels legacy rows, and it does so once. Raises ``ValueError`` for
+        any other kind too, before anything is written.
         """
-        if funder_kind is not None and funder_kind not in FUNDER_KINDS:
-            raise ValueError(f"raters: funder_kind must be one of {FUNDER_KINDS} or None, got {funder_kind!r}")
+        _check_funder_kind(funder_kind, allow_none=True)
+        if funder and funder_kind is None:
+            raise ValueError("raters: a non-empty funder needs a funder_kind (None is for rows with no funder)")
         try:
             with self.conn:
                 self.conn.execute(
@@ -323,6 +336,24 @@ class Store:
                     (address, first_seen_ts, funder, funder_kind))
         except sqlite3.IntegrityError as e:
             raise ValueError(f"raters: {e}") from e
+
+    def set_funder(self, address: str, funder: Optional[str], funder_kind: str) -> None:
+        """Write the owner pass's verdict for an existing ``raters`` row --
+        ``funder`` and ``funder_kind`` only, leaving ``first_seen_ts`` exactly
+        as it is (I2: a legacy row may hold a measured timestamp that pass 2
+        must not overwrite with NULL). ``funder_kind`` must be one of
+        ``FUNDER_KINDS``, with a funder present for ``"transfer"``/``"owner"``
+        and absent for ``"none"``; anything else raises ``ValueError`` before
+        the write, as does an ``address`` with no row (the owner pass only
+        ever settles rows ``raters_needing_owner_lookup`` handed it)."""
+        _check_funder_kind(funder_kind, allow_none=False)
+        if bool(funder) == (funder_kind == FUNDER_KIND_NONE):
+            raise ValueError(f"raters: funder {funder!r} does not go with funder_kind {funder_kind!r}")
+        with self.conn:
+            cur = self.conn.execute("UPDATE raters SET funder=?, funder_kind=? WHERE address=?",
+                                    (funder, funder_kind, address))
+        if cur.rowcount != 1:
+            raise ValueError(f"raters: no raters row for {address!r} to set a funder on")
 
     def raters_needing_owner_lookup(self) -> list[str]:
         """Addresses whose transfer lookup found no funder and whose
@@ -339,13 +370,16 @@ class Store:
         """How many ``raters`` rows each ``funder_kind`` holds, for report
         provenance: keys ``transfer``/``owner``/``none`` plus ``unknown`` for
         NULL (legacy rows the owner pass has not reached). Every key is always
-        present (0 when empty) so two reports' provenance diff key for key."""
+        present (0 when empty) so two reports' provenance diff key for key,
+        and no other key ever is: a stored value outside ``FUNDER_KINDS``
+        (only a locally tampered store can hold one -- ``upsert_rater`` and
+        ``set_funder`` refuse them) is counted under ``unknown`` rather than
+        becoming a key of its own that ``report.md`` would print (L3)."""
         counts = {kind: 0 for kind in (*FUNDER_KINDS, FUNDER_KIND_UNKNOWN)}
-        rows = self.conn.execute(
-            "SELECT COALESCE(funder_kind, ?), COUNT(*) FROM raters GROUP BY 1",
-            (FUNDER_KIND_UNKNOWN,)).fetchall()
+        rows = self.conn.execute("SELECT funder_kind, COUNT(*) FROM raters GROUP BY 1").fetchall()
         for kind, n in rows:
-            counts[kind] = int(n)
+            key = kind if kind in FUNDER_KINDS else FUNDER_KIND_UNKNOWN
+            counts[key] += int(n)
         return counts
 
     def clear_raters(self) -> int:

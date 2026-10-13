@@ -545,13 +545,19 @@ def estimate_seconds(n_addresses: int, rps: float) -> float:
 @dataclass
 class _Progress:
     """Bookkeeping for one ``enrich_raters`` run, shared by both passes:
-    addresses that failed (listed in the final ``RuntimeError``), rows written
-    (the returned count) and client calls attempted -- the first-address
-    abort rule for ``ProfilePlanError`` keys off the latter, so it holds
-    whichever pass makes the run's first client call."""
+    addresses that failed (listed in the final ``RuntimeError``), the
+    distinct addresses settled (``written``; its size is the returned count
+    -- an address pass 1 left NULL and pass 2 then settled is one address,
+    not two) and client calls attempted -- the first-address abort rule for
+    ``ProfilePlanError`` keys off the latter, so it holds whichever pass
+    makes the run's first client call."""
     failures: list[str] = field(default_factory=list)
-    processed: int = 0
+    written: set[str] = field(default_factory=set)
     attempted: int = 0
+
+    @property
+    def processed(self) -> int:
+        return len(self.written)
 
 
 def _lookup(progress: _Progress, client, address: str, **kw) -> tuple[bool, Optional[tuple[int, int, str]]]:
@@ -592,7 +598,7 @@ def _transfer_pass(store: Store, client, addrs: list[str], progress: _Progress) 
             _, ts, funder = got
             store.upsert_rater(a, ts, funder, FUNDER_KIND_TRANSFER)
             found += 1
-        progress.processed += 1
+        progress.written.add(a)
     logger.info("rater_profile: pass 1 (first transfer): %d address(es), %d funder(s) found, %d failed",
                 len(addrs), found, len(progress.failures))
 
@@ -609,23 +615,26 @@ def _settle(store: Store, address: str, owner: Optional[str], progress: _Progres
     infrastructure (security review M3), and measured on 30 + 12 live
     addresses it changed nothing.
 
-    An owner row keeps ``first_seen_ts`` NULL on purpose: the account's
-    creation time is not what the owner call returns, and
-    ``robustrep.sybil.profiles_from_records`` already falls back to the
-    rater's earliest feedback time for a NULL. Writing that derivable
-    approximation into the cache would make it indistinguishable from a
-    measured value and violate the M4 rule that the raters table never holds
-    an approximate timestamp."""
+    The row's ``first_seen_ts`` is left exactly as it is (``Store.set_funder``
+    updates only ``funder``/``funder_kind``): a legacy row may hold a measured
+    timestamp, which pass 2 must not overwrite (I2), and a row pass 1 wrote
+    this run holds NULL, which stays NULL on purpose -- the account's creation
+    time is not what the owner call returns, and ``robustrep.sybil.
+    profiles_from_records`` already falls back to the rater's earliest
+    feedback time for a NULL. Writing that derivable approximation into the
+    cache would make it indistinguishable from a measured value and violate
+    the M4 rule that the raters table never holds an approximate timestamp."""
     if owner is not None:
-        store.upsert_rater(address, None, owner_funder(owner), FUNDER_KIND_OWNER)
-        progress.processed += 1
+        store.set_funder(address, owner_funder(owner), FUNDER_KIND_OWNER)
+        progress.written.add(address)
         return "owner"
-    store.upsert_rater(address, None, None, FUNDER_KIND_NONE)
-    progress.processed += 1
+    store.set_funder(address, None, FUNDER_KIND_NONE)
+    progress.written.add(address)
     return "none"
 
 
-def _owner_pass(store: Store, rpc, progress: _Progress, state: Optional[BatchState] = None) -> None:
+def _owner_pass(store: Store, rpc, progress: _Progress, state: Optional[BatchState] = None,
+                echo: Optional[Callable[[str], None]] = None) -> None:
     """Pass 2 over ``Store.raters_needing_owner_lookup()``: the smart account's
     controlling key via ``account_owners`` (batched with per-entry errors, so
     one contract's answer never decides its neighbours') -> ``funder_kind=
@@ -636,8 +645,11 @@ def _owner_pass(store: Store, rpc, progress: _Progress, state: Optional[BatchSta
     every other address of the chunk is still settled. ``state`` is the
     ``fetch`` command's shared ``BatchState`` (as ``cli._step_owners`` gets
     it), so batching found unsupported earlier in the run is not rediscovered
-    here."""
+    here. ``echo``, when given, is told ``"owner pass: N address(es)
+    pending"`` before the pass starts (the CLI prints it)."""
     pending = store.raters_needing_owner_lookup()
+    if echo is not None:
+        echo(f"owner pass: {len(pending)} address(es) pending")
     if not pending:
         return
     counts = {"owner": 0, "none": 0}
@@ -659,7 +671,8 @@ def _owner_pass(store: Store, rpc, progress: _Progress, state: Optional[BatchSta
 
 def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2Client | AlchemyClient"],
                   addresses: Optional[list[str]] = None, *, rpc=None,
-                  batch_state: Optional[BatchState] = None) -> int:
+                  batch_state: Optional[BatchState] = None,
+                  echo: Optional[Callable[[str], None]] = None) -> int:
     """Fill the raters table for every client address not yet profiled, in two
     passes.
 
@@ -686,9 +699,10 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
     an address whose own RPC lookup failed is recorded by itself and its
     chunk-mates are still settled (see ``_owner_pass``). ``batch_state``, when
     given, is the caller's shared ``base_erc8004.BatchState`` (the ``fetch``
-    command hands the one its agent-owner step used). Without ``rpc`` there
-    is no pass 2 and pass-1 misses keep their NULL kind for a later run that
-    has one.
+    command hands the one its agent-owner step used); ``echo``, when given,
+    is called once with ``"owner pass: N address(es) pending"`` as pass 2
+    starts (the CLI prints it). Without ``rpc`` there is no pass 2 and pass-1
+    misses keep their NULL kind for a later run that has one.
 
     Sets ``rater_profile_mode`` to ``client.source`` (``"blockscout"``,
     ``"etherscan"`` or ``"alchemy"``; ``"etherscan"`` for any client without a
@@ -719,8 +733,9 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
     ``store.distinct_clients()`` -- for a caller (e.g. the CLI) that already
     computed the target list, so it isn't queried from the store twice.
 
-    Returns the number of rows written across both passes with a client, or
-    the number of still-unprofiled addresses in fallback mode; 0 (no HTTP
+    Returns the number of distinct addresses settled across both passes with
+    a client (an address pass 1 left NULL and pass 2 then settled counts
+    once), or the number of still-unprofiled addresses in fallback mode; 0 (no HTTP
     calls, no store writes, no mode change) when every client address is
     already profiled and nothing awaits the owner pass.
     """
@@ -743,7 +758,7 @@ def enrich_raters(store: Store, client: Optional["EtherscanClient | BlockscoutV2
     if addrs:
         _transfer_pass(store, client, addrs, progress)
     if rpc is not None:
-        _owner_pass(store, rpc, progress, batch_state)
+        _owner_pass(store, rpc, progress, batch_state, echo)
 
     if progress.failures:
         store.set_sync("rater_profile_mode", f"{source}-partial")

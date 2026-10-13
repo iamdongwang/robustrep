@@ -137,7 +137,7 @@ def test_owner_found_writes_kind_owner_with_first_seen_left_null(tmp_path):
         seed(s, A, B)
         rpc = OwnerRpc({A: KEY, B: KEY})
         n = enrich_raters(s, TransferClient(), rpc=rpc)
-        assert n == 4  # 2 processed in pass 1 + 2 in pass 2
+        assert n == 2  # distinct addresses settled this run, not one per pass
         assert rows(s) == {A: (None, OWNER, "owner"), B: (None, OWNER, "owner")}
         assert s.raters_needing_owner_lookup() == []
         assert s.get_sync("rater_profile_mode") == "blockscout"
@@ -167,7 +167,7 @@ def test_alchemy_client_is_not_asked_again_in_pass_two(tmp_path):
     with Store(tmp_path / "t.db") as s:
         seed(s, A, B)
         client = RecordingAlchemy()
-        assert enrich_raters(s, client, rpc=OwnerRpc({A: KEY})) == 4
+        assert enrich_raters(s, client, rpc=OwnerRpc({A: KEY})) == 2
         assert client.calls == [A, B]
         assert rows(s) == {A: (None, OWNER, "owner"), B: (None, None, "none")}
         assert s.get_sync("rater_profile_mode") == "alchemy"
@@ -177,7 +177,7 @@ def test_non_alchemy_client_behaves_the_same(tmp_path):
     with Store(tmp_path / "t.db") as s:
         seed(s, A)
         client = TransferClient()
-        assert enrich_raters(s, client, rpc=OwnerRpc()) == 2
+        assert enrich_raters(s, client, rpc=OwnerRpc()) == 1
         assert client.calls == [A]
         assert rows(s) == {A: (None, None, "none")}
 
@@ -189,7 +189,7 @@ def test_nothing_found_anywhere_writes_kind_none(tmp_path):
     with Store(tmp_path / "t.db") as s:
         seed(s, A)
         client = RecordingAlchemy()
-        assert enrich_raters(s, client, rpc=OwnerRpc()) == 2
+        assert enrich_raters(s, client, rpc=OwnerRpc()) == 1
         assert rows(s) == {A: (None, None, "none")}
         assert client.calls == [A]
 
@@ -212,7 +212,7 @@ def test_later_run_does_not_requery_settled_rows(tmp_path):
     with Store(tmp_path / "t.db") as s:
         seed(s, A, B)
         first = OwnerRpc({A: KEY})
-        assert enrich_raters(s, TransferClient(), rpc=first) == 4
+        assert enrich_raters(s, TransferClient(), rpc=first) == 2
         assert rows(s) == {A: (None, OWNER, "owner"), B: (None, None, "none")}
         again = OwnerRpc({A: KEY, B: KEY})
         client = TransferClient()
@@ -323,7 +323,7 @@ def test_one_info_line_per_pass_with_counts(tmp_path, caplog):
         seed(s, A, B, C)
         client = RecordingAlchemy(answers={A: (1, 100, FUNDER)})
         with caplog.at_level(logging.INFO, logger="robustrep.sources.rater_profile"):
-            assert enrich_raters(s, client, rpc=OwnerRpc({B: KEY})) == 5
+            assert enrich_raters(s, client, rpc=OwnerRpc({B: KEY})) == 3
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert len(infos) == 2
         assert "pass 1" in infos[0] and "3 address(es)" in infos[0] and "1 funder(s) found" in infos[0]
@@ -341,3 +341,71 @@ def test_fallback_mode_skips_pass_two_and_writes_nothing(tmp_path):
         assert rpc.queried() == set()
         assert rows(s) == {B: (None, None, None)}
         assert s.get_sync("rater_profile_mode") == "fallback"
+
+
+# --- pass 2 preserves first_seen_ts (I2) ---------------------------------------------
+
+
+def test_owner_pass_keeps_a_legacy_first_seen_ts(tmp_path):
+    with Store(tmp_path / "t.db") as s:
+        seed(s, A, B)
+        s.upsert_rater(A, 1_700_000_000, None)   # legacy row: timestamp known, no funder, kind NULL
+        s.upsert_rater(B, 1_700_000_001, None)
+        assert enrich_raters(s, TransferClient(), rpc=OwnerRpc({A: KEY})) == 2
+        assert rows(s) == {A: (1_700_000_000, OWNER, "owner"), B: (1_700_000_001, None, "none")}
+
+
+# --- the owner-pass pending line --------------------------------------------------------
+
+
+def test_echo_is_told_how_many_addresses_the_owner_pass_has_pending(tmp_path):
+    lines = []
+    with Store(tmp_path / "t.db") as s:
+        seed(s, A, B)
+        s.upsert_rater(C, None, None)
+        enrich_raters(s, TransferClient(), rpc=OwnerRpc({A: KEY}), echo=lines.append)
+        assert lines == ["owner pass: 3 address(es) pending"]
+        lines.clear()
+        enrich_raters(s, TransferClient(), rpc=OwnerRpc(), echo=lines.append)
+        assert lines == ["owner pass: 0 address(es) pending"]
+
+
+def test_echo_is_silent_without_rpc_or_without_a_client(tmp_path):
+    lines = []
+    with Store(tmp_path / "t.db") as s:
+        seed(s, A)
+        enrich_raters(s, TransferClient(), echo=lines.append)
+        enrich_raters(s, None, rpc=OwnerRpc(), echo=lines.append)
+        assert lines == []
+
+
+# --- server text never reaches WARNING/ERROR (L1) ---------------------------------------
+
+LEAKY = "https://user:secret@host/path"  # pragma: allowlist secret
+
+
+def test_owner_pass_error_line_is_scrubbed_of_server_text(tmp_path, caplog):
+    class _LeakyRpc(OwnerRpc):
+        def call(self, method, params):
+            raise RpcError(f"gave up after 5 attempts: [-32000] {LEAKY} more")
+
+    with Store(tmp_path / "t.db") as s:
+        seed(s, A)
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(RuntimeError):
+                enrich_raters(s, TransferClient(), rpc=_LeakyRpc())
+    loud = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert loud and all("owner lookup failed" in m for m in loud if "rater_profile" in m)
+    assert "secret" not in " ".join(loud) and "host/path" not in " ".join(loud)
+
+
+def test_batch_fallback_warning_is_scrubbed_of_server_text(tmp_path, caplog):
+    with Store(tmp_path / "t.db") as s:
+        seed(s, A)
+        rpc = OwnerRpc({A: KEY}, batch_error=RpcError(f"gave up after 5 attempts: [-32016] {LEAKY}"))
+        with caplog.at_level(logging.WARNING):
+            enrich_raters(s, TransferClient(), rpc=rpc)
+        assert rows(s)[A] == (None, OWNER, "owner")
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "[-32016]" in warnings[0]
+    assert "secret" not in warnings[0] and "host/path" not in warnings[0]

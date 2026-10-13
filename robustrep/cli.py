@@ -203,10 +203,14 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
     linked by the smart account's controlling key), together with
     ``batch_state`` -- the run's shared ``base.BatchState``, the same one
     ``_step_owners`` used, so batching found unsupported there is not
-    rediscovered here; the summary line then also reports how many rows of
-    each ``funder_kind`` this run wrote. With ``profile_source="none"``
-    there is no client, so neither pass runs and no rows are written,
-    whatever ``rpc`` is.
+    rediscovered here. ``enrich_raters`` is given ``typer.echo`` so it can
+    print ``owner pass: N address(es) pending`` as pass 2 starts; the summary
+    line then reports the distinct addresses settled and how many rows of
+    each ``funder_kind`` this run wrote -- on a partial run (``RuntimeError``)
+    that funder-kind line is printed here before the error propagates, so
+    what was written is never hidden behind the WARNING. With
+    ``profile_source="none"`` there is no client, so neither pass runs and no
+    rows are written, whatever ``rpc`` is.
 
     ``etherscan_key``, when given, overrides ``ETHERSCAN_API_KEY`` (the key
     itself is never echoed). The Alchemy key is read from ``ALCHEMY_API_KEY``
@@ -249,7 +253,13 @@ def _step_raters(store: Store, etherscan_key: Optional[str], profile_source: str
         source_label = getattr(client, "source", "etherscan").capitalize()
         typer.echo(f"profiling {len(targets)} rater(s) via {source_label}, ETA ~{eta_h:.1f}h")
     before = store.funder_kind_counts()
-    n = enrich_raters(store, client, addresses=targets, rpc=rpc, batch_state=batch_state)
+    try:
+        n = enrich_raters(store, client, addresses=targets, rpc=rpc, batch_state=batch_state, echo=typer.echo)
+    except RuntimeError:
+        # A partial run (some addresses failed) still wrote rows: say what it
+        # wrote before the caller prints the WARNING and moves on.
+        typer.echo(_funder_kinds_line(before, store.funder_kind_counts()))
+        raise
     mode = store.get_sync("rater_profile_mode") or "unknown"
     if client is None:
         return (f"raters profiled: {n} (fallback: --profile-source none; rows not written); "
