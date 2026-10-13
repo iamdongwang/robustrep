@@ -4,6 +4,59 @@ All notable changes to robustrep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0,
 so a `0.x` bump may change published numbers without changing the API.
 
+## [Unreleased]
+
+Blockscout's free tier stopped serving Base: its developer portal states
+"Starting October 1, 2026, Base, Polygon and ZkSync will no longer be
+available on Free tier", and since 2026-10-09 `base.blockscout.com/api` has
+answered with a Cloudflare challenge page. Etherscan's free plan never covered
+Base via the V2 API. Rater profiling (first-seen time and funder per rater,
+the input to sybil clustering) therefore had no free source left. Alchemy's
+free plan does cover Base, and on 12 raters already profiled through
+Blockscout its earliest incoming external transfer gave the identical funder
+and timestamp (12/12, 2026-10-13). Scoring is unchanged.
+
+### Added
+
+- **`AlchemyClient` (`robustrep/sources/alchemy_profile.py`).** Looks up
+  the first incoming external transfer per address with one
+  `alchemy_getAssetTransfers` call (`toAddress`, `category: ["external"]`,
+  `order: asc`, `maxCount: 1`, `withMetadata`). Default 2.5 requests/sec
+  (free plan: 300 CU/s, 120 CU per call), 5 retries. Same duck-typed
+  interface and the same security contract as the other clients: streamed
+  and capped body, implausible timestamps refused and warned once, the key
+  redacted from urllib3 logs. Alchemy puts the key in the URL *path*, so no
+  `requests` exception, URL or response text is ever interpolated into a
+  raised message or log record; a JSON-RPC error's server text is logged at
+  DEBUG only, length-bounded. A rejected key or a Base network not enabled
+  for the app raises `AlchemyConfigError` (a `ProfilePlanError`, fixed
+  message), which aborts profiling on the first address.
+- **`fetch --profile-source alchemy`** and the **`ALCHEMY_API_KEY`**
+  environment variable (environment only -- there is deliberately no flag).
+  `--profile-rps`/`--profile-retries` apply as for the other sources.
+- **`auto` precedence:** Etherscan key -> Alchemy key -> keyless Blockscout.
+  `rater_profile_mode` records `alchemy` / `alchemy-partial` for a run
+  profiled through Alchemy.
+
+### Changed
+
+- **Shared profile-HTTP helpers moved to `robustrep/sources/profile_http.py`**
+  (`capped_json`, `plausible_ts`/`implausible`/`warn_bad_ts`,
+  `status_code`, `is_transient_http`, `retry_after_seconds`,
+  `raise_exhausted`, and the `MAX_PROFILE_RESPONSE_BYTES`,
+  `MAX_PLAUSIBLE_TS`, `RETRY_AFTER_CAP` constants) as public names, so every
+  rater-profile client applies one copy of the security review's rules.
+  `MAX_PLAUSIBLE_TS`, `MAX_PROFILE_RESPONSE_BYTES` and `EtherscanPlanError`
+  remain importable from `rater_profile`. The implausible-timestamp WARNING
+  is now emitted by the `robustrep.sources.profile_http` logger.
+- **`ProfilePlanError`** is the new base of `EtherscanPlanError` (and
+  `AlchemyConfigError`); `enrich_raters` aborts on the first address for any
+  of them.
+- A store profiled partly through Blockscout and partly through Alchemy
+  holds rows from both, while `rater_profile_mode` names only the last run's
+  source. Acceptable because the two definitions were verified equivalent
+  (above); the report's mode line describes the method, not the host per row.
+
 ## [0.2.0] — 2026-10-12
 
 Adaptive `eth_getLogs` fetching. On 2026-10-12 mainnet.base.org began answering

@@ -33,8 +33,15 @@ The default endpoint list is rotated automatically and the `eth_getLogs` window 
 endpoint; `--rpc-url` (repeatable) replaces the list and `--chunk` caps the window.
 RPC endpoint hostnames appear in the public report and `scores.json`; do not use an endpoint whose hostname embeds an account id or key.
 
-Rater profiles: Blockscout (free, no key) by default; Etherscan V2 requires a paid plan for Base.
-Pick a source explicitly with `fetch --profile-source {auto,blockscout,etherscan,none}`.
+Rater profiles (first-seen time and funder per rater, for sybil clustering) come from Alchemy when
+`ALCHEMY_API_KEY` is set — its free plan covers Base (2.5 requests/sec; ~13k raters in about 1.5 h).
+Blockscout closed its free Base API in 2026-10 and Etherscan's free plan never covered Base, so Alchemy
+is now the practical source. Pick one explicitly with
+`fetch --profile-source {auto,alchemy,blockscout,etherscan,none}`; `auto` prefers an Etherscan key, then
+an Alchemy key, then keyless Blockscout.
+The Alchemy key is read from the environment only (no flag), redacted from urllib3's debug log, and
+never appears in an error message — Alchemy puts it in the request URL's path, so nothing that quotes a
+URL is ever raised or logged.
 
 Latest scores: `reports/latest/scores.json`, also served at
 https://iamdongwang.github.io/robustrep/reports/latest/scores.json
