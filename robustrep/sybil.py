@@ -5,6 +5,17 @@ first-seen within `Config.sybil_window_s` seconds, (3) Jaccard(ratees) >=
 `Config.sybil_jaccard` (requires `sybil_jaccard > 0`, enforced by Config, so a
 shared ratee is necessary for signal 3 to ever fire).
 
+A funder is either a bare address -- the `from` of the rater's first incoming
+transfer -- or `owner:<address>`, the controlling key of a smart-contract
+rater that never received a transfer (`robustrep.sources.account_owner`).
+The second kind is self-reported by the rater's own contract, so it is kept
+in its own namespace: `_norm_funder` only lowercases, so `owner:x` equals
+`owner:x` and never the bare `x`, and owner-kind raters cluster only among
+themselves. An operator who both funds EOAs and controls smart wallets from
+the same key therefore forms two clusters -- accepted; the planned
+replacement is a signature-verified owner (the signing owner index read out
+of the UserOperation; design spec section 10, v0.3).
+
 Candidate pairs come from blocking (same funder; or sharing a ratee with at
 most `Config.sybil_max_group` raters), each pruned to avoid an O(n^2) blowup
 -- see `_candidate_pairs`. Pairs may repeat across blocks and are not

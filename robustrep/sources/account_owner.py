@@ -17,9 +17,18 @@ those 55 wallets returned only **4 distinct owner addresses** (26/14/11/4).
 
 This module reads that key. The result is stored in ``raters.funder`` with
 ``funder_kind = "owner"`` (``robustrep.store``), which widens the column's
-meaning from "who funded the address" to "who controls or funded it"; the
-comparison in ``robustrep.sybil`` (equality of the normalised funder) is
-unchanged.
+meaning from "who funded the address" to "who controls or funded it". It is
+stored in its own namespace, ``owner:<0x40hex lowercase>`` (``owner_funder``):
+``ownerAtIndex`` is whatever the rater's own contract answers, so a registrant
+can name any address as the "controlling key" of N raters at no cost beyond
+deployment (security review M1) -- naming the first funder of an honest
+transfer-kind rater would otherwise cluster the two. The comparison in
+``robustrep.sybil`` (equality of the lowercased funder) is unchanged, and
+``owner:...`` can only ever equal another ``owner:...``: owner-kind raters
+cluster among themselves. An operator who both funds EOAs and controls smart
+wallets from one key forms two clusters -- accepted; the planned replacement
+is the signature-verified owner (the signing owner index read out of the
+UserOperation; spec section 10, v0.3).
 
 Two selectors, both over plain ``eth_call`` at ``latest`` (an address without
 code answers ``"0x"`` to any ``eth_call``, so no ``eth_getCode`` is needed):
@@ -66,6 +75,7 @@ transfer-derived funder passes, so the two rules store the same shape.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable, Optional, Union
 
 from .base_erc8004 import ZERO_ADDRESS, BatchState, _decode_owner_result, _warn_batch_fallback
@@ -83,6 +93,28 @@ OWNER_SELECTOR = "0x8da5cb5b"
 # How many ``ownerAtIndex`` slots to scan (indices 0..OWNER_INDEX_SCAN-1): owners
 # can be removed, so index 0 may be empty while a later one still holds a key.
 OWNER_INDEX_SCAN = 4
+# The namespace an owner-kind funder is stored under (``owner_funder``). A
+# transfer-kind funder is a bare address, so the two can never compare equal.
+OWNER_FUNDER_PREFIX = "owner:"
+_OWNER_FUNDER_RE = re.compile(r"^owner:0x[0-9a-f]{40}$")
+
+
+def owner_funder(address) -> str:
+    """``address`` as the stored owner-kind funder, ``owner:<0x40hex lowercase>``.
+    The address part goes through ``profile_http.funder_address`` -- the gate
+    every transfer-kind funder passes -- and anything that is not a bare
+    ``0x`` + 40-hex address (an already-prefixed value included) raises
+    ``ValueError``: this is the one place the namespace is written, and it
+    must never nest."""
+    addr = funder_address(address, "owner")
+    if addr is None:
+        raise ValueError(f"owner funder must be a 0x + 40-hex address, got {type(address).__name__}")
+    return OWNER_FUNDER_PREFIX + addr
+
+
+def is_owner_funder(value) -> bool:
+    """True for exactly the shape ``owner_funder`` produces."""
+    return isinstance(value, str) and _OWNER_FUNDER_RE.fullmatch(value) is not None
 
 # ABI layout constants for a ``bytes`` return value.
 _WORD = 32

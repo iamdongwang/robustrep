@@ -904,21 +904,13 @@ def test_first_tx_http_401_oversized_body_is_still_a_config_error(monkeypatch, d
     assert http.responses_made[0].closed is True
 
 
-# --- categories: the owner pass's internal-transfer retry --------------------------
+# --- no categories parameter: the internal-transfer retry was dropped --------------
 
 
-def test_first_tx_categories_default_to_external_only():
+def test_first_tx_has_no_categories_parameter_and_asks_for_external_only():
     import inspect
 
-    assert inspect.signature(AlchemyClient.first_tx).parameters["categories"].default == ("external",)
-
-
-def test_first_tx_retry_request_asks_for_external_and_internal_transfers():
+    assert "categories" not in inspect.signature(AlchemyClient.first_tx).parameters
     http = FakeAlchemyHttp([ok([transfer()])])
-    got = client(http).first_tx(ADDR, categories=("external", "internal"))
-    assert got is not None
-    body = http.calls[0]["json"]
-    assert body["params"][0]["category"] == ["external", "internal"]
-    # Nothing else about the request changes.
-    assert body["params"][0]["toAddress"] == ADDR.lower()
-    assert body["params"][0]["order"] == "asc" and body["params"][0]["maxCount"] == "0x1"
+    assert client(http).first_tx(ADDR) is not None
+    assert http.calls[0]["json"]["params"][0]["category"] == ["external"]

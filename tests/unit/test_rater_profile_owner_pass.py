@@ -1,16 +1,16 @@
-"""``enrich_raters`` pass 2: the owner lookup and internal-transfer retry for
-raters whose first-transfer lookup found nothing (``funder_kind`` NULL).
+"""``enrich_raters`` pass 2: the owner lookup for raters whose first-transfer
+lookup found nothing (``funder_kind`` NULL). An owner is stored in its own
+namespace (``owner:<address>``, see ``account_owner.owner_funder``).
 
 Split out of ``test_rater_profile.py`` (file size). Everything here runs
 against fakes -- a duck-typed transfer client, an ``AlchemyClient`` subclass
-that records the categories it was asked for, and a recording RPC -- so no
-test touches the network.
+answering from a dict, and a recording RPC -- so no test touches the network.
 """
 import logging
 
 import pytest
 
-from robustrep.sources.account_owner import OWNER_AT_INDEX_SELECTOR
+from robustrep.sources.account_owner import OWNER_AT_INDEX_SELECTOR, owner_funder
 from robustrep.sources.alchemy_profile import AlchemyClient
 from robustrep.sources.profile_http import ProfilePlanError
 from robustrep.sources.rater_profile import enrich_raters
@@ -24,6 +24,7 @@ A, B, C, D = ("0x" + "a1" * 20, "0x" + "b2" * 20, "0x" + "c3" * 20, "0x" + "d4" 
 FUNDER = "0x" + "f0" * 20
 KEY = "0x" + "ab" * 20
 KEY2 = "0x" + "cd" * 20
+OWNER, OWNER2 = owner_funder(KEY), owner_funder(KEY2)
 ALCHEMY_KEY = "ALCHEMY-TEST-KEY-VALUE-0123456789"
 
 
@@ -61,23 +62,18 @@ class TransferClient:
 
 class RecordingAlchemy(AlchemyClient):
     """A real ``AlchemyClient`` (so ``isinstance`` holds) whose ``first_tx``
-    answers from dicts instead of HTTP: ``answers`` for the default external
-    lookup, ``retry_answers`` for the ``("external", "internal")`` retry.
-    ``raise_on_retry`` maps an address to an exception the retry raises."""
+    answers from a dict instead of HTTP; ``raise_for`` maps an address to an
+    exception it raises."""
 
-    def __init__(self, answers=None, retry_answers=None, raise_on_retry=None):
+    def __init__(self, answers=None, raise_for=None):
         super().__init__(ALCHEMY_KEY, session=object(), sleep=lambda _: None)
-        self.answers, self.retry_answers = dict(answers or {}), dict(retry_answers or {})
-        self.raise_on_retry = dict(raise_on_retry or {})
-        self.calls = []
+        self.answers, self.raise_for, self.calls = dict(answers or {}), dict(raise_for or {}), []
 
-    def first_tx(self, address, categories=("external",)):
-        self.calls.append((address, tuple(categories)))
-        if tuple(categories) == ("external",):
-            return self.answers.get(address)
-        if address in self.raise_on_retry:
-            raise self.raise_on_retry[address]
-        return self.retry_answers.get(address)
+    def first_tx(self, address):
+        self.calls.append(address)
+        if address in self.raise_for:
+            raise self.raise_for[address]
+        return self.answers.get(address)
 
 
 class OwnerRpc:
@@ -142,12 +138,13 @@ def test_owner_found_writes_kind_owner_with_first_seen_left_null(tmp_path):
         rpc = OwnerRpc({A: KEY, B: KEY})
         n = enrich_raters(s, TransferClient(), rpc=rpc)
         assert n == 4  # 2 processed in pass 1 + 2 in pass 2
-        assert rows(s) == {A: (None, KEY, "owner"), B: (None, KEY, "owner")}
+        assert rows(s) == {A: (None, OWNER, "owner"), B: (None, OWNER, "owner")}
         assert s.raters_needing_owner_lookup() == []
         assert s.get_sync("rater_profile_mode") == "blockscout"
-        # Clustering sees the shared key through the ordinary funder column.
+        # Clustering sees the shared key through the ordinary funder column,
+        # in the owner namespace so it can never equal a transfer funder.
         meta = s.load_rater_meta()
-        assert set(meta["funder"]) == {KEY} and meta["first_seen_ts"].isna().all()
+        assert set(meta["funder"]) == {OWNER} and meta["first_seen_ts"].isna().all()
 
 
 def test_pass_two_batches_index_zero_calls(tmp_path):
@@ -159,29 +156,24 @@ def test_pass_two_batches_index_zero_calls(tmp_path):
         assert rpc.calls == []
 
 
-# --- pass 2: internal-transfer retry -----------------------------------------------
+# --- pass 2: no second client call ------------------------------------------------
 
 
-def test_alchemy_retry_with_internal_category_writes_transfer(tmp_path):
+def test_alchemy_client_is_not_asked_again_in_pass_two(tmp_path):
+    # The internal-transfer retry was dropped (security review M3): a
+    # paymaster's gas advance is an internal transfer, so the retry could have
+    # bound passkey wallets to shared infrastructure; measured on 30 + 12 live
+    # addresses it changed nothing. Pass 2 is owner -> "owner", else "none".
     with Store(tmp_path / "t.db") as s:
-        seed(s, A)
-        client = RecordingAlchemy(retry_answers={A: (7, 777, FUNDER)})
-        assert enrich_raters(s, client, rpc=OwnerRpc()) == 2
-        assert rows(s) == {A: (777, FUNDER, "transfer")}
-        assert client.calls == [(A, ("external",)), (A, ("external", "internal"))]
+        seed(s, A, B)
+        client = RecordingAlchemy()
+        assert enrich_raters(s, client, rpc=OwnerRpc({A: KEY})) == 4
+        assert client.calls == [A, B]
+        assert rows(s) == {A: (None, OWNER, "owner"), B: (None, None, "none")}
         assert s.get_sync("rater_profile_mode") == "alchemy"
 
 
-def test_alchemy_retry_is_skipped_when_an_owner_was_found(tmp_path):
-    with Store(tmp_path / "t.db") as s:
-        seed(s, A)
-        client = RecordingAlchemy(retry_answers={A: (7, 777, FUNDER)})
-        enrich_raters(s, client, rpc=OwnerRpc({A: KEY}))
-        assert rows(s) == {A: (None, KEY, "owner")}
-        assert client.calls == [(A, ("external",))]
-
-
-def test_non_alchemy_client_gets_no_internal_retry(tmp_path):
+def test_non_alchemy_client_behaves_the_same(tmp_path):
     with Store(tmp_path / "t.db") as s:
         seed(s, A)
         client = TransferClient()
@@ -199,20 +191,20 @@ def test_nothing_found_anywhere_writes_kind_none(tmp_path):
         client = RecordingAlchemy()
         assert enrich_raters(s, client, rpc=OwnerRpc()) == 2
         assert rows(s) == {A: (None, None, "none")}
-        assert client.calls == [(A, ("external",)), (A, ("external", "internal"))]
+        assert client.calls == [A]
 
 
 def test_pass_two_selects_only_null_kind_rows_without_a_funder(tmp_path):
     with Store(tmp_path / "t.db") as s:
         s.upsert_rater(A, 100, FUNDER, "transfer")   # has a funder
         s.upsert_rater(B, None, None, "none")        # already settled
-        s.upsert_rater(C, None, KEY2, "owner")       # has an owner
+        s.upsert_rater(C, None, OWNER2, "owner")     # has an owner
         s.upsert_rater(D, None, None)                # legacy NULL -> the one to look up
         rpc = OwnerRpc({D: KEY})
         # Every client address is already in raters, so pass 1 has nothing to do.
         assert enrich_raters(s, TransferClient(), rpc=rpc) == 1
         assert rpc.queried() == {D}
-        assert rows(s)[D] == (None, KEY, "owner")
+        assert rows(s)[D] == (None, OWNER, "owner")
         assert rows(s)[A] == (100, FUNDER, "transfer") and rows(s)[B] == (None, None, "none")
 
 
@@ -221,7 +213,7 @@ def test_later_run_does_not_requery_settled_rows(tmp_path):
         seed(s, A, B)
         first = OwnerRpc({A: KEY})
         assert enrich_raters(s, TransferClient(), rpc=first) == 4
-        assert rows(s) == {A: (None, KEY, "owner"), B: (None, None, "none")}
+        assert rows(s) == {A: (None, OWNER, "owner"), B: (None, None, "none")}
         again = OwnerRpc({A: KEY, B: KEY})
         client = TransferClient()
         assert enrich_raters(s, client, rpc=again) == 0
@@ -239,7 +231,7 @@ def test_pass_two_runs_for_legacy_rows_even_when_pass_one_is_idle(tmp_path):
         s.upsert_rater(A, None, None)
         rpc = OwnerRpc({A: KEY})
         assert enrich_raters(s, TransferClient(), rpc=rpc) == 1
-        assert rows(s) == {A: (None, KEY, "owner")}
+        assert rows(s) == {A: (None, OWNER, "owner")}
         assert s.get_sync("rater_profile_mode") == "blockscout"
 
 
@@ -256,7 +248,7 @@ def test_rpc_failure_in_pass_two_fails_only_that_address(tmp_path, caplog):
         assert B in str(e.value) and A not in str(e.value) and C not in str(e.value)
         # B's own per-address scan died, so B alone stays NULL for the next
         # run; A (owner) and C (nothing anywhere) are settled.
-        assert rows(s) == {A: (None, KEY, "owner"), B: (None, None, None), C: (None, None, "none")}
+        assert rows(s) == {A: (None, OWNER, "owner"), B: (None, None, None), C: (None, None, "none")}
         assert s.get_sync("rater_profile_mode") == "blockscout-partial"
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1 and B in errors[0] and "owner lookup failed" in errors[0]
@@ -274,7 +266,7 @@ def test_whole_batch_failure_in_pass_two_still_settles_every_address_it_can(tmp_
                 enrich_raters(s, TransferClient(), rpc=rpc)
         got = rows(s)
         assert got[addrs[7]] == (None, None, None)
-        assert all(got[a] == (None, KEY, "owner") for a in addrs if a != addrs[7])
+        assert all(got[a] == (None, OWNER, "owner") for a in addrs if a != addrs[7])
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
@@ -285,7 +277,7 @@ def test_owner_pass_uses_the_callers_batch_state(tmp_path):
         rpc = OwnerRpc({A: KEY, B: KEY2}, batch_error=RpcBatchStructureError("not a list"))
         enrich_raters(s, TransferClient(), rpc=rpc, batch_state=state)
         assert state.batch_unsupported is True
-        assert rows(s) == {A: (None, KEY, "owner"), B: (None, KEY2, "owner")}
+        assert rows(s) == {A: (None, OWNER, "owner"), B: (None, OWNER2, "owner")}
         # A state that already knows batching is unsupported skips rpc.batch entirely.
         s.upsert_rater(C, None, None)
         again = OwnerRpc({C: KEY}, batch_error=RpcBatchStructureError("not a list"))
@@ -293,37 +285,24 @@ def test_owner_pass_uses_the_callers_batch_state(tmp_path):
         assert again.batches == [] and again.calls == [C]
 
 
-def test_retry_failure_in_pass_two_is_collected_and_the_rest_still_settle(tmp_path):
+def test_plan_error_on_the_very_first_client_call_aborts(tmp_path):
     with Store(tmp_path / "t.db") as s:
         seed(s, A, B)
-        client = RecordingAlchemy(raise_on_retry={A: RuntimeError("boom")})
-        with pytest.raises(RuntimeError) as e:
-            enrich_raters(s, client, rpc=OwnerRpc())
-        assert "1 address(es)" in str(e.value) and A in str(e.value)
-        assert rows(s) == {A: (None, None, None), B: (None, None, "none")}
-        assert s.get_sync("rater_profile_mode") == "alchemy-partial"
-
-
-def test_plan_error_on_the_very_first_client_call_aborts_even_in_pass_two(tmp_path):
-    with Store(tmp_path / "t.db") as s:
-        seed(s, A, B)
-        s.upsert_rater(A, None, None)
-        s.upsert_rater(B, None, None)
-        client = RecordingAlchemy(raise_on_retry={A: ProfilePlanError("plan"), B: ProfilePlanError("plan")})
+        client = RecordingAlchemy(raise_for={A: ProfilePlanError("plan"), B: ProfilePlanError("plan")})
         with pytest.raises(ProfilePlanError):
             enrich_raters(s, client, rpc=OwnerRpc())
-        assert len(client.calls) == 1
-        assert rows(s) == {A: (None, None, None), B: (None, None, None)}
+        assert client.calls == [A]
+        assert rows(s) == {}
         assert s.get_sync("rater_profile_mode") is None
 
 
 def test_plan_error_after_an_earlier_client_call_is_a_regular_failure(tmp_path):
     with Store(tmp_path / "t.db") as s:
-        seed(s, A)
-        client = RecordingAlchemy(raise_on_retry={A: ProfilePlanError("plan")})
+        seed(s, A, B)
+        client = RecordingAlchemy(raise_for={B: ProfilePlanError("plan")})
         with pytest.raises(RuntimeError, match="1 address"):
             enrich_raters(s, client, rpc=OwnerRpc())
-        assert rows(s) == {A: (None, None, None)}
+        assert rows(s) == {A: (None, None, "none")}
         assert s.get_sync("rater_profile_mode") == "alchemy-partial"
 
 
@@ -333,7 +312,7 @@ def test_pass_one_failure_still_lets_pass_two_run(tmp_path):
         s.upsert_rater(C, None, None)
         with pytest.raises(RuntimeError, match=B):
             enrich_raters(s, TransferClient(raise_for=[B]), rpc=OwnerRpc({A: KEY, C: KEY2}))
-        assert rows(s) == {A: (None, KEY, "owner"), C: (None, KEY2, "owner")}
+        assert rows(s) == {A: (None, OWNER, "owner"), C: (None, OWNER2, "owner")}
 
 
 # --- logging -----------------------------------------------------------------------
@@ -341,17 +320,16 @@ def test_pass_one_failure_still_lets_pass_two_run(tmp_path):
 
 def test_one_info_line_per_pass_with_counts(tmp_path, caplog):
     with Store(tmp_path / "t.db") as s:
-        seed(s, A, B, C, D)
-        client = RecordingAlchemy(answers={A: (1, 100, FUNDER)}, retry_answers={C: (2, 200, FUNDER)})
+        seed(s, A, B, C)
+        client = RecordingAlchemy(answers={A: (1, 100, FUNDER)})
         with caplog.at_level(logging.INFO, logger="robustrep.sources.rater_profile"):
-            assert enrich_raters(s, client, rpc=OwnerRpc({B: KEY})) == 7
+            assert enrich_raters(s, client, rpc=OwnerRpc({B: KEY})) == 5
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert len(infos) == 2
-        assert "pass 1" in infos[0] and "4 address(es)" in infos[0] and "1 funder(s) found" in infos[0]
-        assert "pass 2" in infos[1]
-        assert "owner: 1, transfer-internal: 1, none: 1" in infos[1]
-        assert rows(s) == {A: (100, FUNDER, "transfer"), B: (None, KEY, "owner"),
-                           C: (200, FUNDER, "transfer"), D: (None, None, "none")}
+        assert "pass 1" in infos[0] and "3 address(es)" in infos[0] and "1 funder(s) found" in infos[0]
+        assert "pass 2" in infos[1] and "2 address(es)" in infos[1]
+        assert "owner: 1, none: 1" in infos[1] and "transfer-internal" not in infos[1]
+        assert rows(s) == {A: (100, FUNDER, "transfer"), B: (None, OWNER, "owner"), C: (None, None, "none")}
 
 
 def test_fallback_mode_skips_pass_two_and_writes_nothing(tmp_path):

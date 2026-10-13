@@ -92,10 +92,14 @@ ALCHEMY_FREE_CU_PER_SECOND = 300
 ALCHEMY_CU_PER_GET_ASSET_TRANSFERS = 120
 DEFAULT_ALCHEMY_RPS = ALCHEMY_FREE_CU_PER_SECOND / ALCHEMY_CU_PER_GET_ASSET_TRANSFERS
 
-# Transfer categories of the default lookup: external transfers only, the
-# definition verified equivalent to Blockscout's ``filter=to`` (see the module
-# docstring). ``first_tx(categories=...)`` widens it per call.
-DEFAULT_CATEGORIES: tuple[str, ...] = ("external",)
+# Transfer categories of the lookup: external transfers only, the definition
+# verified equivalent to Blockscout's ``filter=to`` (see the module docstring).
+# Deliberately not widened to ``internal``: a paymaster's gas advance to a
+# smart account is an internal transfer, so admitting it could bind
+# passkey-controlled wallets to shared ERC-4337 infrastructure as their
+# "funder" (security review M3); measured on 30 + 12 live addresses the wider
+# lookup changed nothing.
+CATEGORIES: tuple[str, ...] = ("external",)
 
 # Substrings (case-insensitive) of a JSON-RPC error message meaning the key
 # or the app's network configuration is rejected -- a configuration problem
@@ -186,17 +190,12 @@ class AlchemyClient:
         self.retries, self.sleep = retries, sleep
         self.gap = 1.0 / rps
 
-    def first_tx(self, address: str,
-                 categories: tuple[str, ...] = DEFAULT_CATEGORIES) -> Optional[tuple[int, int, str]]:
+    def first_tx(self, address: str) -> Optional[tuple[int, int, str]]:
         """Return ``(block, timestamp, funder_from_address)`` for the earliest
-        incoming transfer to ``address`` in any of ``categories`` (default
-        ``("external",)``: the funder rule verified equivalent to Blockscout's),
-        or ``None`` if it has none, its block timestamp is implausible (M4,
-        logged once) or its ``from`` is not an address (L1, logged once).
-        ``rater_profile.enrich_raters``'s owner pass retries an address with
-        ``("external", "internal")``: a smart-contract account may have been
-        funded only by an internal (contract-to-contract) transfer, which
-        the external-only lookup never sees. Raises
+        incoming external transfer to ``address`` (``CATEGORIES``: the funder
+        rule verified equivalent to Blockscout's), or ``None`` if it has none,
+        its block timestamp is implausible (M4, logged once) or its ``from``
+        is not an address (L1, logged once). Raises
         ``ValueError`` naming ``address`` for a malformed body -- not a JSON
         object, ``result`` not an object, ``transfers`` not a list, an entry
         missing ``blockNum``/``from``/``metadata.blockTimestamp`` or with a
@@ -204,7 +203,7 @@ class AlchemyClient:
         parsed as JSON. See the class docstring for the full error
         contract."""
         address = address.lower()
-        payload = _request_body(address, categories)
+        payload = _request_body(address)
         return fetch_with_retries(
             "Alchemy", address,
             lambda: self.session.post(self._url, json=payload, timeout=REQUEST_TIMEOUT, stream=True),
@@ -232,11 +231,10 @@ class AlchemyClient:
         return _parse_transfer(transfers[0], address)
 
 
-def _request_body(address: str, categories: tuple[str, ...] = DEFAULT_CATEGORIES) -> dict:
+def _request_body(address: str) -> dict:
     """The JSON-RPC body for one lookup: the earliest (``order: asc``,
-    ``maxCount: 1``) transfer of any of ``categories`` *to* ``address`` over
-    the whole chain, with block metadata so the timestamp comes back in the
-    same call.
+    ``maxCount: 1``) external transfer *to* ``address`` over the whole chain,
+    with block metadata so the timestamp comes back in the same call.
     ``excludeZeroValue: false`` so a zero-value call to the address still
     counts as its first incoming transfer, matching Blockscout's
     ``filter=to`` definition (a contract deployment would not: it has
@@ -249,7 +247,7 @@ def _request_body(address: str, categories: tuple[str, ...] = DEFAULT_CATEGORIES
             "fromBlock": "0x0",
             "toBlock": "latest",
             "toAddress": address,
-            "category": list(categories),
+            "category": list(CATEGORIES),
             "order": "asc",
             "maxCount": "0x1",
             "withMetadata": True,

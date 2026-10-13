@@ -37,9 +37,6 @@ changes is which raters the funder signal can link.
   pre-0.2.2 store adds the column and marks existing funders `transfer`
   once; `Store.upsert_rater` takes the kind, `raters_needing_owner_lookup`
   and `funder_kind_counts` are new.
-- **Internal-transfer retry.** An address with no owner is retried through
-  Alchemy with `category: ["external", "internal"]`
-  (`AlchemyClient.first_tx(categories=...)`) before being marked `none`.
 - **Provenance `funder_kind_counts`** (in `scores.json` and as the
   `Funder kinds` line of `report.md`), a `Controlling-key linking`
   Limitations bullet, and the `fetch` summary line's per-run funder-kind
