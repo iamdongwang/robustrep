@@ -4,7 +4,7 @@ All notable changes to robustrep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0,
 so a `0.x` bump may change published numbers without changing the API.
 
-## [Unreleased]
+## [0.2.2] — 2026-10-13
 
 Since October 2026 the new ERC-8004 raters on Base are almost all
 smart-contract accounts: of 230 sampled unprofiled raters (2026-10-13),
