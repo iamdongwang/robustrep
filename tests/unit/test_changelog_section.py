@@ -64,10 +64,53 @@ def test_last_section_stops_before_link_references() -> None:
     assert body == "Initial release."
 
 
+def test_trailing_link_definition_with_trailing_space_is_still_cut() -> None:
+    mod = _load()
+    text = "## [1.0.0] — 2026-01-01\n\nBody.\n\n[1.0.0]: https://example.invalid/x   \n"
+    assert mod.section(text, "1.0.0") == "Body."
+
+
+def test_link_definition_inside_a_section_is_kept() -> None:
+    mod = _load()
+    text = (
+        "## [1.1.0] — 2026-01-02\n\nSee [the issue][ref] for context.\n\n"
+        "[ref]: https://example.invalid/issue\n\n- a bullet after the definition\n\n"
+        "## [1.0.0] — 2026-01-01\n\nOld.\n\n[1.1.0]: https://example.invalid/compare\n"
+    )
+    body = mod.section(text, "1.1.0")
+    assert "[ref]: https://example.invalid/issue" in body
+    assert body.endswith("- a bullet after the definition")
+    assert "Old." not in body
+
+
 def test_missing_version_raises() -> None:
     mod = _load()
     with pytest.raises(LookupError, match="0.9.9"):
         mod.section(SAMPLE, "0.9.9")
+
+
+def test_empty_section_raises() -> None:
+    mod = _load()
+    text = "## [2.0.0] — 2026-02-02\n\n\n## [1.0.0] — 2026-01-01\n\nOld.\n"
+    with pytest.raises(LookupError, match="empty '## \\[2.0.0\\]'"):
+        mod.section(text, "2.0.0")
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("Thanks to @someone for the report.", ["bare mention '@someone'"]),
+        ("The `@decorator` form and user\\@example.com stay.", []),
+        ("We now reject an Attack on the fetcher.", ["banned word 'Attack'"]),
+        ("Rejects `bot` traffic in a code span.", []),
+        ("A robot and a botnet are different words.", []),
+        ("Clean notes about measured behaviour.", []),
+    ],
+)
+def test_lint_flags_mentions_and_banned_words_outside_code(
+    body: str, expected: list[str]
+) -> None:
+    assert _load().lint(body) == expected
 
 
 def test_cli_prints_body_and_fails_on_unknown_version(tmp_path: Path) -> None:
@@ -89,3 +132,21 @@ def test_cli_prints_body_and_fails_on_unknown_version(tmp_path: Path) -> None:
     )
     assert bad.returncode == 1
     assert "9.9.9" in bad.stderr
+
+
+def test_cli_lint_fails_and_prints_nothing_to_stdout(tmp_path: Path) -> None:
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(
+        "## [3.0.0] — 2026-03-03\n\nThanks @reporter, this stops the fraud.\n",
+        encoding="utf-8",
+    )
+    res = subprocess.run(
+        [sys.executable, str(SCRIPT), str(changelog), "3.0.0", "--lint"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert res.stdout == ""
+    assert "bare mention '@reporter'" in res.stderr
+    assert "banned word 'fraud'" in res.stderr
