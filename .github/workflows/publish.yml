@@ -64,7 +64,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with: { name: dist, path: dist/ }
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
   # The GitHub Release is the human-facing record of what PyPI now serves:
   # notes are the tag's CHANGELOG section (validated in `build` above, before
   # the upload), and the wheel and sdist attached are proven byte-identical to
