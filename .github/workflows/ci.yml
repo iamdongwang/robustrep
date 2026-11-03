@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -45,7 +45,7 @@ jobs:
             echo "pip-audit attempt $attempt failed; retrying in 15s"; sleep 15
           done
           exit 1
-      # constraints.txt is frozen on one machine (macOS/CPython 3.10), so on its
+      # constraints.txt is frozen on one machine (macOS/CPython 3.12), so on its
       # own it cannot see a dependency that installs only elsewhere -- a
       # Linux-gated marker, a platform-specific wheel. Anything pip actually
       # installed that is absent from constraints.txt is unpinned *and* outside

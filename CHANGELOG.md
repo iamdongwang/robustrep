@@ -4,6 +4,20 @@ All notable changes to robustrep are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0,
 so a `0.x` bump may change published numbers without changing the API.
 
+## [Unreleased]
+
+### Changed
+- **Python 3.11+ required** (was 3.10+). The security fixes for pillow
+  (13.0.0) and filelock (4.2.1), published 2026-10-16/17, require Python
+  3.11, so a 3.10 environment can no longer pass the dependency audit. Users
+  on 3.10 can stay on 0.2.2. CI now tests 3.11-3.13.
+
+### Security
+- CI pins bumped for newly published advisories: pillow 12.3.0 -> 13.0.0,
+  filelock 3.32.6 -> 4.2.1, certifi 2026.7.22 -> 2026.10.18, msgpack
+  1.2.2 -> 1.2.3. pillow is only used by matplotlib to write robustrep's own
+  figures; filelock is dev tooling only.
+
 ## [0.2.2] — 2026-10-13
 
 Since October 2026 the new ERC-8004 raters on Base are almost all
@@ -424,6 +438,7 @@ no longer rescales a group by its own extremes.
 Initial release on PyPI: the scoring library, the Base ERC-8004 adapter, and the
 reproducible report.
 
+[Unreleased]: https://github.com/iamdongwang/robustrep/compare/v0.2.2...HEAD
 [0.2.2]: https://github.com/iamdongwang/robustrep/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/iamdongwang/robustrep/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/iamdongwang/robustrep/compare/v0.1.2...v0.2.0
