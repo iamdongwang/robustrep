@@ -1,15 +1,15 @@
 # Robust reputation on ERC-8004 (Base)
 
-Data cut at block 52102625. Ratings: 528310 (123 revoked, excluded below). Agents rated: 29876. Agents scored (>= min_clusters independent clusters): 5072; insufficient (too few clusters): 24804.
+Data cut at block 53435482. Ratings: 674149 (136 revoked, excluded below). Agents rated: 152439. Agents scored (>= min_clusters independent clusters): 5120; insufficient (too few clusters): 147319.
 
 ## Headline numbers
-- No evidence URI (level 0): 14.7%
+- No evidence URI (level 0): 29.8%
 - No verifiable interaction evidence (levels 0-1): 99.5%. This is comparable to the study's (arXiv 2606.26028) reported 98.7-100% of ratings with no interaction evidence.
 - Verified on chain (level 3): 0.1%
-- Agents flagged (largest single cluster >= 50% of that agent's records, among scored agents only): 3410 (67.2%)
+- Agents flagged (largest single cluster >= 50% of that agent's records, among scored agents only): 3474 (67.9%)
 - Read `sybil_flag` together with `n_clusters` and `zero_evidence_ratio`: in scenario F an attack split across two funders held 91% of the records while the largest single cluster was 45%, leaving the flag at 0.
-- Rater concentration: 13501 distinct raters, 528310 ratings (1.0 median, 47826 max ratings per rater). With repeat raters this dense, the largest-single-cluster flag is mostly single-rater dominance (one address rating the same agent many times); read it with `n_raw` and `n_clusters`.
-- Tag hygiene: 677 distinct tags; 0.2% of records carry a tag with fewer than 10 records overall. tag1 is free text on ERC-8004; many values are sentences rather than categories. v0.1 keeps every tag as its own group; a rare-tag merge is a v0.2 item.
+- Rater concentration: 136529 distinct raters, 674149 ratings (1.0 median, 47826 max ratings per rater). With repeat raters this dense, the largest-single-cluster flag is mostly single-rater dominance (one address rating the same agent many times); read it with `n_raw` and `n_clusters`.
+- Tag hygiene: 694 distinct tags; 0.2% of records carry a tag with fewer than 10 records overall. tag1 is free text on ERC-8004; many values are sentences rather than categories. v0.1 keeps every tag as its own group; a rare-tag merge is a v0.2 item.
 - Median |mean - robust| among scored agents: 0.061
 
 ## Figures
@@ -30,20 +30,20 @@ Data cut at block 52102625. Ratings: 528310 (123 revoked, excluded below). Agent
 
 ## Sensitivity
 Rank stability of the top-N robust-score ranking under reasonable parameter perturbations (evidence-weight shape, sybil Jaccard threshold, sybil time window, normalization fit share), each vs the base configuration. Top sets are tie-inclusive (every agent scoring >= the N-th highest score). `top_set_jaccard` is the primary stability measure: the overlap of the base and variant top sets. Spearman's rho (Pearson correlation of average ranks over the union of the two top sets, no scipy dependency) is reported for completeness; a blank cell means one run ranked the whole union as a single tie while the other did not (zero variance on one side, so no correlation is defined).
-1091 of the 5072 scored agents tie at the top score (1.000), against a base top set of 1091. The top set is essentially one tie block in which every member holds the same rank, and Spearman's rho is therefore uninformative on this data: any value is driven by the few agents outside the block, and a value near 0 reflects tie order, not a ranking change. Read `top_set_jaccard`.
+1100 of the 5120 scored agents tie at the top score (1.000), against a base top set of 1100. The top set is essentially one tie block in which every member holds the same rank, and Spearman's rho is therefore uninformative on this data: any value is driven by the few agents outside the block, and a value near 0 reflects tie order, not a ranking change. Read `top_set_jaccard`.
 A variant whose `budget_limited` is True hit a sybil pair budget while clustering (each variant re-clusters from scratch, and a wider sybil window generates more candidate pairs), so its row may reflect the budget rather than the parameter being varied; compare it against the base row's own `budget_limited`.
 
 | variant         |   spearman_union |   spearman_top |   top_set_jaccard |   top_set_size | budget_limited   |
 |:----------------|-----------------:|---------------:|------------------:|---------------:|:-----------------|
-| base            |        1         |      1         |          1        |           1091 | True             |
-| weights_flatter |       -0.0553064 |     -0.0553064 |          0.56     |            625 | True             |
-| weights_steeper |                  |                |          0.950348 |           1148 | True             |
-| jaccard_0.6     |                  |                |          0.99725  |           1088 | True             |
-| jaccard_0.9     |                  |                |          0.969778 |           1125 | True             |
-| window_6h       |                  |                |          0.99817  |           1093 | True             |
-| window_72h      |                  |                |          0.999083 |           1090 | True             |
-| fit_0.8         |        1         |      1         |          1        |           1091 | True             |
-| fit_1.0         |                  |                |          0.982585 |           1072 | True             |
+| base            |       1          |     1          |          1        |           1100 | True             |
+| weights_flatter |      -0.0508888  |    -0.0508888  |          0.562274 |            631 | True             |
+| weights_steeper |                  |                |          0.950735 |           1157 | True             |
+| jaccard_0.6     |      -0.0020365  |    -0.0020365  |          0.99455  |           1096 | True             |
+| jaccard_0.9     |                  |                |          0.970018 |           1134 | True             |
+| window_6h       |      -0.00128441 |    -0.00128441 |          0.997278 |           1101 | True             |
+| window_72h      |                  |                |          0.998182 |           1098 | True             |
+| fit_0.8         |       1          |     1          |          1        |           1100 | True             |
+| fit_1.0         |                  |                |          0.981818 |           1080 | True             |
 
 ## Adversarial evidence
 Known-answer attack scenarios (see `robustrep.report.adversarial.scenario_table`), each computed with **bootstrap_n=0**: point estimates only -- no confidence-interval claims are made from this table.
@@ -73,16 +73,21 @@ normalize per (tag, scale) -> evidence weights -> sybil collapse (2-of-3 signals
 ## Limitations
 - **Clustering evasion.** An attacker using a distinct funder per rater, spacing first-seen timestamps more than the sybil time window apart, and rating decoy ratees can still reach a Jaccard of 1.0 with another attacker who shares the same decoy -- but that pair still evades detection, because it fails both of the other two signals (distinct funders, and outside the time window), so no pair ever reaches 2 of the 3 required signals. Every attacker rater lands in its own singleton cluster. The residual defense is evidence weighting (an evasive farm is almost always evidence-free): `zero_evidence_ratio` is the signal that survives this evasion even when `sybil_flag` reads 0 and rater clustering sees nothing unusual.
 - **Large-ratee-group blind spot.** A ratee with more raters than `sybil_max_group` is skipped entirely for ratee-based blocking (see `robustrep.sybil`), so a farm concentrated on one very popular ratee can evade the ratee-sharing signal by sheer volume, independent of the evasion technique above.
-- **Budget-limited clustering.** Sybil clustering was budget-limited: 1 ratee block(s) skipped for size (> sybil_max_group), 1 for the per-ratee pair budget, global pair budget reached: no (672992 candidate pairs examined, 600537 tested). Clusters among the affected raters may be under-merged, so their ratees' scores are less robust than reported, never more.
+- **Controlling-key linking.** Most new raters are smart-contract accounts with no incoming transfer, so no first funder exists for them. Such a rater is linked instead by the key that controls the account (`ownerAtIndex`, then `owner()`), stored as its funder in its own namespace (`owner:<address>`) with `funder_kind` = `owner`: wallets sharing a controlling key count as one cluster, exactly as wallets sharing a first funder do. The key is reported by the rater's own contract and is not verified, so owner-linked raters cluster only among themselves, never with transfer-linked ones. The bundlers and paymaster that carry these accounts' first transactions are deliberately not used -- they are shared infrastructure common to unrelated raters. Accounts controlled by a passkey expose no comparable key and stay unlinked (`funder_kind` = `none`); the Funder kinds line in Provenance says how many rows each rule produced.
+- **Budget-limited clustering.** Sybil clustering was budget-limited: 1 ratee block(s) skipped for size (> sybil_max_group), 1 for the per-ratee pair budget, global pair budget reached: no (785205 candidate pairs examined, 711633 tested). Clusters among the affected raters may be under-merged, so their ratees' scores are less robust than reported, never more.
 - **DNS rebinding in the evidence fetcher (the residual unmitigated gap in v0.1).** The SSRF guard resolves an evidence URI's host and checks *those* addresses, but `requests`/`urllib3` resolve the host again independently; a rebinding attacker answering a public address on the first lookup and a private one on the second can pass the guard and cause a GET to a private address. The blast radius is not nil: the fetched text is consumed by the tx-hash scan and the per-URI outcome is persisted, so a bypass is at least a four-state oracle about the target (no response; a response with no markers; a 0x-hash or task-id key present; a hash involving the rater/owner addresses -- and further states as other notes are recorded, e.g. `fetch-error` or `lookup-budget:N`) -- not a blind request. That is precisely why the URL is parser-cross-checked (`urlsplit` against `urllib3`), host-allowlisted to LDH labels, and rebuilt canonically from the vetted components before it is fetched: "nothing of the response is persisted or reported" would not be reason enough to tolerate a reachable bypass -- and here it is not even true, since the `(level, note)` pair is both. Closing the remaining DNS gap (resolve once, then fetch through a pinned-IP transport adapter) is a v0.2 item. See `robustrep.sources.evidence_fetch` for the full writeup and its xfail regression test.
 - **Two-tag lower-median bias.** With exactly two tags, cross-tag combination is a step, not a blend: the reported score is whichever tag's median holds at least half the total evidence mass; the other tag is discarded. At an exact mass tie (within a 1e-9 relative tolerance) the lower-scored tag wins by the same lower-median convention. The deviation from a blended estimate is bounded by the gap between the two tag medians and is downward only at the tie.
 - **Unique-tag gaming.** `tag1` is attacker-chosen free text and v0.1 keeps every distinct value as its own normalization group, so a rater who invents a tag nobody else uses gets a group of one: at `d0` a posted `1` fits the absolute `binary` rule and normalizes straight to 1.0, with no honest record in the group to normalize against (the scale buys nothing either -- the attacker picks that too, and a `100` at `d2` is the same 1.0). What that buys is bounded, not free. A tag reaches the reported score only through the cross-tag weighted median, and a tag's weight there is the SUM of its votes' evidence weights, not their count -- so an evidence-free invented tag carries ~0.1 per (ratee, tag, cluster) vote, not per rating: collapse gives each cluster one vote carrying its records' mean weight, so a hundred ratings from one cluster are still ~0.1. A top-scoring invented tag can take over the ratee's score only once the honest tags together hold less than half the ratee's total evidence mass. The cost is paid in evidence mass, which is the quantity the whole aggregator is built to make expensive; a rare-tag merge is a v0.2 item.
 - **Evidence lookup budget.** Verifying an evidence URI's transaction hashes is bounded twice, and both bounds can only hide a real level 3, never invent one. A run-wide budget (`evidence_max_total_lookups`) cuts verification short once it is spent: each URI it caught is cached with a `lookup-budget:N` note and counted as `evidence_lookup_starved_uris` in Provenance, its level is a possible **false negative**, and the level-3 share reported above is therefore biased downward, never upward. A later `fetch` retries those URIs, up to `MAX_LOOKUP_ATTEMPTS` attempts each (see `robustrep.sources.evidence_batch`), after which the starved level stands. The second bound is per URI: only the first 8 distinct hashes in a document are ever looked up, and that truncation happens silently -- no note, no counter -- so a document carrying more hashes than that can be under-levelled without ever appearing in the count above.
 - **Normalization precedes sybil collapse.** Rule selection runs per (tag, scale) group over the raw records, before clustering collapses a farm into one vote (see the Method order above). So a farm the clusterer handles perfectly -- every member merged, a single vote between them -- can still have forced a rung change on the way in (percent -> `rank`, say) by pushing its group past the outlier tolerance, re-levelling every honest record in that group; the collapse happens afterwards and cannot undo a rung already chosen. The tolerance (`max(1, floor(n * (1 - norm_fit_share)))` records allowed outside a rule's range -- see `robustrep.normalize`) is the only defense at that stage. `norm_rule_counts` in Provenance is the signal it leaves: diff it run over run and a rung flip shows up as a plain diff.
+- **Log sources not cross-checked.** Logs from different endpoints are not cross-checked against each other; the weekly drift test covers only the recorded fixture window.
 
 ## Provenance
-- Rater profile mode: blockscout
+- Rater profile mode: alchemy
 - Confirmations lag (data cut is final as of this block): 20
+- Funder kinds: transfer 13,534; owner 110,488; none 12,507; unknown 0
+- Log sources: base-pokt.nodies.app (blocks 52,102,626–52,551,481, 7,773 ranges, 388,490 blocks, 23,724 logs); base-rpc.publicnode.com (blocks 52,522,296–53,435,482, 449 ranges, 884,815 blocks, 120,064 logs); base.drpc.org (blocks 52,124,626–52,557,053, 780 ranges, 59,550 blocks, 2,064 logs)
+- Source recording starts at block 52,102,626; any blocks before it were fetched before source recording existed.
 - Scoring configuration used:
   - `bootstrap_n`: 1000
   - `bootstrap_seed`: 0
@@ -95,9 +100,9 @@ normalize per (tag, scale) -> evidence weights -> sybil collapse (2-of-3 signals
   - `sybil_max_pairs_per_ratee`: 500000
   - `sybil_flag_share`: 0.5
   - `norm_fit_share`: 0.9
-  - `norm_rule_counts`: {'binary': 379450, 'percent': 146582, 'rank': 1980, 'unit': 163, 'constant': 12}
-  - `evidence_level_shares`: {0: 0.14677188192818075, 1: 0.8478057960532918, 2: 0.004674480818346533, 3: 0.0007478412001809965}
+  - `norm_rule_counts`: {'binary': 400315, 'percent': 271206, 'rank': 2311, 'unit': 169, 'constant': 12}
+  - `evidence_level_shares`: {0: 0.29802244170364667, 1: 0.6968619299627752, 2: 0.004455403679157524, 3: 0.000660224654420612}
   - `evidence_max_lookups_per_uri`: 8
   - `evidence_max_total_lookups`: 20000
   - `evidence_lookup_starved_uris`: 0
-- Versions: robustrep 0.1.1, python 3.10.9, numpy 2.2.6, pandas 2.3.3, matplotlib 3.10.9, requests 2.34.2, urllib3 2.7.0, eth_abi 6.0.0
+- Versions: robustrep 0.2.2, python 3.10.9, numpy 2.2.6, pandas 2.3.3, matplotlib 3.10.9, requests 2.34.2, urllib3 2.8.0, eth_abi 6.0.0
